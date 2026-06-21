@@ -1,0 +1,63 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "klyk"
+dynamic = ["version"]
+description = "OS-level macOS app testing via MCP — native apps, Electron apps, browsers, web pages, system dialogs"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+authors = [{ name = "Bent Eisheuer", email = "bentnicolaus@gmail.com" }]
+keywords = ["mcp", "macos", "testing", "automation", "ai-agent", "accessibility", "ocr"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Environment :: Console",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: MacOS :: MacOS X",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Testing",
+    "Topic :: Software Development :: Testing :: Acceptance",
+]
+dependencies = [
+    "mcp>=1.0.0",
+    "python-dotenv>=1.0.0",
+    # Transitive of mcp, declared explicitly so run's nested-step validation can't silently vanish.
+    "jsonschema>=4.0",
+    "pyobjc-framework-Vision>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Quartz>=10.0; sys_platform == 'darwin'",
+    "pyobjc-framework-Cocoa>=10.0; sys_platform == 'darwin'",
+    # Template matching runs in pure NumPy (klyk/matcher.py); the PNG codec is
+    # first-party CoreGraphics (klyk/capture.py). No OpenCV — it was the only
+    # dependency forcing numpy>=2, which broke shared Python environments.
+    "numpy>=1.24",
+]
+
+[project.urls]
+Homepage = "https://github.com/legetdev/klyk"
+Repository = "https://github.com/legetdev/klyk"
+Issues = "https://github.com/legetdev/klyk/issues"
+
+[project.scripts]
+klyk = "klyk.cli:main"
+klyk-call = "klyk.client:main"
+
+[tool.hatch.version]
+# Single source of truth: klyk/__init__.py's __version__.
+path = "klyk/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["klyk"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "/klyk",
+    "/README.md",
+    "/SECURITY.md",
+    "/LICENSE",
+]

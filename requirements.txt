@@ -1,0 +1,20 @@
+mcp>=1.0.0
+python-dotenv>=1.0.0
+# Nested-step input validation in `run`. Ships transitively with mcp, but
+# declared explicitly so a future mcp re-shuffle can't silently disable run's
+# validation safety net (same reasoning as pyobjc-framework-Cocoa below).
+jsonschema>=4.0
+
+# OCR fallback for click_element on canvas/Electron/browser surfaces.
+pyobjc-framework-Vision>=10.0
+pyobjc-framework-Quartz>=10.0
+# AppKit (NSEvent) — required for press_system_key (NX_SYSDEFINED events).
+# Often present as a transitive of pyobjc-framework-Quartz, but declared
+# explicitly so a future PyObjC re-shuffle can't silently break it.
+pyobjc-framework-Cocoa>=10.0
+
+# Pixel-accurate template matching (get_template / find_template). Pure NumPy —
+# the normalized cross-correlation lives in klyk/matcher.py and the PNG codec in
+# klyk/capture.py (CoreGraphics). No OpenCV: it was the sole reason klyk forced
+# numpy>=2, which broke shared Python environments pinned to numpy<2.
+numpy>=1.24
