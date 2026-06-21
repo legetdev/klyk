@@ -7,7 +7,7 @@ gives them the `klyk` command, and from there:
                                    permissions, run a health check. One command,
                                    no prompts. Defaults to Claude Code; pass a
                                    client (cursor, windsurf, continue, cline,
-                                   codex, gemini, antigravity/agy) for another.
+                                   codex, gemini, antigravity/agy, grok) for another.
                                    Flags: --all (wire every detected client),
                                    --ambient (add a shell-fallback note to the
                                    client's context file), --wait (poll until you

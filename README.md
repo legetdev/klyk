@@ -71,7 +71,7 @@ Restart Claude Code (or whichever MCP client you use) and klyk is live. Try `ins
 `klyk install <client>` auto-configures any supported client — same turnkey flow as Claude (writes the config, grants permissions, runs a health check):
 
 ```bash
-klyk install cursor      # or: windsurf · continue · cline · codex · gemini · antigravity (agy)
+klyk install cursor      # or: windsurf · continue · cline · codex · gemini · antigravity (agy) · grok
 klyk install --list      # show every supported client and its config path
 ```
 
@@ -85,6 +85,7 @@ klyk install --list      # show every supported client and its config path
 | OpenAI Codex CLI | `~/.codex/config.toml` |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/mcp_config.json` |
+| Grok CLI (xAI) | `~/.grok/config.toml` |
 
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 

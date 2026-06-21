@@ -110,6 +110,10 @@ CLIENTS: dict[str, Client] = {
         "drive klyk with `klyk-call` instead (see README).",
         context_file=_h(".gemini", "GEMINI.md"),
     ),
+    "grok": Client(
+        "grok", "Grok CLI (xAI)", _h(".grok", "config.toml"), "toml",
+        "Restart Grok (or run `grok mcp doctor`) to load klyk.",
+    ),
 }
 
 # Alternate names a user might type for a client. The standard Gemini CLI and
