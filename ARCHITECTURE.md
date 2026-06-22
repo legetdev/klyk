@@ -281,6 +281,10 @@ deliberately doesn't, on cost/benefit grounds. Recorded so the decisions aren't 
 
 **No HTTP bridge / remote MCP.** Local MCP clients use stdio directly; a localhost bridge or tunnel to reach hosted apps (ChatGPT, Grok web) would expose full machine control over the network — pure attack surface for a single-machine, local-first tool. The shell front door (`klyk-call`) covers harnesses with weak MCP support without it.
 
+**Built or considered, then removed.**
+- *Per-action ghost-cursor sprite* — a small sprite marking each action; removed because it read poorly from peripheral vision, was easy to miss, and competed with the menu-bar item. The always-on menu-bar status item + automatic dock badges replaced it.
+- *Auto-pause on user activity* — pausing an autonomous run when the user returns to the keyboard; dropped because klyk tasks complete in seconds (the long-running-agent premise didn't hold) and the Cmd+Shift+Esc emergency-stop already covers "halt now." Would have added session state for a workflow nobody hit.
+
 ---
 
 ## Hard limits — won't build
