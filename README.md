@@ -95,6 +95,15 @@ Any other MCP client works too — klyk speaks MCP natively. Add this entry to i
 
 Permissions, the singleton lock, and `klyk doctor` work identically regardless of which client launches klyk.
 
+### Choosing a model — the speed vs. intelligence trade-off
+
+klyk runs at the same OS speed no matter what's driving it — the latency and accuracy you *feel* are the **model's**, not klyk's. Because klyk is model-agnostic, you pick where you want to sit on a very real trade-off:
+
+- **Frontier models (e.g. Claude Opus).** Long gaps between actions — sometimes **minutes** while the model reasons — but each action is usually well-chosen, correctly targeted, and efficient. Fewer wrong clicks, fewer wasted round-trips. Best for high-stakes or irreversible work where a misfire is expensive.
+- **Fast, smaller models (e.g. Gemini Flash).** Often **under ~10 seconds** between actions — snappy and cheap — but they misfire more: wrong element, wrong order, premature verdict. They lean harder on klyk's observe→act→verify loop to catch and recover from mistakes. Best for fast, iterative, low-stakes tasks where throughput beats precision.
+
+There's no universally "right" model — it's a deliberate choice per task. Match the model to the cost of being wrong: the smarter-but-slower model when an errant click matters, the faster-but-looser model when speed and volume matter and recovery is cheap.
+
 ### Drive klyk from any AI (no MCP integration required)
 
 MCP support varies a lot between agent harnesses — some gate it, some implement it incompletely, some don't have it. So klyk ships an extra front door that works even when a client's own MCP plumbing doesn't. It reaches the **same** persistent klyk session.
