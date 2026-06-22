@@ -394,7 +394,12 @@ _SERVER_INSTRUCTIONS = (
     "Everything outside browser web content — Finder, system dialogs, native "
     "macOS apps, the menu bar, the Dock, system settings, Electron app chrome "
     "(toolbar, menus, sidebars) — klyk is the right tool and runs fully "
-    "invisibly in the default autonomous mode."
+    "invisibly in the default autonomous mode.\n"
+    "\n"
+    "USING THESE TOOLS: klyk's tools are already loaded and ready to call "
+    "directly — start with `screenshot` to see the screen, then act. Do NOT "
+    "read or search klyk's source files to learn the API; everything you need "
+    "is in these tool descriptions."
 )
 
 server = Server("klyk", version=__version__, instructions=_SERVER_INSTRUCTIONS)
