@@ -258,6 +258,31 @@ Capabilities that will never ship from this surface area — a macOS API constra
 
 ---
 
+## Rejected & deferred capabilities
+
+Distinct from the API-impossible "Hard limits" below: these are capabilities klyk *could* build but
+deliberately doesn't, on cost/benefit grounds. Recorded so the decisions aren't re-litigated.
+
+**Performance shortcuts (rejected — the bottleneck they target doesn't exist).**
+- *AX subtree caching* — the first walk is already ~70 ms; a cross-call cache would buy that 70 ms at the cost of the agent clicking a stale "ghost" element.
+- *Delta AX* — reduces token cost, not latency; the walker still has to traverse the tree to detect changes.
+- *Lazy / async AX* — breaks the "one tool = one observation" model for the same ~70 ms the parallel `inspect` already saves.
+- *Window-bounded AX* — single-window apps don't benefit; multi-window apps already steer via `window_id`.
+- *Per-app capability cache* — saves 10–30 ms per `click_element` cascade miss, but adds per-session hidden state and risks caching a transient failure as permanent.
+
+**Tools considered and skipped.**
+- *`wait_for_idle`* — high lazy-fallback risk (agents reach for it instead of finding the right readiness signal); no documented failure motivated it.
+- *`middle_click`, `cursor_position`, `zoom`* — niche, or already approximated by existing primitives (modifier+click, `move_cursor`, `read_grid` / `get_pixels`).
+
+**Anthropic Computer-Use patterns deliberately NOT adopted** — they contradict klyk's "uniform reach, invisible-first" premise.
+- *Tier-based app restrictions* (browsers read-only, IDEs click-only) — contradicts "if a human can do it on a Mac, klyk can."
+- *Visible-cursor-only delivery* — would gut autonomous + background modes, klyk's biggest advantage.
+- *Per-app `request_access` permission model* — substantial surface against klyk's developer-machine framing; deferred until a concrete use case demands per-app gating.
+
+**No HTTP bridge / remote MCP.** Local MCP clients use stdio directly; a localhost bridge or tunnel to reach hosted apps (ChatGPT, Grok web) would expose full machine control over the network — pure attack surface for a single-machine, local-first tool. The shell front door (`klyk-call`) covers harnesses with weak MCP support without it.
+
+---
+
 ## Hard limits — won't build
 
 Constraints that come from the macOS APIs klyk is built on. Not roadmap items — these will not ship from this surface area.

@@ -29,3 +29,6 @@ dist/
 ROADMAP.md
 CLAUDE.md
 PUBLISH.md
+
+# Local roadmap-migration backups
+.roadmap-backup-*/
