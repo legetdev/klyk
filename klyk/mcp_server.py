@@ -4749,9 +4749,24 @@ async def call_tool(
         # --- list_windows ---
         elif name == "list_windows":
             session, _ = await _get_session(args, name)
-            windows = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: capture.list_windows_for_pid(session.pid)
-            )
+            # Window enumeration is normally sub-100ms (a WindowServer query,
+            # not an AX walk); 10 s is a generous ceiling that only trips
+            # under genuine executor-queue backup (many concurrent tool calls
+            # or rapid window churn stalling the OS), not normal variance.
+            try:
+                windows = await asyncio.wait_for(
+                    asyncio.get_event_loop().run_in_executor(
+                        None, lambda: capture.list_windows_for_pid(session.pid)
+                    ),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                raise RuntimeError(
+                    f"Timed out listing windows for {session.app!r} after 10 s. "
+                    "macOS's window server may be under heavy load (many apps "
+                    "or windows churning at once) — wait a moment and retry, "
+                    "or run `klyk doctor` if this persists."
+                )
             # Assign / refresh A-Z labels in z-order
             label_map = window_labels.assign(args["app"], [w["window_id"] for w in windows])
             for w in windows:

@@ -6,12 +6,15 @@ Sessions are keyed by app name — no session_id exposed to agents.
 from __future__ import annotations
 
 import asyncio
+import logging
 import os as _os
 import uuid
 from dataclasses import dataclass, field
 from typing import Literal
 
 from .logs import LogBuffer, StderrReader
+
+log = logging.getLogger("klyk")
 
 
 @dataclass
@@ -250,9 +253,23 @@ async def create_session(
             # session_id lookups also work, same as the standard path.
             registry.register(session)
             return session
-        win = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: capture.wait_for_window(pid, timeout=15.0)
-        )
+        # Hard wall-clock ceiling on top of wait_for_window's own internal 15 s
+        # budget: run_in_executor only starts counting once a worker thread is
+        # free, so under heavy concurrent load (many overlapping tool calls,
+        # rapid window churn) the *submission* can queue for minutes before
+        # the call even begins — silently turning a documented "15 s" wait
+        # into an unbounded one. wait_for's timer runs independently of the
+        # executor queue, so this fires within ~2 s of the stated budget
+        # regardless of how backed up the executor is.
+        try:
+            win = await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: capture.wait_for_window(pid, timeout=15.0)
+                ),
+                timeout=17.0,
+            )
+        except asyncio.TimeoutError:
+            win = None
         if win is None:
             raise RuntimeError(
                 f"No window appeared for {app_name!r} (pid={pid}) within 15 s. "
@@ -420,16 +437,16 @@ def _close_session(session: Session) -> None:
     on a never-closed pipe), and unbounded template cache memory.
     """
     from . import launcher
-    # Tell the stderr reader to stop and close its pipe — this lets the daemon
-    # thread exit instead of blocking on the pipe until interpreter shutdown.
-    reader = getattr(session, "_log_reader", None)
-    if reader is not None:
-        try:
-            reader.stop()
-        except Exception:
-            pass
-        session._log_reader = None
-    # Terminate the log/proc Popen.
+    # Kill the log/proc Popen FIRST, before touching the reader. Order matters:
+    # StderrReader's background thread sits in a blocking read on proc.stdout,
+    # holding that BufferedReader's internal lock for the syscall's duration.
+    # If reader.stop() (which calls proc.stdout.close()) runs while the
+    # process is still alive and producing no output, close() has to wait on
+    # that same lock — and since nothing is unblocking the read, it can stall
+    # for minutes (measured: 200s+ in isolation) instead of returning
+    # instantly. Killing the process first closes the pipe's WRITE end,
+    # which delivers EOF to the blocked read immediately, so the reader
+    # thread's loop exits and releases the lock before stop() ever needs it.
     proc = getattr(session, "_log_proc", None)
     if proc is not None:
         try:
@@ -448,6 +465,16 @@ def _close_session(session: Session) -> None:
             except Exception:
                 pass
         session._log_proc = None
+    # Now that the process (and its stdout pipe's write end) is gone, the
+    # reader thread's blocking read has already returned EOF — stop() closes
+    # the read end and joins cleanly instead of waiting on the io lock.
+    reader = getattr(session, "_log_reader", None)
+    if reader is not None:
+        try:
+            reader.stop()
+        except Exception:
+            pass
+        session._log_reader = None
     # Free in-session caches.
     try:
         session.template_cache.clear()
@@ -470,9 +497,21 @@ async def close_app(app: str) -> None:
             _visibility.detach(app)
         except Exception:
             pass
-        await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _close_session(session)
-        )
+        # _close_session's own logic is bounded (~4 s worst case: 1 s proc.wait
+        # + terminate_pid's 3 s SIGTERM/SIGKILL escalation), so 10 s is a
+        # generous ceiling that only fires under genuine executor-queue
+        # backup (see the matching comment in create_session), not normal
+        # variance. Cleanup is best-effort either way — a timeout here still
+        # means the app's own process was already signaled to terminate.
+        try:
+            await asyncio.wait_for(
+                asyncio.get_event_loop().run_in_executor(
+                    None, lambda: _close_session(session)
+                ),
+                timeout=10.0,
+            )
+        except asyncio.TimeoutError:
+            log.warning(f"close_app cleanup for {app!r} exceeded 10 s ceiling — abandoning wait")
 
 
 def list_sessions() -> list[dict]:
