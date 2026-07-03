@@ -2451,9 +2451,35 @@ async def _seamless_post(
         return {"ok": False, "error": "chromium_cursor_warp"}
 
     # Active-app check. SkyLight delivery requires the target to be the
-    # OS-level frontmost app (verified empirically against Chromium;
-    # treated as universal for safety until non-Chromium evidence suggests
-    # otherwise — see PHASE_2_VERIFY_SKYLIGHT.md).
+    # OS-level frontmost/key app for actions that change content state
+    # (click, double/triple-click, drag) — confirmed empirically (2026-07-02):
+    # a raw backgrounded click posts successfully (no ctypes error) but has
+    # NO effect (caret doesn't move, Finder sidebar navigation doesn't fire),
+    # matching AppKit's standard "first click focuses, doesn't interact"
+    # convention for a non-key window. This holds across independent native
+    # apps (TextEdit, Finder), not just Chromium, so activation here is a
+    # real requirement, not overcaution.
+    #
+    # Scroll is the documented exception: macOS lets a scroll gesture affect
+    # whatever window is under the pointer without first bringing it forward
+    # (the same "scroll a background window" behavior a trackpad gesture
+    # gets) — confirmed empirically: a backgrounded native-app scroll moved
+    # the visible content with zero activation. Forcing scroll through the
+    # same activation gate as click was pure unnecessary focus theft, so it
+    # skips this check entirely and posts directly regardless of frontmost
+    # state.
+    if tool_name == "scroll":
+        try:
+            ok = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: post_fn(needs_primer),
+            )
+        except Exception as e:
+            log.warning(f"skylight post raised in {tool_name}: {type(e).__name__}: {e}")
+            return {"ok": False, "error": "invisible_delivery_error"}
+        if not ok:
+            return {"ok": False, "error": "skylight_post_failed"}
+        return {"ok": True, "via": "skylight"}
+
     is_active = await asyncio.get_event_loop().run_in_executor(
         None, lambda: computer.is_frontmost_app(session.pid)
     )
