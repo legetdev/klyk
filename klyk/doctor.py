@@ -141,9 +141,19 @@ def check_skylight() -> CheckResult:
     try:
         from . import skylight  # noqa
         if skylight.is_available():
+            if skylight.keywin_available():
+                return CheckResult(
+                    "SkyLight framework", "ok",
+                    "loaded (invisible input + key-window routing available)",
+                )
             return CheckResult(
                 "SkyLight framework", "ok",
-                "/System/Library/PrivateFrameworks/SkyLight.framework loaded",
+                "loaded; key-window routing unavailable — clicks deliver raw",
+                "Invisible clicks still work, but the key-window helper "
+                "(make_window_key) didn't resolve its symbols, so clicks land as "
+                "raw posts: simple controls (buttons, menus) work, but text-caret "
+                "and list/row selection on a backgrounded window may not. Most "
+                "likely a macOS change to a private symbol — file an issue.",
             )
         return CheckResult(
             "SkyLight framework", "warn",

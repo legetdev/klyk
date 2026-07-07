@@ -604,15 +604,15 @@ TOOLS = [
             "menus; modifiers=['cmd'|'shift'|'alt'|'ctrl'] stamp through. Blocked if outside "
             "window bounds — pass confirm_destructive=true to override. If an AX element exists "
             "within 20 px, response includes nearby_ax_hint suggesting click_element. "
-            "Native apps (autonomous / background) route through SkyLight: cursor doesn't move, "
-            "focus doesn't change — fully invisible (`via:'skylight'`, '+activated' if autonomous "
-            "had to bring the app forward). Chromium-based apps (browsers and Electron) are the "
-            "exception: their renderer mishandles synthetic clicks, so klyk uses a real cursor "
-            "there — autonomous briefly "
-            "activates the window and clicks (`via:'cursor_warp'`, `escalated_from:'chromium_cursor_warp'`); "
-            "background returns `{ok:false, requires_foreground:true}`. Humanoid always uses "
-            "cursor_warp. Multi-window: a `focus_warning` means the click landed in the wrong "
-            "window — stop and resolve. "
+            "Native apps (autonomous / background) route through SkyLight and are FULLY INVISIBLE: "
+            "the cursor doesn't move, the target window isn't raised, and the user's focus never "
+            "changes — the same in both modes (`via:'skylight+keyed'`, or `'skylight'` on the rare "
+            "macOS where the key-window helper is unavailable). Chromium-based apps (browsers and "
+            "Electron) are the exception: their renderer mishandles synthetic clicks, so klyk uses "
+            "a real cursor there — autonomous briefly activates the window and clicks "
+            "(`via:'cursor_warp'`, `escalated_from:'chromium_cursor_warp'`); background returns "
+            "`{ok:false, requires_foreground:true}`. Humanoid always uses cursor_warp. "
+            "Multi-window: a `focus_warning` means the click landed in the wrong window — stop and resolve. "
             "Safety: don't click an unfamiliar URL or a money-moving control (Send, Buy, Confirm "
             "Transfer, Place Order, Sign) without the user's explicit OK in this session."
         ),
@@ -642,11 +642,12 @@ TOOLS = [
             "to 2 on the second pair so apps see a real double-click, not two fast singles. "
             "Coordinates are window-relative (same space as click and screenshot). "
             "Supports modifiers — e.g. modifiers=['cmd'] for Cmd+Double-click. "
-            "SEAMLESS MODE (background / autonomous): routes through SkyLight — cursor doesn't "
-            "move, target window isn't raised, modifier flags stamp through. Response carries "
-            "`via:'skylight'` (or `+primer` for Chromium, `+activated` for autonomous-mode "
-            "activation). Background mode returns `{ok:false, requires_foreground:true}` when "
-            "the target app isn't frontmost. In humanoid mode response carries `via:'cursor_warp'`."
+            "SEAMLESS MODE (background / autonomous): native apps route through SkyLight fully "
+            "invisibly — cursor doesn't move, target window isn't raised, focus doesn't change, "
+            "modifier flags stamp through (`via:'skylight+keyed'`, or `'skylight'` if the "
+            "key-window helper is unavailable; `+primer` for Chromium). Chromium browser web "
+            "content instead uses a real cursor: autonomous activates + clicks (`via:'cursor_warp'`), "
+            "background returns `{ok:false, requires_foreground:true}`. Humanoid: `via:'cursor_warp'`."
         ),
         inputSchema={
             "type": "object",
@@ -675,11 +676,12 @@ TOOLS = [
             "address bar), or the full line in a code editor. "
             "Coordinates are window-relative (same space as click and screenshot). "
             "Supports modifiers — e.g. modifiers=['shift'] to extend an existing selection. "
-            "SEAMLESS MODE (background / autonomous): routes through SkyLight — cursor doesn't "
-            "move, target window isn't raised, modifier flags stamp through. Response carries "
-            "`via:'skylight'` (or `+primer` for Chromium, `+activated` for autonomous-mode "
-            "activation). Background mode returns `{ok:false, requires_foreground:true}` when "
-            "the target app isn't frontmost. In humanoid mode response carries `via:'cursor_warp'`."
+            "SEAMLESS MODE (background / autonomous): native apps route through SkyLight fully "
+            "invisibly — cursor doesn't move, target window isn't raised, focus doesn't change, "
+            "modifier flags stamp through (`via:'skylight+keyed'`, or `'skylight'` if the "
+            "key-window helper is unavailable; `+primer` for Chromium). Chromium browser web "
+            "content instead uses a real cursor: autonomous activates + clicks (`via:'cursor_warp'`), "
+            "background returns `{ok:false, requires_foreground:true}`. Humanoid: `via:'cursor_warp'`."
         ),
         inputSchema={
             "type": "object",
@@ -783,9 +785,9 @@ TOOLS = [
             "autonomous/background (SkyLight) mode; humanoid fallback drops them. "
             "`hover_seconds` (default 0) holds the cursor at the target — still pressed — "
             "before releasing, for spring-loaded drops. "
-            "Response `via`: 'skylight' / '+primer' / '+activated' in seamless mode, "
-            "'cursor_warp' in humanoid. Background returns `requires_foreground:true` if "
-            "the target app isn't frontmost."
+            "Response `via`: 'skylight+keyed' (native, fully invisible — no raise, no focus "
+            "change) or '+primer' for Chromium in seamless mode, 'cursor_warp' in humanoid. "
+            "Background returns `requires_foreground:true` only for Chromium web content."
         ),
         inputSchema={
             "type": "object",
@@ -906,23 +908,22 @@ TOOLS = [
     types.Tool(
         name="fill_field",
         description=(
-            "Focus a field and replace its contents. Three-stage cascade — first path that "
+            "Focus a field and replace its contents. Two-stage cascade — first path that "
             "succeeds wins, the chosen path is reported in `via`:\n"
             "  1. **`via:'ax_set_value'`** — Pure AX write via AXUIElementSetAttributeValue. "
-            "Zero cursor movement, zero keyboard events, zero clipboard activity. Fires only "
-            "for native macOS text inputs (AXTextField, AXTextArea, AXSearchField, AXComboBox) "
-            "not rooted in AXWebArea. Web-form inputs (Chrome, Safari, Electron) ignore the "
-            "AX write because the DOM value isn't bound to the AX cache — those skip to step 2 "
-            "and the response includes `ax_skip_reason` naming why (e.g. 'web_backed').\n"
-            "  2. **`via:'skylight'`** — SkyLight focus-click + Cmd+A + paste. Click is "
-            "invisible; Cmd+A and paste already route via CGEventPostToPid for keys (also "
-            "invisible). Companion / autonomous modes only.\n"
-            "  3. **`via:'cursor_warp'`** — Humanoid mode or seamless-failed fallback. Real "
-            "cursor-moving click + Cmd+A + paste.\n"
-            "Steps 2 and 3 are NOT atomic: a popup or modal opening between the focus-click "
-            "and the Cmd+A will receive the Cmd+A. For already-focused fields prefer type_text "
-            "(no clear). Background mode returns `{ok:false, requires_foreground:true}` if the "
-            "target app isn't frontmost AND the AX path didn't already win. "
+            "Fully invisible: zero cursor movement, zero keyboard events, zero clipboard "
+            "activity, no activation. Fires for native macOS text inputs (AXTextField, "
+            "AXTextArea, AXSearchField, AXComboBox) not rooted in AXWebArea — the common case, "
+            "and it stays completely in the background. Web-form inputs (Chrome, Safari, "
+            "Electron) ignore the AX write because the DOM value isn't bound to the AX cache — "
+            "those fall to step 2, and the response includes `ax_skip_reason` (e.g. 'web_backed').\n"
+            "  2. **`via:'activated'`** — Fallback when the AX write can't apply (mostly web / "
+            "Electron fields). klyk clears with Cmd+A and pastes with Cmd+V — command shortcuts "
+            "macOS delivers only to the frontmost app, so klyk briefly brings the target forward "
+            "first. NOT atomic: a popup opening between the focus-click and the Cmd+A would "
+            "receive the Cmd+A. For already-focused fields prefer type_text (no clear). "
+            "Background mode returns `{ok:false, requires_foreground:true}` whenever the AX write "
+            "didn't win (the clear+paste needs the app frontmost). "
             "Safety: don't enter payment details, recipient addresses, or transfer amounts "
             "without the user's explicit OK in this session."
         ),
@@ -966,11 +967,13 @@ TOOLS = [
             "\n"
             "If you omit `mode`, klyk auto-picks: `keys` on Chromium-based apps "
             "(browsers and Electron — safe for games and inputs alike), `paste` "
-            "elsewhere — so you rarely need to set it. Delivery: in autonomous mode "
-            "klyk briefly brings a Chromium-based window frontmost so its renderer "
-            "accepts the keys (background mode returns "
-            "requires_foreground instead); native apps receive keys invisibly with "
-            "no activation — so you never need humanoid mode just to type. "
+            "elsewhere — so you rarely need to set it. Delivery: `keys` reaches a "
+            "native app FULLY INVISIBLY (no activation, no focus change), even "
+            "backgrounded. `paste` uses Cmd+V, a command shortcut macOS delivers only "
+            "to the frontmost app, so in autonomous mode klyk briefly activates a "
+            "non-frontmost target for the paste (background returns requires_foreground); "
+            "Chromium keystrokes likewise need the window frontmost. So for guaranteed "
+            "invisible typing into a backgrounded native app, pass `mode='keys'`. "
             "Safety: don't type unfamiliar URLs into a browser address bar, or payment / "
             "recipient / transfer details, without the user's explicit OK in this session."
         ),
@@ -1138,11 +1141,11 @@ TOOLS = [
             "affected.\n"
             "\n"
             "SEAMLESS MODE (background / autonomous): scroll wheel event routes through "
-            "SkyLight to the target PID — cursor doesn't move, target window isn't raised. "
-            "Useful for scrolling a background app behind the user's foreground work. "
-            "Response carries `via:'skylight'` (or `+activated` for autonomous activation). "
-            "Background mode returns `{ok:false, requires_foreground:true}` if the target app "
-            "isn't frontmost. In humanoid mode response carries `via:'cursor_warp'` and the "
+            "SkyLight to the target PID — cursor doesn't move, target window isn't raised, and "
+            "the app is never activated (macOS scrolls the window under the pointer without "
+            "bringing it forward). Fully invisible whether or not the target is frontmost — ideal "
+            "for scrolling a background app behind the user's foreground work. Response carries "
+            "`via:'skylight'`. In humanoid mode response carries `via:'cursor_warp'` and the "
             "cursor warps to (x, y) before the wheel event fires."
         ),
         inputSchema={
@@ -2356,30 +2359,40 @@ async def _seamless_post(
     post_fn,                         # callable(primer_first: bool) -> bool
     log_coords: tuple[int, int] | None = None,
     needs_primer: bool | None = None,
+    target_wid: int | None = None,   # window to make key before a native click
 ) -> dict:
     """
-    Generic seamless-mode dispatch. Owns the active-app check, the per-mode
-    failure handling (background → require_foreground; autonomous → activate
-    and log), and the post call itself. `post_fn` is a callable that takes
-    a `primer_first: bool` and performs the actual SkyLight post for the
-    specific event type (click, double-click, drag, scroll). Returning
-    True/False from `post_fn` is the only success signal; raising from
-    `post_fn` is caught and surfaced as `{ok: False, error: ...}`.
+    Generic seamless-mode dispatch. Owns the delivery/self-test gate, the
+    Chromium-vs-native routing decision, and the post call itself. `post_fn` is
+    a callable taking `primer_first: bool` that performs the actual SkyLight post
+    for the specific event type (click, double-click, drag, scroll). Returning
+    True/False from `post_fn` is the only success signal; raising from `post_fn`
+    is caught and surfaced as `{ok: False, error: ...}`.
+
+    Native click-family delivery is fully invisible: `make_window_key(target_wid)`
+    flips the target window to key WITHOUT activating the app, raising the window,
+    or moving the cursor — so both simple and key-window-dependent controls
+    interact while the user's foreground stays put, in autonomous AND background
+    mode. Only Chromium web content still needs activation (its renderer distrusts
+    synthetic clicks), so that path alone can return requires_foreground.
 
     Returns one of:
-      {ok: True, via: "skylight" | "skylight+activated" | "...+primer"}
-      {ok: False, requires_foreground: True, reason, app, suggestion}
+      {ok: True, via: "skylight+keyed" | "skylight" | "...+primer"}
+      {ok: False, requires_foreground: True, reason, app, suggestion}  # Chromium only
       {ok: False, error: "skylight_post_failed"}
       {ok: False, error: "invisible_delivery_error"}
+      {ok: False, error: "chromium_cursor_warp" | "activation_failed"}  # Chromium path
 
-    `log_coords` is the (x, y) used in autonomous-mode escalation log
-    entries. Pass None for tools without a single canonical coordinate
-    (full-window scroll, for example).
+    `log_coords` is the (x, y) used in autonomous-mode escalation log entries
+    (Chromium path). Pass None for tools without a single canonical coordinate.
 
-    `needs_primer` overrides the default "use primer for Chromium apps"
-    rule when False/True is explicitly passed. Default None = auto-detect.
-    Scroll passes False (wheel events don't benefit from the renderer
-    primer because they hit a different input path than clicks).
+    `needs_primer` overrides the default "use primer for Chromium apps" rule when
+    False/True is explicitly passed. Default None = auto-detect. Scroll passes
+    False and posts directly regardless of frontmost state.
+
+    `target_wid` is the window made key before a native click; when None (or the
+    key-window helper is unavailable) delivery falls back to a raw click, which
+    still fires simple controls.
     """
     # Delivery gate: if a startup/doctor self-test conclusively found that
     # SkyLight loads but no longer DELIVERS on this macOS build (a private-API
@@ -2450,24 +2463,12 @@ async def _seamless_post(
         # so the caller's autonomous branch handles it.
         return {"ok": False, "error": "chromium_cursor_warp"}
 
-    # Active-app check. SkyLight delivery requires the target to be the
-    # OS-level frontmost/key app for actions that change content state
-    # (click, double/triple-click, drag) — confirmed empirically (2026-07-02):
-    # a raw backgrounded click posts successfully (no ctypes error) but has
-    # NO effect (caret doesn't move, Finder sidebar navigation doesn't fire),
-    # matching AppKit's standard "first click focuses, doesn't interact"
-    # convention for a non-key window. This holds across independent native
-    # apps (TextEdit, Finder), not just Chromium, so activation here is a
-    # real requirement, not overcaution.
-    #
-    # Scroll is the documented exception: macOS lets a scroll gesture affect
-    # whatever window is under the pointer without first bringing it forward
-    # (the same "scroll a background window" behavior a trackpad gesture
-    # gets) — confirmed empirically: a backgrounded native-app scroll moved
-    # the visible content with zero activation. Forcing scroll through the
-    # same activation gate as click was pure unnecessary focus theft, so it
-    # skips this check entirely and posts directly regardless of frontmost
-    # state.
+    # Scroll posts directly regardless of frontmost state: macOS lets a scroll
+    # gesture affect whatever window is under the pointer without bringing it
+    # forward (same as a trackpad scroll over a background window) — verified
+    # 2026-07-02. Click-family delivery (handled after this branch) makes the
+    # target window key WITHOUT raising it; neither path activates or steals
+    # the user's focus.
     if tool_name == "scroll":
         try:
             ok = await asyncio.get_event_loop().run_in_executor(
@@ -2480,77 +2481,41 @@ async def _seamless_post(
             return {"ok": False, "error": "skylight_post_failed"}
         return {"ok": True, "via": "skylight"}
 
-    is_active = await asyncio.get_event_loop().run_in_executor(
-        None, lambda: computer.is_frontmost_app(session.pid)
-    )
-
-    if not is_active:
-        if session.mode == "background":
-            return {
-                "ok": False,
-                "requires_foreground": True,
-                "reason": "target_app_not_active",
-                "app": session.app,
-                "suggestion": (
-                    f"SkyLight delivery requires {session.app} to be the frontmost app. "
-                    "Either bring it forward yourself, or switch to mode='autonomous' "
-                    "to allow klyk to activate it automatically."
-                ),
-            }
-        # Autonomous: activate, log, then proceed. The activation IS user-
-        # visible (target app's frontmost window comes forward) but it's
-        # the documented autonomous-mode escalation contract.
-        #
-        # Post-activation settle:
-        # - Native AppKit apps: ~100 ms is enough; the AX/event pipeline is
-        #   ready almost immediately.
-        # - Chromium renderers: empirically the renderer's input handler is
-        #   still warming up for ~150-250 ms after activation. SkyLight
-        #   clicks fired inside that window land inconsistently — observed
-        #   on 6mal5: 5 rapid Löschen clicks worked once, then 5 identical
-        #   clicks against a freshly re-activated tab silently no-op'd.
-        #   Same root cause as the type_text first-char drop (which is now
-        #   fixed via a 60 ms pre-settle inside type_text_char_by_char).
-        # - Verdict: bump the Chromium settle to 260 ms; keep 100 ms for
-        #   everything else. The cost is a slightly longer flicker on the
-        #   very first Chromium action after focus loss; subsequent rapid
-        #   actions in the same active window pay nothing.
-        await computer.activate_app(session.pid)
-        settle = 0.260 if _is_chromium_based(session) else 0.1
-        await asyncio.sleep(settle)
-        cx = log_coords[0] if log_coords else None
-        cy = log_coords[1] if log_coords else None
-        _log_escalation(session, tool_name, cx, cy, "activate_for_skylight")
-        # Activation can silently fail (app on another Space, a modal grab,
-        # AppleScript blocked). If the target still isn't frontmost, a SkyLight
-        # post would be discarded by the renderer while post_fn still returns
-        # True — reporting a click that never landed. Bail so the caller (in
-        # autonomous mode) falls through to cursor-warp, which forces it visibly.
-        still_active = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: computer.is_frontmost_app(session.pid)
+    # Native click-family (click / double / triple-click / drag). Deliver
+    # invisibly with NO activation, NO window raise, NO focus theft — the same
+    # in autonomous AND background mode.
+    #
+    # make_window_key flips the target window to key for input routing (yabai's
+    # SLPSPostEventRecordTo pattern) WITHOUT bringing it forward or changing the
+    # OS-active app. A raw backgrounded SkyLight click already fires simple
+    # controls (buttons, menu items); the keyed step additionally lets
+    # key-window-dependent controls interact — text-field caret, list / table /
+    # sidebar row selection — which otherwise respond only inside the key window.
+    # Verified empirically (2026-07-06, 6/6 reproducible): a backgrounded native
+    # window's button AND text field both interact after this, with the user's
+    # active app and window stack completely unchanged. This replaced the old
+    # activate-and-raise path, which stole focus and raised the window — the very
+    # behavior autonomous mode exists to avoid, and the same over-activation that
+    # was removed from scroll on 2026-07-02, now removed from clicks too.
+    keyed = False
+    if target_wid is not None:
+        keyed = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: skylight.make_window_key(session.pid, int(target_wid)),
         )
-        if not still_active:
-            return {"ok": False, "error": "activation_failed"}
-
     try:
         ok = await asyncio.get_event_loop().run_in_executor(
             None, lambda: post_fn(needs_primer),
         )
     except Exception as e:
         # ctypes-level or framework-level failure inside skylight.py. Honor
-        # the docstring contract — caller gets {ok: False, error} and decides
-        # whether to fall through, never a raw exception they can't react to.
+        # the docstring contract — caller gets {ok: False, error}, never a raw
+        # exception they can't react to. Autonomous callers fall through to the
+        # visible cursor-warp; background callers surface it.
         log.warning(f"skylight post raised in {tool_name}: {type(e).__name__}: {e}")
-        # Agent-facing error is a stable, plain reason (no Python type name /
-        # repr — that's a technical identifier the agent can't act on, and the
-        # full type+message is already in the log above).
         return {"ok": False, "error": "invisible_delivery_error"}
     if not ok:
         return {"ok": False, "error": "skylight_post_failed"}
-    via = "skylight+activated" if not is_active else "skylight"
-    if needs_primer:
-        via += "+primer"
-    return {"ok": True, "via": via}
+    return {"ok": True, "via": "skylight+keyed" if keyed else "skylight"}
 
 
 def _is_command_shortcut(keys: list[str]) -> bool:
@@ -2671,6 +2636,7 @@ async def _seamless_click(
             modifier_flags=modifier_flags, primer_first=primer,
         ),
         log_coords=(int(x), int(y)),
+        target_wid=target_wid,
     )
 
 
@@ -2690,6 +2656,7 @@ async def _seamless_double_click(
             modifier_flags=modifier_flags, primer_first=primer,
         ),
         log_coords=(int(x), int(y)),
+        target_wid=target_wid,
     )
 
 
@@ -2709,6 +2676,7 @@ async def _seamless_triple_click(
             modifier_flags=modifier_flags, primer_first=primer,
         ),
         log_coords=(int(x), int(y)),
+        target_wid=target_wid,
     )
 
 
@@ -2732,6 +2700,7 @@ async def _seamless_drag(
             button=button, modifier_flags=modifier_flags, primer_first=primer,
         ),
         log_coords=(int(x1), int(y1)),
+        target_wid=target_wid,
     )
 
 
@@ -3986,52 +3955,68 @@ async def call_tool(
                 }))]
             ax_skip_reason = ax_result.get("status")  # for the response trail
 
-            # --- 2. Seamless focus-click (background/autonomous) ---
-            # The Cmd+A and the paste already route via CGEventPostToPid
-            # (keyboard) so the keystroke portion is invisible — the focus
-            # click is the only step that needs SkyLight routing.
-            via = "cursor_warp"
-            if session.mode in ("background", "autonomous") and skylight.is_available():
-                await _refresh_window(session)
-                target_wid = int(session.window_id)
-                seamless_result = await _seamless_click(
-                    session, target_wid, float(x), float(y), "left", "fill_field",
-                )
-                if seamless_result.get("ok"):
-                    via = seamless_result["via"]
-                elif seamless_result.get("requires_foreground"):
-                    return [types.TextContent(type="text", text=json.dumps(seamless_result))]
-                else:
-                    _log_escalation(session, "fill_field", x, y, seamless_result.get("error", "skylight_unknown"))
-
-            # --- 3. Cursor-warp focus-click fallback ---
-            if via == "cursor_warp":
-                sx, sy = _to_screen(session, x, y)
-                await computer.click(sx, sy)
+            # --- 2. Focus-click, then clear (Cmd+A) and paste (Cmd+V) ---
+            # Unlike a plain click, this path uses command shortcuts (Cmd+A /
+            # Cmd+V), which macOS delivers only to the ACTIVE app's menu bar — a
+            # keyed background window is not enough (verified 2026-07-06: both
+            # no-op on a non-active window). The invisible AX write above handles
+            # native text inputs; reaching here means it couldn't (mostly web /
+            # Electron fields, which are Chromium and get activated anyway), so a
+            # brief activation here is correct, not a focus-theft regression.
+            if session.mode == "background":
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False,
+                    "requires_foreground": True,
+                    "reason": "fill_field_needs_foreground",
+                    "app": session.app,
+                    "ax_skip_reason": ax_skip_reason,
+                    "suggestion": (
+                        f"This field didn't accept the invisible AX write, so klyk must clear "
+                        f"and paste with Cmd+A / Cmd+V — which macOS delivers only to the "
+                        f"frontmost app. Bring {session.app} forward, or use mode='autonomous'."
+                    ),
+                }))]
+            # autonomous / humanoid: bring the app frontmost so the shortcuts land.
+            frontmost = await _await_frontmost(session)
+            await _refresh_window(session)
+            sx, sy = _to_screen(session, x, y)
+            await computer.click(sx, sy)
             await asyncio.sleep(0.01)
             await computer.press_key("Cmd+A", session.pid)
             await asyncio.sleep(0.005)
             await computer.type_text(text, session.pid)
-            result: dict = {"ok": True, "via": via}
+            result: dict = {"ok": True, "via": "activated"}
+            if not frontmost:
+                result["warning"] = (
+                    "Could not confirm the app came frontmost; the field may not have been "
+                    "cleared/filled. Verify with inspect or read_element."
+                )
             if ax_skip_reason:
-                # Surface why AXSetValue didn't win — useful for agents
-                # debugging "why am I still seeing cursor movement on this
-                # field" and for klyk's own telemetry.
+                # Surface why the invisible AX write didn't win — useful for agents
+                # and for klyk's own telemetry.
                 result["ax_skip_reason"] = ax_skip_reason
             return [types.TextContent(type="text", text=json.dumps(result))]
 
         # --- type_text ---
         elif name == "type_text":
             session, _ = await _get_session(args, name)
-            gate = await _ensure_key_delivery(session, "type_text")
-            if gate is not None:
-                return [types.TextContent(type="text", text=json.dumps(gate))]
             # Effective default: real keystrokes on Chromium (clipboard paste is
             # ignored by keydown-driven web UIs — games, rich editors), fast
             # paste everywhere else. An explicit `mode` always wins.
             mode = args.get("mode")
             if mode is None:
                 mode = "keys" if _is_chromium_based(session) else "paste"
+            # Paste is Cmd+V — a command shortcut macOS routes through the ACTIVE
+            # app's menu bar, so it needs the target frontmost (a keyed background
+            # window isn't enough). Per-char keys reach a keyed window invisibly,
+            # so gate only paste as a command shortcut: autonomous activates,
+            # background returns requires_foreground rather than silently pasting
+            # into the void.
+            gate = await _ensure_key_delivery(
+                session, "type_text", command_shortcut=(mode == "paste"),
+            )
+            if gate is not None:
+                return [types.TextContent(type="text", text=json.dumps(gate))]
             if mode == "keys":
                 await computer.type_text_char_by_char(args["text"], session.pid)
             else:

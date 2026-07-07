@@ -56,7 +56,9 @@ two third-party PIDs (Finder, Chrome) — see `PHASE_2_VERIFY_SKYLIGHT.md`.
 from __future__ import annotations
 
 import ctypes
+import ctypes.util
 import logging
+import struct
 import time
 from ctypes import c_double, c_int32, c_int64, c_uint32, c_uint64, c_void_p
 
@@ -70,6 +72,13 @@ class CGPoint(ctypes.Structure):
     _fields_ = [("x", c_double), ("y", c_double)]
 
 
+# ProcessSerialNumber — Carbon Process Manager handle, needed to route the
+# key-window events (make_window_key) to a specific process. Same layout as
+# klyk/computer.py's _PSN.
+class _PSN(ctypes.Structure):
+    _fields_ = [("hi", c_uint32), ("lo", c_uint32)]
+
+
 # ---------------------------------------------------------------------------
 # Framework loading — guarded so the module imports cleanly even if SkyLight
 # isn't present (future macOS may rename or remove it; we want a clean
@@ -80,6 +89,14 @@ _AVAILABLE = False
 _cg = None
 _cf = None
 _sl = None
+_as = None
+
+# Separate availability flag for the key-window routing primitive
+# (make_window_key). Independent of _AVAILABLE so that if only these extra
+# symbols are missing on some future macOS, invisible clicks still work — they
+# just deliver as a raw backgrounded click (which interacts with buttons/menus
+# but not key-window-dependent controls) instead of a keyed click.
+_KEYWIN_AVAILABLE = False
 
 # Tri-state cache for the delivery self-test (see self_test()):
 #   None  = not yet run, or inconclusive (couldn't build the test harness)
@@ -129,6 +146,22 @@ except (OSError, AttributeError) as e:
     # In either case the public API degrades to is_available()=False and
     # the post_* functions return False — the caller picks the legacy CG path.
     log.warning("skylight: unavailable (%s)", e)
+
+# Key-window routing primitives — bound separately so a missing symbol on a
+# future macOS disables ONLY the keyed-click upgrade, not all invisible input.
+try:
+    if _AVAILABLE:
+        # SLPSPostEventRecordTo(ProcessSerialNumber*, void* event_record) —
+        # yabai's make_key_window primitive. Argtypes match the proven call
+        # convention (both pointers passed as c_void_p via byref / array decay).
+        _sl.SLPSPostEventRecordTo.restype = c_int32
+        _sl.SLPSPostEventRecordTo.argtypes = [c_void_p, c_void_p]
+        _as = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
+        _as.GetProcessForPID.restype = c_int32
+        _as.GetProcessForPID.argtypes = [c_int32, ctypes.POINTER(_PSN)]
+        _KEYWIN_AVAILABLE = True
+except (OSError, AttributeError) as e:
+    log.warning("skylight: key-window routing unavailable (%s)", e)
 
 
 # ---------------------------------------------------------------------------
@@ -287,6 +320,65 @@ def is_available() -> bool:
     never raises.
     """
     return _AVAILABLE
+
+
+def keywin_available() -> bool:
+    """
+    True if the key-window routing primitive (make_window_key) resolved its
+    private symbols. When False, invisible clicks still work — they deliver as
+    a raw backgrounded click instead of a keyed one — so callers treat this as
+    an optional upgrade, never a hard requirement. Never raises.
+    """
+    return _KEYWIN_AVAILABLE
+
+
+def make_window_key(pid: int, window_id: int) -> bool:
+    """
+    Make the target window the KEY window for input routing — WITHOUT raising
+    it, changing its z-order, switching Spaces, or changing the OS-active app
+    (no focus theft). This is yabai's `make_key_window` pattern: two
+    `SLPSPostEventRecordTo` events carrying a reverse-engineered event record.
+
+    Why klyk needs it: a raw SkyLight click delivered to a backgrounded native
+    window fires simple controls (buttons, menu items) but does NOT drive
+    key-window-dependent ones — text-field caret placement, list/table/sidebar
+    row selection — because AppKit routes those only inside the key window.
+    Calling this immediately before the click makes those controls interact
+    while the user's foreground app, window stack, and Space stay exactly as
+    they were. Verified empirically (2026-07-06): a button AND a text field in a
+    backgrounded window both interact after this call, with zero change to the
+    active app and zero window raise (6/6 reproducible), whereas the fuller
+    `_SLPSSetFrontProcessWithOptions` variant steals keyboard focus and is
+    deliberately NOT used here.
+
+    Coordinates / raising are untouched — this only flips key-window state.
+
+    Returns True if the events were posted, False if the primitive isn't
+    available on this macOS (caller then delivers a raw click, which still
+    works for simple controls). Never raises.
+    """
+    if not _KEYWIN_AVAILABLE:
+        return False
+    try:
+        psn = _PSN()
+        if _as.GetProcessForPID(int(pid), ctypes.byref(psn)) != 0:
+            return False
+        # Reverse-engineered 0xf8-byte event record (yabai window_manager.c →
+        # window_manager_make_key_window). Field offsets are load-bearing.
+        b = (ctypes.c_uint8 * 0xf8)()
+        b[0x04] = 0xf8
+        b[0x3a] = 0x10
+        struct.pack_into("<I", b, 0x3c, int(window_id) & 0xffffffff)
+        for i in range(0x20, 0x30):
+            b[i] = 0xff
+        b[0x08] = 0x01
+        _sl.SLPSPostEventRecordTo(ctypes.byref(psn), b)
+        b[0x08] = 0x02
+        _sl.SLPSPostEventRecordTo(ctypes.byref(psn), b)
+        return True
+    except Exception as e:  # never let a routing hiccup break the click path
+        log.warning("skylight.make_window_key: %s: %s", type(e).__name__, e)
+        return False
 
 
 def delivery_verified():
