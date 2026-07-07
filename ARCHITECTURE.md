@@ -38,6 +38,12 @@ klyk/
 ├── keycodes.py          # macOS virtual key code table (regular keys)
 ├── ax_roles.py          # Shared AX role catalogs — INTERACTIVE / BROWSER_INTERACTIVE
 ├── skylight.py          # Private SkyLight framework binding — invisible mouse path
+├── updates.py           # Update awareness — daily cached PyPI check + install-method
+│                        #   detection driving `klyk update` (pipx / uv / pip / editable).
+│                        #   Shared state: ~/.klyk/update_check.json (single small file,
+│                        #   atomic overwrite, 24 h TTL, offline-safe, KLYK_UPDATE_CHECK=0
+│                        #   opt-out). Surfaced in `klyk doctor` + the menu-bar line —
+│                        #   never in agent-facing tool responses (token consideration 4).
 ├── requirements.txt
 ├── README.md            # Install, permissions, usage
 ├── ARCHITECTURE.md      # This file — internals reference

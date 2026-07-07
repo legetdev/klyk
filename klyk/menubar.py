@@ -220,6 +220,10 @@ class MenuBarController:
                     if cur != last:
                         last = cur
                         ui.dispatch(self._apply_ownership_visibility)
+                        # A newly-visible eye may carry a menu built long ago
+                        # (e.g. an update notice that has since resolved) —
+                        # rebuild so it never shows stale state.
+                        self.request_refresh()
                 except Exception:
                     pass
                 time.sleep(2.0)
@@ -264,6 +268,21 @@ class MenuBarController:
             )
             note.setEnabled_(False)
             new_menu.addItem_(note)
+
+        # Update notice — one line, only when the daily cached check found a
+        # newer release. status() is cache-only (a stat() in the common case),
+        # so this adds no network work to the rebuild. Failure-isolated: a
+        # broken check can never break the menu.
+        try:
+            upd = _update_line()
+            if upd:
+                upd_item = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
+                    upd, None, "",
+                )
+                upd_item.setEnabled_(False)
+                new_menu.addItem_(upd_item)
+        except Exception as e:
+            log.warning("menubar update line failed: %s", e)
 
         if n_apps == 0:
             empty = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
@@ -358,6 +377,18 @@ class MenuBarController:
             menu.addItem_(recent_holder)
 
         menu.addItem_(NSMenuItem.separatorItem())
+
+
+def _update_line() -> str | None:
+    """The menu's update-notice text, or None when klyk is current (or the
+    check is disabled / has never succeeded). Pure formatting over the shared
+    cache — unit-testable without AppKit."""
+    from . import updates
+    st = updates.status()
+    if not st["update_available"]:
+        return None
+    return (f"⬆ Update available: {st['installed']} → {st['latest']} — "
+            "run `klyk update`")
 
 
 # Module-level singleton.

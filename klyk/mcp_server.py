@@ -6099,6 +6099,17 @@ def _run_on_macos() -> None:
     except Exception as e:
         log.warning("SkyLight delivery self-test skipped: %s: %s", type(e).__name__, e)
 
+    # 2b'. Update-freshness check — background daemon thread, at most one real
+    #      PyPI fetch per day (shared ~/.klyk/update_check.json cache), fully
+    #      offline-safe, opt-out via KLYK_UPDATE_CHECK=0. When a newer release
+    #      exists the menu-bar shows a one-line notice; nothing is ever added
+    #      to agent-facing tool responses (token-bloat consideration 4).
+    try:
+        from . import updates as _updates
+        _updates.start_background_check(on_checked=_refresh_menubar)
+    except Exception as e:
+        log.warning("update check not started: %s: %s", type(e).__name__, e)
+
     # 2c. Keyboard-layout warm — build the char→keycode map on the MAIN thread.
     #     Carbon/TIS input-source APIs (used to map characters to layout-correct
     #     keycodes) assert main-thread on macOS 14+; the old per-call staleness

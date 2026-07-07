@@ -107,6 +107,34 @@ def check_python_version() -> CheckResult:
     )
 
 
+def check_klyk_version() -> CheckResult:
+    """Installed vs latest published release. Uses the shared daily cache
+    (a fresh doctor run refetches when the cache is stale, capped at a 3 s
+    network wait). Offline or disabled is never a failure — the detail says
+    exactly what happened either way."""
+    from . import __version__, updates
+    if not updates.enabled():
+        return CheckResult(
+            "klyk version", "ok",
+            f"{__version__} (update check disabled via KLYK_UPDATE_CHECK=0)",
+        )
+    st = updates.check()
+    if st["latest"] is None:
+        return CheckResult(
+            "klyk version", "ok",
+            f"{__version__} (could not reach PyPI — freshness unverified)",
+        )
+    if st["update_available"]:
+        return CheckResult(
+            "klyk version", "warn",
+            f"{__version__} → {st['latest']} available",
+            "Run `klyk update` — one command upgrades klyk for every "
+            "connected AI client at once and restarts the running server, "
+            "so agents load the new version on their next call.",
+        )
+    return CheckResult("klyk version", "ok", f"{__version__} (latest release)")
+
+
 def check_pyobjc_imports() -> CheckResult:
     """klyk depends on AppKit, Foundation, Quartz from pyobjc. Verify
     they load."""
@@ -467,6 +495,7 @@ def run_all_checks() -> list[CheckResult]:
         check_platform(),
         check_macos_version(),
         check_python_version(),
+        check_klyk_version(),
         check_pyobjc_imports(),
         check_skylight(),
         check_skylight_delivery(),

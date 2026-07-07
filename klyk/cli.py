@@ -12,7 +12,12 @@ gives them the `klyk` command, and from there:
                                    --ambient (add a shell-fallback note to the
                                    client's context file), --wait (poll until you
                                    grant permissions), --list (show all clients).
-    klyk update             — update klyk to the latest release (pip -U).
+    klyk update             — update klyk to the latest release. Detects how
+                                   klyk was installed (pipx / uv / pip) and runs
+                                   the matching upgrade, then restarts the
+                                   running server so every connected agent gets
+                                   the new version on its next call.
+                                   --check only reports if an update exists.
     klyk doctor [--fix]     — green/yellow/red health check; --fix auto-repairs
                                    what it can (state dir, config entry).
     klyk restart            — stop the klyk instance currently driving the Mac
@@ -135,27 +140,82 @@ def _doctor_fix() -> None:
 
 
 def _update(rest: list[str]) -> None:
-    """Update klyk to the latest published release via pip, in klyk's own
-    environment. Reports the version before and after."""
-    from . import __version__ as before
-    print(f"Updating klyk (currently {before})…", flush=True)
-    r = subprocess.run(
-        [sys.executable, "-m", "pip", "install", "-U", "klyk"],
-        capture_output=True, text=True,
-    )
-    if r.returncode != 0:
-        sys.stderr.write(r.stderr)
-        print("✗ Update failed. If you installed klyk with pipx/uv, update it "
-              "with that tool instead.", file=sys.stderr)
+    """Update klyk to the latest published release, using the upgrade command
+    that matches HOW klyk was installed (pipx / uv tool / pip — detected
+    automatically), then restart the running server so every connected agent
+    loads the new version on its next call. `--check` only reports whether
+    an update exists, changing nothing."""
+    from . import __version__ as before, updates
+
+    if "--check" in rest:
+        st = updates.check(force=True)
+        if st["latest"] is None:
+            print(f"klyk {before} — could not reach PyPI to compare. "
+                  "Check your connection and retry.")
+            sys.exit(1)
+        if st["update_available"]:
+            print(f"Update available: {before} → {st['latest']}. Run `klyk update`.")
+        else:
+            print(f"klyk {before} is the latest release.")
+        return
+
+    method = updates.install_method()
+    if method == "editable":
+        print(f"klyk {before} is a development (editable) install — it tracks "
+              "the source checkout, not PyPI. Update it with `git pull` in the repo.")
+        return
+
+    cmd = updates.upgrade_command(method)
+    print(f"Updating klyk {before} (installed via {method}) — running: "
+          f"{' '.join(cmd)}", flush=True)
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True)
+    except FileNotFoundError:
+        print(f"✗ `{cmd[0]}` is not on PATH, but this klyk lives in a {method}-"
+              f"managed environment. Install {cmd[0]} (or reinstall klyk with "
+              "`pipx install klyk`), then re-run `klyk update`.", file=sys.stderr)
         sys.exit(1)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr or r.stdout)
+        print(f"✗ Update failed (see the {cmd[0]} output above).", file=sys.stderr)
+        sys.exit(1)
+
     after = subprocess.run(
         [sys.executable, "-c", "import klyk; print(klyk.__version__)"],
         capture_output=True, text=True,
     ).stdout.strip() or before
+    # Record the fresh state so the doctor and menu-bar stop showing a
+    # now-stale "update available" the moment the upgrade lands.
+    updates.check(force=True)
+
     if after == before:
         print(f"✓ Already on the latest version ({before}).")
+        return
+    print(f"✓ Updated klyk {before} → {after}.")
+    _restart_after_update()
+
+
+def _restart_after_update() -> None:
+    """Stop the currently running klyk server (if any) so the MCP client
+    respawns it with the new code on the next tool call — no manual client
+    restart needed. Fully transparent about what happened."""
+    from .ownership import current_owner
+    from .launcher import terminate_pid
+    owner = current_owner()
+    if not owner:
+        print("  No klyk server was running — the new version loads on the next session.")
+        return
+    try:
+        os.kill(owner, 0)
+    except OSError:
+        print("  No klyk server was running — the new version loads on the next session.")
+        return
+    if terminate_pid(owner):
+        print(f"  ✓ Restarted the running klyk server (pid {owner}) — connected "
+              "agents load the new version on their next call.")
     else:
-        print(f"✓ Updated klyk {before} → {after}. Restart your AI client to load it.")
+        print(f"  ⚠ Could not stop the running klyk server (pid {owner}). "
+              "Run `klyk restart` (or restart your AI client) to load the new version.")
 
 
 # ---------------------------------------------------------------------------
