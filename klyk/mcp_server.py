@@ -404,6 +404,20 @@ _SERVER_INSTRUCTIONS = (
 
 server = Server("klyk", version=__version__, instructions=_SERVER_INSTRUCTIONS)
 
+# MCP SDK 1.x registers low-level handlers through decorators; 2.x registers
+# typed request callbacks. Keep the handler bodies identical across both APIs.
+_MCP_USES_TYPED_HANDLERS = not hasattr(server, "list_tools")
+if _MCP_USES_TYPED_HANDLERS:
+    def _defer_handler_registration(handler):
+        """Keep a handler callable until MCP 2.x adapters register it below."""
+        return handler
+
+    _list_tools_handler = _defer_handler_registration
+    _call_tool_handler = _defer_handler_registration
+else:
+    _list_tools_handler = server.list_tools()
+    _call_tool_handler = server.call_tool()
+
 # ---------------------------------------------------------------------------
 # Shared schema fragments
 # ---------------------------------------------------------------------------
@@ -1997,8 +2011,11 @@ TOOLS = [
             "`click(x, y)` whenever the target has visible text. Tries the AX tree first "
             "(case-insensitive partial match), falls back to on-device OCR so it works on "
             "canvas, browser content, and Electron. For menu-bar items use `click_menu`. "
-            "`index` picks among multiple matches (default 0). `window` scopes the search to "
-            "one window of a multi-window app. Response includes `via` so you can tell which "
+            "An explicit `index` picks among multiple matches. When OCR finds multiple equally "
+            "ranked best matches and `index` is omitted, the tool FAILS CLOSED without clicking "
+            "and returns each candidate's coordinates and dimensions for disambiguation. `window` "
+            "scopes the search to one window of a multi-window app. Response includes `via` so you "
+            "can tell which "
             "tier hit: `ax_action` (AXPress/AXOpen at element or parent level), "
             "`ax_match+skylight` (AX-found target, SkyLight-delivered click), `ocr+skylight`, "
             "or `cursor_warp` (humanoid mode). Background mode returns "
@@ -2021,8 +2038,11 @@ TOOLS = [
                 },
                 "index": {
                     "type": "integer",
-                    "default": 0,
-                    "description": "Which match to click if multiple elements match (0-based).",
+                    "minimum": 0,
+                    "description": (
+                        "Explicit 0-based match to click. Omit it to fail closed when multiple "
+                        "equally ranked OCR matches remain."
+                    ),
                 },
                 **_VERIFY_PARAM,
             },
@@ -2956,7 +2976,13 @@ async def _resolve_label_in_window(
 # step with a missing/out-of-range arg would otherwise surface as an opaque
 # KeyError/ValueError. No tool schema uses additionalProperties:false, so the
 # keys `run` injects (app, window_id) never trip validation.
-_TOOL_SCHEMAS = {t.name: t.inputSchema for t in TOOLS}
+def _tool_input_schema(tool: types.Tool) -> dict:
+    """Return a tool schema across the MCP SDK 1.x and 2.x field names."""
+    schema = getattr(tool, "inputSchema", None)
+    return schema if schema is not None else tool.input_schema
+
+
+_TOOL_SCHEMAS = {t.name: _tool_input_schema(t) for t in TOOLS}
 # Pre-build one validator per tool. The bare jsonschema.validate() convenience
 # function rebuilds (and re-check_schemas) the validator on EVERY call — ~1 ms
 # each, so a long `run` paid hundreds of ms of pure validation overhead. Cached
@@ -2971,7 +2997,7 @@ else:
     _TOOL_VALIDATORS = {}
 
 
-@server.list_tools()
+@_list_tools_handler
 async def list_tools() -> list[types.Tool]:
     return TOOLS
 
@@ -3199,7 +3225,7 @@ def _refresh_menubar() -> None:
         pass
 
 
-@server.call_tool()
+@_call_tool_handler
 async def call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent | types.ImageContent]:
@@ -5499,6 +5525,7 @@ async def call_tool(
         elif name == "click_element":
             session, _ = await _get_session(args, name)
             query = _normalize_label(args["label"])
+            index_explicit = "index" in args
             index = int(args.get("index", 0))
 
             # Optional window filter: scope the AX scan (and OCR fallback's screenshot)
@@ -5728,6 +5755,33 @@ async def call_tool(
                 # matches the query beats one that merely contains it.
                 _rank_ocr_matches(ocr_matches, query)
                 if ocr_matches:
+                    # OCR knows where text rendered, not which duplicate is the intended
+                    # control. Never let stable reading order silently decide between tied
+                    # best matches; return lean geometry unless the caller chose an index.
+                    best_tier = _match_tier(ocr_matches[0].get("text", ""), query)
+                    best_matches = [
+                        match for match in ocr_matches
+                        if _match_tier(match.get("text", ""), query) == best_tier
+                    ]
+                    if not index_explicit and len(best_matches) > 1:
+                        match_limit = 12
+                        payload = {
+                            "ok": False,
+                            "ambiguous": True,
+                            "error": (
+                                f"{len(best_matches)} equally ranked OCR matches found for "
+                                f"'{args['label']}' — nothing was clicked."
+                            ),
+                            "matches_found": len(best_matches),
+                            "matches": best_matches[:match_limit],
+                            "suggestion": (
+                                "Inspect the candidate coordinates and dimensions, then call "
+                                "click_element again with an explicit 0-based index."
+                            ),
+                        }
+                        if len(best_matches) > match_limit:
+                            payload["matches_truncated"] = len(best_matches) - match_limit
+                        return [types.TextContent(type="text", text=json.dumps(payload))]
                     if index >= len(ocr_matches):
                         return [types.TextContent(type="text", text=json.dumps({
                             "error": f"Index {index} out of range — {len(ocr_matches)} OCR match(es) found.",
@@ -5962,6 +6016,24 @@ async def call_tool(
         depth_str = "" if is_top_level else " nested=1"
         log.info(f"done: {name} duration_ms={duration_ms}{gap_str}{depth_str}")
     return response
+
+
+if _MCP_USES_TYPED_HANDLERS:
+    async def _list_tools_typed(_context, _params):
+        """Adapt klyk's tool list to the MCP SDK 2.x result model."""
+        return types.ListToolsResult(tools=await list_tools())
+
+    async def _call_tool_typed(_context, params):
+        """Adapt an MCP SDK 2.x call request to klyk's stable dispatcher."""
+        content = await call_tool(params.name, params.arguments)
+        return types.CallToolResult(content=content)
+
+    server.add_request_handler(
+        "tools/list", types.PaginatedRequestParams, _list_tools_typed,
+    )
+    server.add_request_handler(
+        "tools/call", types.CallToolRequestParams, _call_tool_typed,
+    )
 
 
 # ---------------------------------------------------------------------------
