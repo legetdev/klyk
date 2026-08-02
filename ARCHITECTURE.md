@@ -38,6 +38,9 @@ klyk/
 ├── keycodes.py          # macOS virtual key code table (regular keys)
 ├── ax_roles.py          # Shared AX role catalogs — INTERACTIVE / BROWSER_INTERACTIVE
 ├── skylight.py          # Private SkyLight framework binding — invisible mouse path
+├── clients.py           # MCP-client registry + safe JSON/JSONC/TOML config writers
+├── jsonc.py             # Atomic comment-preserving OpenCode config edits
+├── cli.py               # Install, uninstall, doctor, update, and restart commands
 ├── updates.py           # Update awareness — daily cached PyPI check + install-method
 │                        #   detection driving `klyk update` (pipx / uv / pip / editable).
 │                        #   Shared state: ~/.klyk/update_check.json (single small file,
@@ -55,6 +58,11 @@ klyk/
 ---
 
 ## Architecture Details
+
+### MCP client configuration
+`clients.py` keeps every supported local agent in one registry and always points it at the exact Python interpreter that owns the installed klyk package. Most JSON clients share a simple `mcpServers` merge; Codex/Grok use append-only TOML blocks because Python's standard library cannot safely rewrite TOML.
+
+OpenCode has a distinct global `mcp` shape and accepts both JSON and JSONC. Its stdlib-only span editor parses comments and trailing commas, edits only `mcp.klyk`, preserves unrelated bytes and file permissions, writes through an atomic same-directory replace, follows OpenCode's `config.json` → `opencode.json` → `opencode.jsonc` precedence, and removes klyk from every loaded global file on uninstall. Invalid or ambiguous structures fail closed with an exact manual snippet; no config is partially rewritten. After installation, the CLI runs `opencode mcp list` as a native end-to-end gate because macOS permissions are launcher-specific: a doctor pass in the installer process does not prove that OpenCode's spawned server has the same grant.
 
 ### CoreGraphics via ctypes
 All input events use Apple's CoreGraphics framework directly via Python's `ctypes`. No third-party computer use libraries. The "humanoid" mode posts events to `kCGHIDEventTap` — the hardware input tap — so the OS processes them identically to physical input. The default "autonomous" mode and the strict "background" mode route mouse events through SkyLight instead (see Seamless Mode section below).

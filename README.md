@@ -82,14 +82,14 @@ You never have to wonder whether you're behind, either:
 
 Behind these sits a single once-a-day check of klyk's own PyPI metadata (nothing about you or your screen is sent — see the Security model below), cached in `~/.klyk/update_check.json` and fully offline-safe. Set `KLYK_UPDATE_CHECK=0` to disable it entirely.
 
-**One driver at a time.** Any number of MCP clients can have klyk configured and connected simultaneously (Claude Code *and* Cursor *and* Gemini CLI…) — each spawns its own klyk process, and none is ever refused. But only **one** session holds the control token and actually drives the Mac at a time, so two agents can never interleave clicks and keystrokes into the same app. A new session takes control automatically when the previous driver is gone; taking over from a *live* driver is an explicit `take_control` call. Exactly one menu-bar eye is visible: the active driver's.
+**One driver at a time.** Any number of MCP clients can have klyk configured and connected simultaneously (Claude Code *and* OpenCode *and* Cursor…) — each spawns its own klyk process, and none is ever refused. But only **one** session holds the control token and actually drives the Mac at a time, so two agents can never interleave clicks and keystrokes into the same app. A new session takes control automatically when the previous driver is gone; taking over from a *live* driver is an explicit `take_control` call. Exactly one menu-bar eye is visible: the active driver's.
 
 ### Use with other MCP clients
 
 `klyk install <client>` auto-configures any supported client — same turnkey flow as Claude (writes the config, grants permissions, runs a health check):
 
 ```bash
-klyk install cursor      # or: windsurf · continue · cline · codex · gemini · antigravity (agy) · grok
+klyk install opencode    # or: cursor · windsurf · continue · cline · codex · gemini · antigravity (agy) · grok
 klyk install --list      # show every supported client and its config path
 ```
 
@@ -101,9 +101,19 @@ klyk install --list      # show every supported client and its config path
 | Continue | `~/.continue/config.json` |
 | Cline | VS Code globalStorage `cline_mcp_settings.json` |
 | OpenAI Codex CLI | `~/.codex/config.toml` |
+| OpenCode CLI | `~/.config/opencode/opencode.json` or `opencode.jsonc` (legacy `config.json` is honored) |
 | Gemini CLI | `~/.gemini/settings.json` |
 | Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/mcp_config.json` |
 | Grok CLI (xAI) | `~/.grok/config.toml` |
+
+For OpenCode, setup and verification are two commands:
+
+```bash
+klyk install opencode
+opencode mcp list        # klyk should show connected
+```
+
+Klyk writes OpenCode's global local-MCP entry, so it is available in every workspace and with every provider/model that supports tool use. Existing JSON/JSONC comments, trailing commas, formatting, permissions, providers, and other MCP servers are preserved; re-running the installer is safe, and `klyk uninstall opencode` removes only klyk. The installer finishes by running OpenCode's own MCP status check, catches launcher-specific macOS permission gaps, and does not declare success until OpenCode reports klyk connected. OpenCode normally reloads config changes automatically.
 
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 
@@ -178,6 +188,7 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 | `ocr.py` | Apple Vision OCR (two-pass: fast then accurate) |
 | `matcher.py` | Pure-NumPy template matching (FFT + integral-image NCC) with template cache support |
 | `grader.py`, `reporter.py` | Verdict + UI grading helpers |
+| `clients.py`, `jsonc.py` | Multi-client setup plus atomic, comment-preserving OpenCode configuration |
 | `updates.py` | Update awareness (daily cached PyPI check) + `klyk update` plumbing |
 | `keycodes.py`, `logs.py` | Low-level support |
 

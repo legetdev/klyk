@@ -391,68 +391,78 @@ def check_klyk_log_writable() -> CheckResult:
         )
 
 
-def check_claude_json_entry() -> CheckResult:
-    """Verify ~/.claude.json has a klyk entry pointing at a resolvable
-    Python executable. Specific to Claude Code (which reads that file);
-    other MCP clients have their own config paths and are NOT covered
-    by this check — that's expected, this warn is purely "Claude Code
-    isn't configured to use klyk yet, run klyk install if you
-    want it to be"."""
-    claude_path = Path.home() / ".claude.json"
-    if not claude_path.exists():
+def check_mcp_client_entries() -> CheckResult:
+    """Verify every configured klyk client points at this exact installation."""
+    from . import clients
+
+    valid: list[str] = []
+    problems: list[str] = []
+    repair_keys: list[str] = []
+    for client in clients.CLIENTS.values():
+        if not clients.config_files(client):
+            continue
+        try:
+            entry = clients.current_entry(client)
+        except Exception as exc:
+            problems.append(f"{client.label}: unreadable config ({exc})")
+            repair_keys.append(client.key)
+            continue
+        if entry is None:
+            continue
+        if not isinstance(entry, dict):
+            problems.append(f"{client.label}: klyk entry is not an object")
+            repair_keys.append(client.key)
+            continue
+
+        if client.fmt == "opencode":
+            command = entry.get("command")
+            expected = client.entry["command"]
+            if not isinstance(command, list) or not command:
+                problems.append(f"{client.label}: local command must be a non-empty array")
+                repair_keys.append(client.key)
+                continue
+            cmd, args = str(command[0]), [str(arg) for arg in command[1:]]
+            matches = entry.get("type") == "local" and command == expected
+        else:
+            cmd = entry.get("command", "")
+            args = entry.get("args", [])
+            if not isinstance(cmd, str) or not isinstance(args, list):
+                problems.append(f"{client.label}: command/args have the wrong type")
+                repair_keys.append(client.key)
+                continue
+            matches = cmd == client.entry["command"] and args == client.entry["args"]
+        resolved = shutil.which(cmd) if cmd else None
+        if not resolved:
+            problems.append(f"{client.label}: command {cmd!r} does not resolve")
+            repair_keys.append(client.key)
+            continue
+        if not matches:
+            problems.append(f"{client.label}: entry points at a different klyk installation")
+            repair_keys.append(client.key)
+            continue
+        valid.append(client.label)
+
+    if problems:
+        commands = ", ".join(f"`klyk install {key}`" for key in dict.fromkeys(repair_keys))
         return CheckResult(
-            "~/.claude.json klyk entry", "warn",
-            "~/.claude.json not present",
-            "Run `klyk install` to add klyk to Claude Code's MCP "
-            "config. If you only use klyk via a different MCP client "
-            "(Cursor, Cline, Continue, Windsurf, etc.), ignore this — "
-            "those clients have their own MCP config locations. See the "
-            "README's `Use with other MCP clients` section for the snippet.",
+            "MCP client config", "fail", "; ".join(problems),
+            f"Repair the affected entry with {commands}, then re-run `klyk doctor`.",
         )
-    try:
-        with open(claude_path) as f:
-            cfg = json.load(f)
-    except Exception as e:
+    if valid:
         return CheckResult(
-            "~/.claude.json klyk entry", "fail",
-            f"could not parse: {type(e).__name__}",
-            f"~/.claude.json is corrupted JSON ({e}). Fix the file manually "
-            "and re-run `klyk doctor`.",
-        )
-    servers = cfg.get("mcpServers") or {}
-    entry = servers.get("klyk")
-    if not entry:
-        return CheckResult(
-            "~/.claude.json klyk entry", "warn",
-            "klyk not configured in Claude Code",
-            "Run `klyk install` to add it. Other MCP clients use their "
-            "own config files (see README) and are not checked here.",
-        )
-    cmd = entry.get("command", "")
-    args = entry.get("args", [])
-    resolved = shutil.which(cmd) if cmd else None
-    if not resolved:
-        return CheckResult(
-            "~/.claude.json klyk entry", "fail",
-            f"command {cmd!r} does not resolve on PATH",
-            f"Claude Code will fail to spawn klyk because {cmd!r} isn't on "
-            "PATH. Re-run `klyk install` to refresh the entry, or edit "
-            "~/.claude.json to point at a valid Python (`which python3` "
-            "gives you a working path).",
-        )
-    # Verify the path klyk.mcp_server or the legacy shim resolves
-    target = args[-1] if args else ""
-    if target.startswith("/") and not Path(target).exists():
-        return CheckResult(
-            "~/.claude.json klyk entry", "fail",
-            f"target script {target!r} does not exist",
-            f"~/.claude.json points at {target!r} but the file isn't there. "
-            "Re-run `klyk install` to point at the installed package.",
+            "MCP client config", "ok", f"configured: {', '.join(valid)}",
         )
     return CheckResult(
-        "~/.claude.json klyk entry", "ok",
-        f"{cmd} {' '.join(args)}",
+        "MCP client config", "warn", "klyk is not configured in a supported client",
+        "Run `klyk install` for Claude Code, or `klyk install <client>` for "
+        "OpenCode, Codex, Cursor, Gemini, or another client listed by "
+        "`klyk install --list`.",
     )
+
+
+def check_claude_json_entry() -> CheckResult:
+    """Backward-compatible alias for the now client-agnostic config check."""
+    return check_mcp_client_entries()
 
 
 def check_control_owner() -> CheckResult:
@@ -504,7 +514,7 @@ def run_all_checks() -> list[CheckResult]:
         check_klyk_log_writable(),
         check_accessibility_permission(),
         check_screen_recording_permission(),
-        check_claude_json_entry(),
+        check_mcp_client_entries(),
         check_control_owner(),
     ]
 

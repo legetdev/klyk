@@ -7,7 +7,8 @@ gives them the `klyk` command, and from there:
                                    permissions, run a health check. One command,
                                    no prompts. Defaults to Claude Code; pass a
                                    client (cursor, windsurf, continue, cline,
-                                   codex, gemini, antigravity/agy, grok) for another.
+                                   codex, opencode, gemini, antigravity/agy,
+                                   grok) for another.
                                    Flags: --all (wire every detected client),
                                    --ambient (add a shell-fallback note to the
                                    client's context file), --wait (poll until you
@@ -36,6 +37,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -109,8 +111,7 @@ def _doctor(rest: list[str]) -> None:
 
 
 def _doctor_fix() -> None:
-    """Best-effort auto-repair: create the state dir + refresh the Claude config
-    entry, then re-run the health check. Permission toggles still need you."""
+    """Repair state plus stale configured-client entries, then re-run checks."""
     home = Path.home()
     fixed: list[str] = []
     kdir = home / ".klyk"
@@ -120,13 +121,16 @@ def _doctor_fix() -> None:
             fixed.append("created ~/.klyk")
         except Exception as e:
             print(f"  ⚠ could not create ~/.klyk: {e}")
-    c = clients.get("claude")
-    try:
-        if c is not None and clients.is_present(c) and clients.current_entry(c) != c.entry:
-            clients.write_entry(c)
-            fixed.append("refreshed the Claude Code config entry")
-    except Exception:
-        pass
+    for c in clients.CLIENTS.values():
+        try:
+            existing = clients.current_entry(c)
+            default_claude = c.key == "claude" and clients.is_present(c)
+            if (existing is not None or default_claude) and existing != c.entry:
+                clients.write_entry(c)
+                fixed.append(f"refreshed the {c.label} config entry")
+        except Exception:
+            # The full doctor output below reports the exact file and remedy.
+            continue
     print("Repaired:" if fixed else "Nothing auto-repairable was off.")
     for f in fixed:
         print(f"  ✓ {f}")
@@ -273,9 +277,10 @@ def _configure_client(client) -> bool:
     differing entry; prints a paste snippet when a file can't be auto-edited.
     Returns True if the client is left configured."""
     try:
-        existing = clients.current_entry(client)
+        clients.current_entry(client)
     except Exception as e:
-        print(f"  ✗ Could not read {client.path}: {e}")
+        path = clients.config_path(client)
+        print(f"  ✗ Could not read {path}: {e}")
         print("    Fix the file, then re-run. Or add this manually:")
         print(_indent(clients.snippet(client)))
         return False
@@ -290,14 +295,16 @@ def _configure_client(client) -> bool:
         print(_indent(e.snippet))
         return False
     except Exception as e:
-        print(f"  ✗ Could not write {client.path}: {e}")
+        path = clients.config_path(client)
+        print(f"  ✗ Could not write {path}: {e}")
         print("    Add this manually instead:")
         print(_indent(clients.snippet(client)))
         return False
 
+    path = clients.config_path(client)
     msg = {
-        "added": f"✓ Added klyk to {client.label} ({client.path})",
-        "updated": f"✓ Updated klyk in {client.label} ({client.path})",
+        "added": f"✓ Added klyk to {client.label} ({path})",
+        "updated": f"✓ Updated klyk in {client.label} ({path})",
         "unchanged": f"✓ klyk already configured in {client.label}",
     }[action]
     print(f"  {msg}")
@@ -328,6 +335,11 @@ def _install(rest: list[str]) -> None:
     else:
         targets = [_resolve_client(rest)]
 
+    if any(c.key == "opencode" for c in targets) and _opencode_executable() is None:
+        print("OpenCode CLI is not installed, so its MCP connection cannot be verified.")
+        print("Install OpenCode, then re-run `klyk install opencode`.")
+        sys.exit(1)
+
     print("klyk install")
     print("=================")
     print()
@@ -335,9 +347,16 @@ def _install(rest: list[str]) -> None:
     # Step 1 — client MCP config(s).
     label = f"{len(targets)} detected clients" if all_mode else targets[0].label
     print(f"Step 1 — Configure {label}")
+    failed: list = []
     for c in targets:
-        _configure_client(c)
+        if not _configure_client(c):
+            failed.append(c)
     print()
+    if failed:
+        names = ", ".join(c.label for c in failed)
+        print(f"Configuration failed for: {names}.")
+        print("Nothing was silently skipped. Fix the file issue above and re-run the same command.")
+        sys.exit(1)
 
     # Step 2 — macOS permissions (apply to the process running klyk, for any client).
     print("Step 2 — macOS permissions")
@@ -370,6 +389,15 @@ def _install(rest: list[str]) -> None:
         print("Some items above need attention. Fix them, then re-run `klyk doctor`.")
         sys.exit(1)
 
+    # OpenCode runs MCP subprocesses under its own macOS responsibility chain,
+    # so terminal permissions alone do not prove the real client can connect.
+    # Its native status command is the only cheap end-to-end setup check.
+    if any(c.key == "opencode" for c in targets):
+        print("Step 4 — Verify OpenCode connection")
+        if not _verify_opencode_connection():
+            sys.exit(1)
+        print()
+
     if ax_ok and sr_ok:
         if all_mode:
             print("Restart each client above to load klyk.")
@@ -388,13 +416,67 @@ def _install(rest: list[str]) -> None:
             if c.context_file is not None:
                 _write_context_guide(c)
 
-    # Step 4 — offer to wire every other AI client on the Mac. Permissions are
+    # Finally, offer to wire every other AI client on the Mac. Permissions are
     # already granted (they attach to the user, not the client), so the rest is
     # pure config writes — one prompt instead of a command per client. Skipped in
     # --all mode, which already configured everything detected.
     if not all_mode:
         print()
         _wire_other_clients(targets[0])
+
+
+def _opencode_executable() -> str | None:
+    """Resolve OpenCode from PATH or its standard macOS installer location."""
+    found = shutil.which("opencode")
+    if found:
+        return found
+    fallback = Path.home() / ".opencode" / "bin" / "opencode"
+    return str(fallback) if fallback.is_file() else None
+
+
+def _verify_opencode_connection() -> bool:
+    """Use OpenCode itself to prove the newly configured klyk server connects."""
+    executable = _opencode_executable()
+    if executable is None:
+        print("  ✗ OpenCode CLI is not installed, so the MCP connection cannot be verified.")
+        print("    Install OpenCode, then re-run `klyk install opencode`.")
+        return False
+    try:
+        result = subprocess.run(
+            [executable, "mcp", "list"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            env={**os.environ, "KLYK_UPDATE_CHECK": "0"},
+        )
+    except subprocess.TimeoutExpired:
+        print("  ✗ `opencode mcp list` did not finish within 20 seconds.")
+        print("    Stop any wedged OpenCode process, then re-run `klyk install opencode`.")
+        return False
+    except OSError as exc:
+        print(f"  ✗ Could not run {executable}: {exc}")
+        return False
+
+    output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout + "\n" + result.stderr)
+    connected = any(
+        re.search(r"\bklyk\b", line, re.IGNORECASE)
+        and re.search(r"\bconnected\b", line, re.IGNORECASE)
+        and not re.search(
+            r"\bnot\s+connected\b|\bfailed\b|\berror\b", line, re.IGNORECASE,
+        )
+        for line in output.splitlines()
+    )
+    if result.returncode == 0 and connected:
+        print("  ✓ OpenCode started klyk and reports it connected")
+        return True
+    print("  ✗ OpenCode could not start klyk (`opencode mcp list` is not connected).")
+    print("    Grant Accessibility and Screen Recording to the app that launches OpenCode")
+    print("    (Terminal, Ghostty, iTerm, or OpenCode Desktop). If it is already enabled,")
+    print("    add the OpenCode executable too:")
+    print(f"      {executable}")
+    print("    Fully restart the launcher and OpenCode, then")
+    print("    re-run `klyk install opencode`. No fallback was substituted.")
+    return False
 
 
 def _write_context_guide(client) -> None:
@@ -475,20 +557,27 @@ def _verify_permission(label: str, check_fn, deep_link: str, wait: bool = False)
 # ---------------------------------------------------------------------------
 
 
-def _unwire_client(client) -> None:
-    """Remove klyk's entry (and any context note) from ONE client's config."""
+def _unwire_client(client) -> bool:
+    """Remove one client's klyk entry/context note and report full success."""
+    ok = True
     try:
         removed = clients.remove_entry(client)
         print(f"  ✓ removed klyk from {client.label}" if removed
               else f"  · {client.label}: not configured")
     except clients.ManualEditRequired as e:
         print(f"  ⚠ {client.label}: {e}")
+        ok = False
+    except Exception as e:
+        print(f"  ✗ {client.label}: could not remove klyk: {e}")
+        ok = False
     if client.context_file is not None:
         try:
             if clients.remove_context_block(client):
                 print(f"  ✓ removed the klyk note from {client.context_file}")
         except Exception as e:
             print(f"  ⚠ could not edit {client.context_file}: {e}")
+            ok = False
+    return ok
 
 
 def _uninstall(rest: list[str]) -> None:
@@ -497,19 +586,24 @@ def _uninstall(rest: list[str]) -> None:
     (The pip package itself is removed with `pip uninstall klyk`.)"""
     specific = next((a for a in rest if not a.startswith("-")), None)
     if specific is not None and "--all" not in rest:
-        _unwire_client(_resolve_client(rest))
+        if not _unwire_client(_resolve_client(rest)):
+            sys.exit(1)
         return
 
     print("Uninstalling klyk completely…\n")
     print("Clients:")
     any_client = False
+    client_failures = False
     for c in clients.CLIENTS.values():
         try:
             if clients.current_entry(c) is not None or clients.context_block_present(c):
-                _unwire_client(c)
+                if not _unwire_client(c):
+                    client_failures = True
                 any_client = True
-        except Exception:
-            pass
+        except Exception as e:
+            print(f"  ✗ {c.label}: could not inspect its config: {e}")
+            client_failures = True
+            any_client = True
     if not any_client:
         print("  · none were configured")
 
@@ -528,6 +622,10 @@ def _uninstall(rest: list[str]) -> None:
             p.unlink(missing_ok=True)
             print(f"  ✓ removed {p}")
 
+    if client_failures:
+        print("\nSome client configuration could not be removed.")
+        print("Fix the errors above, then re-run.")
+        sys.exit(1)
     print("\nklyk's config, state, and binaries are gone.")
     print("Finally, remove the package itself:  pip uninstall klyk")
 

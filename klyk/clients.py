@@ -1,12 +1,11 @@
 """Registry of MCP clients that `klyk install <client>` can auto-configure.
 
 Design goal: onboarding to any client should be as easy as adding an MCP to
-Claude. Supporting a new agent CLI = ONE entry in CLIENTS — the same stdio
-launch entry is reused everywhere; only the config file location and on-disk
-shape differ. This keeps the surface uniform and trivially extensible as new
-clients appear, without touching the installer logic.
+Claude. Clients that share a known shape need only one CLIENTS entry; a
+genuinely distinct format gets one focused adapter behind the same API. Every
+client reuses the exact stdio launch entry.
 
-Two on-disk shapes are handled:
+Three on-disk shapes are handled:
   - "json"  : a JSON file with a top-level `mcpServers` map (Claude, Cursor,
               Windsurf, Continue, Cline, Gemini/Antigravity). Merged in place so
               the client's other settings are preserved.
@@ -14,15 +13,22 @@ Two on-disk shapes are handled:
               stdlib can read TOML but not write it, so we append the table when
               it's absent and fall back to a printed snippet when a differing
               entry already exists (never clobber hand-edited TOML).
+  - "opencode": OpenCode's global JSON/JSONC config with a top-level `mcp` map
+              and array-form local command. A small stdlib-only JSONC editor
+              preserves comments, trailing commas, formatting, and unrelated
+              settings while updating only `mcp.klyk`.
 """
 
 from __future__ import annotations
 
 import json
+import shutil
 import sys
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
+
+from . import jsonc
 
 # Key under which klyk registers in every client's config.
 SERVER_KEY = "klyk"
@@ -42,6 +48,13 @@ LAUNCH_ENTRY = {
 # with existing installs so the idempotency check stays stable.
 _CLAUDE_ENTRY = {"type": "stdio", **LAUNCH_ENTRY}
 
+# OpenCode follows its own native local-MCP shape: the executable and arguments
+# are one array under `command`, with no redundant enabled/env fields.
+_OPENCODE_ENTRY = {
+    "type": "local",
+    "command": [LAUNCH_ENTRY["command"], *LAUNCH_ENTRY["args"]],
+}
+
 
 class ManualEditRequired(Exception):
     """Raised when a config can't be safely auto-edited; carries a paste snippet."""
@@ -56,7 +69,7 @@ class Client:
     key: str          # identifier used as `klyk install <key>`
     label: str        # human-readable name
     path: Path        # config file location
-    fmt: str          # "json" | "toml"
+    fmt: str          # "json" | "toml" | "opencode"
     note: str = ""    # shown after a successful install
     entry: dict = field(default_factory=lambda: dict(LAUNCH_ENTRY))
     # Optional natural-language context file this client feeds to its model
@@ -98,6 +111,12 @@ CLIENTS: dict[str, Client] = {
         "codex", "OpenAI Codex CLI", _h(".codex", "config.toml"), "toml",
         "Restart the Codex CLI to load klyk.",
     ),
+    "opencode": Client(
+        "opencode", "OpenCode CLI",
+        _h(".config", "opencode", "opencode.json"), "opencode",
+        "OpenCode reloads the config automatically. Run `opencode mcp list` "
+        "to confirm klyk is connected.", dict(_OPENCODE_ENTRY),
+    ),
     "gemini": Client(
         "gemini", "Gemini CLI", _h(".gemini", "settings.json"), "json",
         "Restart the Gemini CLI, then run /mcp to confirm klyk is listed.",
@@ -131,7 +150,39 @@ def is_present(client: Client) -> bool:
     """Heuristic: is this client installed on this Mac? True when its config file
     exists or its config directory does — both are created on the client's first
     run, so this reliably distinguishes installed clients from the full catalog."""
+    if client.fmt == "opencode":
+        return (
+            shutil.which("opencode") is not None
+            or _h(".opencode", "bin", "opencode").is_file()
+            or any(path.exists() or path.is_symlink() for path in _opencode_paths(client))
+        )
     return client.path.exists() or client.path.parent.exists()
+
+
+def _opencode_paths(client: Client) -> tuple[Path, ...]:
+    """Return OpenCode's global config files in its actual load order."""
+    base = client.path.parent
+    return (base / "config.json", base / "opencode.json", base / "opencode.jsonc")
+
+
+def config_path(client: Client) -> Path:
+    """Return the config file klyk will edit, honoring OpenCode precedence."""
+    if client.fmt != "opencode":
+        return client.path
+    for path in reversed(_opencode_paths(client)):
+        if path.exists() or path.is_symlink():
+            return path
+    return client.path
+
+
+def config_files(client: Client) -> tuple[Path, ...]:
+    """Return every existing file that may contain this client's klyk entry."""
+    if client.fmt == "opencode":
+        return tuple(
+            path for path in _opencode_paths(client)
+            if path.exists() or path.is_symlink()
+        )
+    return (client.path,) if client.path.exists() else ()
 
 
 # --- optional context-file guide (opt-in) --------------------------------
@@ -225,6 +276,9 @@ def list_text() -> str:
     return "\n".join(lines)
 
 
+ConfigFormatError = jsonc.ConfigFormatError
+
+
 def snippet(client: Client) -> str:
     """The exact config block a user would paste for this client."""
     if client.fmt == "toml":
@@ -234,12 +288,29 @@ def snippet(client: Client) -> str:
             f"command = {json.dumps(client.entry['command'])}\n"
             f"args = [{args}]\n"
         )
+    if client.fmt == "opencode":
+        return json.dumps({"mcp": {SERVER_KEY: client.entry}}, indent=2)
     return json.dumps({"mcpServers": {SERVER_KEY: client.entry}}, indent=2)
 
 
 # --- read helpers --------------------------------------------------------
 def current_entry(client: Client):
     """Return klyk's existing entry in this client's config, or None."""
+    if client.fmt == "opencode":
+        existing = None
+        for path in _opencode_paths(client):
+            if not path.exists() and not path.is_symlink():
+                continue
+            present, mcp = jsonc.top_level_property(
+                jsonc.read_exact(path), path, "mcp",
+            )
+            if not present:
+                continue
+            if not isinstance(mcp, dict):
+                raise ConfigFormatError(f"{path}: top-level 'mcp' must be an object")
+            if SERVER_KEY in mcp:
+                existing = mcp[SERVER_KEY]
+        return existing
     if not client.path.exists():
         return None
     if client.fmt == "toml":
@@ -258,7 +329,21 @@ def write_entry(client: Client) -> str:
     file already has a differing entry (we won't risk clobbering it)."""
     if client.fmt == "toml":
         return _write_toml(client)
+    if client.fmt == "opencode":
+        return _write_opencode(client)
     return _write_json(client)
+
+
+def _write_opencode(client: Client) -> str:
+    """Add or refresh klyk in OpenCode's effective global JSON/JSONC config."""
+    existing = current_entry(client)
+    path = config_path(client)
+    text = jsonc.read_exact(path) if path.exists() or path.is_symlink() else "{}\n"
+    updated = jsonc.set_mcp_entry(text, path, SERVER_KEY, client.entry)
+    if updated == text:
+        return "unchanged"
+    jsonc.atomic_write(path, updated)
+    return "updated" if existing is not None else "added"
 
 
 def _write_json(client: Client) -> str:
@@ -303,6 +388,8 @@ def _write_toml(client: Client) -> str:
 
 def remove_entry(client: Client) -> bool:
     """Remove klyk from this client's config. Returns True if removed."""
+    if client.fmt == "opencode":
+        return _remove_opencode(client)
     if not client.path.exists():
         return False
     if client.fmt == "toml":
@@ -323,4 +410,32 @@ def remove_entry(client: Client) -> bool:
     with open(client.path, "w", encoding="utf-8") as f:
         json.dump(data, f, indent=2)
         f.write("\n")
+    return True
+
+
+def _remove_opencode(client: Client) -> bool:
+    """Remove klyk from every OpenCode global config with rollback on failure."""
+    changes: list[tuple[Path, str, str]] = []
+    for path in _opencode_paths(client):
+        if not path.exists() and not path.is_symlink():
+            continue
+        original = jsonc.read_exact(path)
+        updated, changed = jsonc.remove_mcp_entry(original, path, SERVER_KEY)
+        if changed:
+            changes.append((path, original, updated))
+    if not changes:
+        return False
+
+    written: list[tuple[Path, str]] = []
+    try:
+        for path, original, updated in changes:
+            jsonc.atomic_write(path, updated)
+            written.append((path, original))
+    except Exception:
+        for path, original in reversed(written):
+            try:
+                jsonc.atomic_write(path, original)
+            except Exception:
+                pass
+        raise
     return True
