@@ -198,6 +198,10 @@ def launch_native_app(
     """
     prior_pid = _quick_pid_for_app(bundle_id, app_name)
     was_already_running = prior_pid is not None
+    if prior_pid is not None:
+        # Attaching must not open another default-profile instance (notably
+        # Electron apps launched with an isolated user-data directory).
+        return prior_pid, True
 
     if bundle_id:
         subprocess.Popen(["open", "-b", bundle_id])

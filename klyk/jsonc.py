@@ -357,7 +357,9 @@ def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
     if mcp.kind != "object":
         raise ConfigFormatError(f"{path}: top-level 'mcp' must be an object")
 
+    had_duplicates = False
     while len(_properties(mcp, server_key)) > 1:
+        had_duplicates = True
         duplicate = _properties(mcp, server_key)[0]
         text = _remove_property(text, mcp, mcp.properties.index(duplicate))
         root = parse_object(text, path)
@@ -365,6 +367,8 @@ def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
     matches = _properties(mcp, server_key)
     if matches:
         prop = matches[0]
+        if not had_duplicates and prop.value.to_python() == entry:
+            return text
         indent = _line_indent(text, prop.key_token.start)
         newline = "\r\n" if "\r\n" in text else "\n"
         rendered = _format_value(entry, indent, newline)

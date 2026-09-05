@@ -393,7 +393,13 @@ async def get_or_create_session(
             win = capture.get_window_by_id(existing.window_id)
             if win and win.get("pid") == existing.pid:
                 return existing, False
-            # Stale window or pid mismatch — fall through to relaunch.
+            # Losing a window is not permission to terminate a live app and
+            # its other documents. The caller can enumerate and explicitly
+            # select another live window, or close the session deliberately.
+            raise RuntimeError(
+                f"The selected window for {app!r} is no longer available. "
+                "No app was closed. Call list_windows and choose a current window_id."
+            )
         _close_session(existing)
         registry.delete_by_app(app)
         # Mirror close_app's cleanup so the relaunch doesn't inherit stale A/B/C
@@ -408,6 +414,8 @@ async def get_or_create_session(
         except Exception:
             pass
 
+    if len(registry.list_apps()) >= 64:
+        raise RuntimeError("The 64-app session limit was reached; close an unused session before opening another app.")
     resolved_target = target or "native"
     session = await create_session(
         target=resolved_target,

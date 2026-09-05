@@ -1,0 +1,21 @@
+name: Regression tests
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  portable:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        python: ['3.12', '3.14']
+        mcp: ['mcp>=1,<2', 'mcp>=2,<3']
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
+        with:
+          python-version: ${{ matrix.python }}
+      - run: python -m pip install . '${{ matrix.mcp }}'
+      - run: python -B -m unittest discover -s tests
+      - run: python tests/release_check.py

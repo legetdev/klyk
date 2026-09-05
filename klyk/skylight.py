@@ -683,6 +683,7 @@ def post_drag(
     button: str = "left",
     modifier_flags: int = 0,
     primer_first: bool = False,
+    check_stop=None,
 ) -> bool:
     """
     Fire a drag sequence: mouse-down at (x1, y1), `steps` interpolated
@@ -697,6 +698,8 @@ def post_drag(
 
     Returns True on success, False if SkyLight wasn't available.
     """
+    if check_stop is not None:
+        check_stop()
     if not _AVAILABLE:
         return False
     if primer_first:
@@ -713,32 +716,36 @@ def post_drag(
         _post_event(pid, ev_down)
     finally:
         _release(ev_down)
-    time.sleep(0.05)
-
-    # Interpolated drag events.
-    for i in range(1, steps + 1):
-        t = i / steps
-        px = x1 + (x2 - x1) * t
-        py = y1 + (y2 - y1) * t
-        ev_drag = _cg.CGEventCreateMouseEvent(None, drag_type, placeholder, btn_index)
-        try:
-            # Pressure stays 1.0 throughout the drag — release is on the
-            # final mouse-up event, not the last dragged.
-            _stamp_mouse_event(ev_drag, pid, window_id, True, float(px), float(py), modifier_flags)
-            _post_event(pid, ev_drag)
-        finally:
-            _release(ev_drag)
-        time.sleep(step_delay)
-
-    time.sleep(0.02)
-
-    # Mouse-up at destination.
-    ev_up = _cg.CGEventCreateMouseEvent(None, up_type, placeholder, btn_index)
     try:
-        _stamp_mouse_event(ev_up, pid, window_id, False, float(x2), float(y2), modifier_flags)
-        _post_event(pid, ev_up)
+        time.sleep(0.05)
+
+        # Interpolated drag events.
+        for i in range(1, steps + 1):
+            if check_stop is not None:
+                check_stop()
+            t = i / steps
+            px = x1 + (x2 - x1) * t
+            py = y1 + (y2 - y1) * t
+            ev_drag = _cg.CGEventCreateMouseEvent(None, drag_type, placeholder, btn_index)
+            try:
+                # Pressure stays 1.0 throughout the drag — release is on the
+                # final mouse-up event, not the last dragged.
+                _stamp_mouse_event(ev_drag, pid, window_id, True, float(px), float(py), modifier_flags)
+                _post_event(pid, ev_drag)
+            finally:
+                _release(ev_drag)
+            time.sleep(step_delay)
+
+        time.sleep(0.02)
+
     finally:
-        _release(ev_up)
+        # Mouse-up at destination.
+        ev_up = _cg.CGEventCreateMouseEvent(None, up_type, placeholder, btn_index)
+        try:
+            _stamp_mouse_event(ev_up, pid, window_id, False, float(x2), float(y2), modifier_flags)
+            _post_event(pid, ev_up)
+        finally:
+            _release(ev_up)
     return True
 
 

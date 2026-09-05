@@ -31,18 +31,21 @@ _LOG_CHANNEL_CAP = 500
 # *key* visible — the agent still sees "password=" so it can reason about
 # the surrounding failure — and just hide the *value*.
 _SCRUBBERS: list[tuple[re.Pattern, str]] = [
-    # key=value / key: value (password, secret, token, api[_-]key, bearer, etc.)
+    # `Authorization: Bearer …` headers — before the generic key/value rule
+    # so the generic rule does not consume only the word "Bearer" and leave
+    # the actual token visible. Tokens are intentionally any non-whitespace
+    # text, including short and punctuation-bearing values.
+    (
+        re.compile(r'(?i)\b(Bearer)\s+(\S+)'),
+        lambda m: f"{m.group(1)} ***",
+    ),
+    # key=value / key: value (password, secret, token, api[_-]key, etc.)
     (
         re.compile(
             r'(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|'
-            r'auth(?:orization)?|bearer)\s*[:=]\s*\S+'
+            r'auth(?:orization)?)\s*[:=]\s*(?!(?:bearer)\b)\S+'
         ),
         lambda m: f"{m.group(1)}=***",
-    ),
-    # `Authorization: Bearer <token>` HTTP headers — case-insensitive.
-    (
-        re.compile(r'(?i)\b(Bearer)\s+[A-Za-z0-9._\-+/=]{8,}'),
-        lambda m: f"{m.group(1)} ***",
     ),
     # AWS access keys (AKIA*, ASIA*, plain 20-char IDs are the typical pattern).
     (
@@ -58,8 +61,11 @@ _SCRUBBERS: list[tuple[re.Pattern, str]] = [
 
 
 def _scrub(line: str) -> str:
-    """Apply every credential scrubber once. Order doesn't matter — patterns
-    target disjoint shapes. Idempotent on already-scrubbed lines."""
+    """Apply every credential scrubber once in deliberate order.
+
+    Bearer headers run before the generic key/value rule so their token cannot
+    remain visible. The operation is idempotent on already-scrubbed lines.
+    """
     for pattern, repl in _SCRUBBERS:
         line = pattern.sub(repl, line)
     return line

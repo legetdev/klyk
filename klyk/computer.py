@@ -140,6 +140,8 @@ _appserv.AXUIElementSetMessagingTimeout.restype = ctypes.c_int32
 _appserv.AXUIElementSetMessagingTimeout.argtypes = [ctypes.c_void_p, ctypes.c_float]
 _appserv.AXUIElementCreateApplication.restype = ctypes.c_void_p
 _appserv.AXUIElementCreateApplication.argtypes = [ctypes.c_int32]
+_appserv.AXUIElementGetPid.restype = ctypes.c_int32
+_appserv.AXUIElementGetPid.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_int32)]
 _appserv.AXValueGetType.restype = ctypes.c_uint32
 _appserv.AXValueGetType.argtypes = [ctypes.c_void_p]
 _appserv.AXValueGetValue.restype = ctypes.c_bool
@@ -434,15 +436,14 @@ def _ax_attribute_at(x: float, y: float, attribute_bytes: bytes) -> str | None:
 
 
 def _press_key_sync(keycode: int, flags: int, pid: int | None = None) -> None:
+    """Post an exact modifier state, including zero, so preceding shortcuts cannot leak Shift."""
     post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
     ev_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
-    if flags:
-        _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
+    _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
     post(ev_down)
     time.sleep(0.005)
     ev_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
-    if flags:
-        _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
+    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
     post(ev_up)
 
 
@@ -452,8 +453,7 @@ def _key_down_sync(keycode: int, flags: int, pid: int | None = None) -> None:
     keydowns to keep auto-repeat alive in apps that listen for repeats."""
     post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
     ev_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
-    if flags:
-        _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
+    _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
     post(ev_down)
 
 
@@ -461,8 +461,7 @@ def _key_up_sync(keycode: int, flags: int, pid: int | None = None) -> None:
     """Post a single keyup — pairs with _key_down_sync at the end of a hold."""
     post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
     ev_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
-    if flags:
-        _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
+    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
     post(ev_up)
 
 
@@ -563,7 +562,7 @@ def ax_value_at(x: float, y: float, max_retries: int = 4, settle_ms: int = 150) 
     return value
 
 
-def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: int = 150) -> tuple[str | None, str]:
+def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: int = 150, expected_pid: int | None = None) -> tuple[str | None, str]:
     """
     Same as ax_value_at but returns (value, status). Status is one of:
         "ok"         — value was read successfully
@@ -587,6 +586,8 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
             if err != 0 or not elem_ref.value:
                 continue
             try:
+                if not _ax_matches_pid(int(elem_ref.value), expected_pid):
+                    return (None, "wrong_app")
                 attr_key = _cf.CFStringCreateWithCString(None, b"AXValue", kCFStringEncodingUTF8)
                 val_ref = ctypes.c_void_p(0)
                 err = _appserv.AXUIElementCopyAttributeValue(
@@ -601,8 +602,7 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
                     return (None, "no_value")
                 value = _cftype_to_str(val_ref.value)
                 _cf.CFRelease(val_ref)
-                if value:
-                    return (value, "ok")
+                return (value, "ok")
             finally:
                 _cf.CFRelease(elem_ref)
         except Exception:
@@ -610,7 +610,16 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
     return (None, "no_element")
 
 
-def ax_perform_action_at(x: float, y: float, action: str) -> dict:
+def _ax_matches_pid(element: int, expected_pid: int | None) -> bool:
+    """Reject a global AX hit belonging to an occluding application."""
+    if expected_pid is None:
+        return True
+    pid = ctypes.c_int32()
+    return (_appserv.AXUIElementGetPid(ctypes.c_void_p(element), ctypes.byref(pid)) == 0
+            and pid.value == expected_pid)
+
+
+def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | None = None) -> dict:
     """
     Resolve the AX element at (x, y) and invoke AXUIElementPerformAction with
     the named action (e.g. AXPress, AXShowMenu, AXIncrement).
@@ -629,6 +638,7 @@ def ax_perform_action_at(x: float, y: float, action: str) -> dict:
     elements partially covered by other windows, or accessibility-focused apps
     that respond cleanly to AX but oddly to synthetic clicks.
     """
+    _check_stop()
     action_bytes = action.encode("utf-8")
 
     sys_elem = _appserv.AXUIElementCreateSystemWide()
@@ -644,6 +654,8 @@ def ax_perform_action_at(x: float, y: float, action: str) -> dict:
         return {"ok": False, "action": action, "status": "no_element"}
 
     try:
+        if not _ax_matches_pid(int(elem_ref.value), expected_pid):
+            return {"ok": False, "status": "wrong_app", "error": "The AX target belongs to another app; no action was sent."}
         role = _ax_str_attr(int(elem_ref.value), b"AXRole") or "AXUnknownRole"
 
         # Enumerate supported actions so we can either confirm the requested
@@ -687,6 +699,7 @@ def ax_resolve_and_act(
     y: float,
     action_chain: tuple[str, ...] = ("AXPress", "AXOpen"),
     max_levels_up: int = 2,
+    expected_pid: int | None = None,
 ) -> dict:
     """
     Resolve the AX element at (x, y) and try each action in action_chain in
@@ -713,6 +726,7 @@ def ax_resolve_and_act(
       {ok: False, action: None, status: "no_element"} when no AX element
         resolves at the coordinate.
     """
+    _check_stop()
     sys_elem = _appserv.AXUIElementCreateSystemWide()
     if not sys_elem:
         return {"ok": False, "action": None, "status": "no_element",
@@ -755,6 +769,8 @@ def ax_resolve_and_act(
     # Track parent refs we own so we can release them in `finally`.
     parent_chain: list[int] = []
     try:
+        if not _ax_matches_pid(int(elem_ref.value), expected_pid):
+            return {"ok": False, "status": "wrong_app", "error": "The AX target belongs to another app; no action was sent."}
         role_elem = _ax_str_attr(int(elem_ref.value), b"AXRole") or "AXUnknownRole"
         action, avail_elem = _try_chain(int(elem_ref.value))
         if action:
@@ -1390,6 +1406,8 @@ def _ax_str(elem: int, attr: bytes) -> str:
 
 
 def _ax_set_value(elem: int, value: str) -> bool:
+    """Set a string attribute only while the emergency latch permits input."""
+    _check_stop()
     a = _cfstr("AXValue")
     v = _cfstr(value)
     try:
@@ -1404,6 +1422,8 @@ def _ax_set_value(elem: int, value: str) -> bool:
 
 
 def _ax_press(elem: int, action: str = "AXPress") -> bool:
+    """Perform a panel action only while the emergency latch permits input."""
+    _check_stop()
     a = _cfstr(action)
     try:
         return _appserv.AXUIElementPerformAction(
@@ -1511,8 +1531,7 @@ def ax_focus_save_field(pid: int) -> bool:
                         state["saw_label"] = True
                 elif role == "AXTextField":
                     if state["saw_label"] and _ax_str(e, b"AXTitle") != "tag editor":
-                        _ax_set_focused(e)
-                        state["done"] = True
+                        state["done"] = _ax_set_focused(e)
                         return
             ch = _ax_read_attr_ptr(e, b"AXChildren")
             if ch:
@@ -2268,6 +2287,7 @@ def _ax_window_for_cg_id(pid: int, target_window_id: int, target_x: float, targe
 
 def _ax_set_attr_value(elem: int, attr: bytes, ax_value_ref: int) -> bool:
     """Set an AX attribute (caller owns ax_value_ref). Returns True on success."""
+    _check_stop()
     attr_key = _cf.CFStringCreateWithCString(None, attr, kCFStringEncodingUTF8)
     if not attr_key:
         return False
@@ -2281,6 +2301,8 @@ def _ax_set_attr_value(elem: int, attr: bytes, ax_value_ref: int) -> bool:
 
 
 def _ax_perform_action(elem: int, action: bytes) -> bool:
+    """Perform one AX action only while the emergency latch permits input."""
+    _check_stop()
     action_key = _cf.CFStringCreateWithCString(None, action, kCFStringEncodingUTF8)
     if not action_key:
         return False
@@ -2353,7 +2375,7 @@ def _ax_is_web_backed(elem: int, max_hops: int = 12) -> bool:
             _cf.CFRelease(cur_ref)
 
 
-def ax_set_value_at(x: float, y: float, text: str) -> dict:
+def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = None) -> dict:
     """
     Try to set the AXValue of the element at (x, y) to `text` — the fully
     invisible alternative to click+Cmd+A+paste for native text inputs.
@@ -2372,6 +2394,7 @@ def ax_set_value_at(x: float, y: float, text: str) -> dict:
       {ok: False, role, status: "not_settable"}                        AXValue is read-only on this element
       {ok: False, role, status: "set_failed", err}                     AXSetAttributeValue itself returned non-zero
     """
+    _check_stop()
     sys_elem = _appserv.AXUIElementCreateSystemWide()
     if not sys_elem:
         return {"ok": False, "status": "no_element"}
@@ -2384,6 +2407,8 @@ def ax_set_value_at(x: float, y: float, text: str) -> dict:
         return {"ok": False, "status": "no_element"}
 
     try:
+        if not _ax_matches_pid(int(elem_ref.value), expected_pid):
+            return {"ok": False, "status": "wrong_app", "error": "The AX target belongs to another app; no action was sent."}
         role = _ax_str_attr(int(elem_ref.value), b"AXRole") or "AXUnknownRole"
 
         if role not in _AX_TEXT_INPUT_ROLES:
@@ -2667,17 +2692,19 @@ async def long_press(x: int, y: int, duration: float = 1.0, button: str = "left"
             down_t, up_t, btn = kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft
         ev_down = _cg.CGEventCreateMouseEvent(None, down_t, pt, btn)
         _post(ev_down)
-        # Hold. Caller-provided duration; use small interval so an emergency
-        # stop can interrupt during a long hold without waiting for the full
-        # sleep.
-        elapsed = 0.0
-        step = 0.05
-        while elapsed < duration:
-            _check_stop()
-            await asyncio.sleep(min(step, duration - elapsed))
-            elapsed += step
-        ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
-        _post(ev_up)
+        try:
+            # Hold. Caller-provided duration; use small interval so an emergency
+            # stop can interrupt during a long hold without waiting for the full
+            # sleep.
+            elapsed = 0.0
+            step = 0.05
+            while elapsed < duration:
+                _check_stop()
+                await asyncio.sleep(min(step, duration - elapsed))
+                elapsed += step
+        finally:
+            ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
+            _post(ev_up)
 
 
 async def double_click(x: int, y: int, modifiers: list[str] | None = None) -> None:
@@ -2898,7 +2925,6 @@ async def press_system_key(name: str) -> None:
                 await asyncio.sleep(0.01)
 
 
-_clipboard_restore_task: asyncio.Task | None = None
 # The user's pasteboard contents captured before a paste, pending restore.
 # Held at module scope (not a local) so the atexit safety net can flush it if
 # the process exits inside the post-paste restore window. None = nothing pending.
@@ -2945,7 +2971,7 @@ def _restore_pasteboard(snapshot: list | None) -> None:
 
 def _flush_clipboard_restore() -> None:
     """Best-effort synchronous restore for the narrow window where the process
-    exits after a paste but before the deferred restore task has run."""
+    exits while a paste is awaiting clipboard restoration."""
     if _clipboard_snapshot is not None:
         _restore_pasteboard(_clipboard_snapshot)
 
@@ -2954,38 +2980,31 @@ atexit.register(_flush_clipboard_restore)
 
 
 async def type_text(text: str, pid: int | None = None) -> None:
-    """Type text using clipboard paste, snapshotting and restoring the user's
-    FULL clipboard (text, image, files, or empty) around the paste — never just
-    the plain-text view that pbpaste exposes, which would corrupt an image or
-    file clipboard."""
-    global _clipboard_restore_task, _clipboard_snapshot
+    """Paste while preserving every clipboard type, including on failure or cancellation."""
+    from AppKit import NSPasteboard
+    global _clipboard_snapshot
     _check_stop()
     async with _input_lock:
-        # Cancel a pending restore but KEEP its snapshot — the user's original
-        # clipboard still has to be restored after THIS paste too. Re-snapshotting
-        # now would capture the prior paste's text, so only snapshot when nothing
-        # is already pending (the start of a fresh burst).
-        if _clipboard_restore_task and not _clipboard_restore_task.done():
-            _clipboard_restore_task.cancel()
-        if _clipboard_snapshot is None:
-            _clipboard_snapshot = _snapshot_pasteboard()
-        # timeout so a contended pasteboard (e.g. behind a modal sheet) fails
-        # fast instead of hanging type_text for minutes (was unbounded).
-        subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
-        await asyncio.sleep(0.005)
-        _paste_sync(pid)
-
-    async def _restore():
-        # Deferred so the target app's Cmd+V consumes our text before we put the
-        # user's data back. Reads the snapshot under the lock at run time; a
-        # cancelled restore (rapid successive type_text) never reaches these
-        # lines, so the snapshot survives until the final paste's restore runs.
-        global _clipboard_snapshot
-        await asyncio.sleep(0.15)
-        async with _input_lock:
-            _restore_pasteboard(_clipboard_snapshot)
+        snapshot = _snapshot_pasteboard()
+        if snapshot is None:
+            raise RuntimeError("Could not preserve the clipboard; use mode='keys' or try again.")
+        _clipboard_snapshot = snapshot
+        pb = NSPasteboard.generalPasteboard()
+        change_count = pb.changeCount()
+        try:
+            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            change_count = pb.changeCount()
+            await asyncio.sleep(0.005)
+            _check_stop()
+            _paste_sync(pid)
+            # Finish restoration before the next tool can intentionally replace
+            # the clipboard. This also bounds cleanup after cancelled pastes.
+            await asyncio.sleep(0.15)
+        finally:
+            # A real copy made by the user during the paste takes precedence.
+            if pb.changeCount() == change_count:
+                _restore_pasteboard(snapshot)
             _clipboard_snapshot = None
-    _clipboard_restore_task = asyncio.create_task(_restore())
 
 
 async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
@@ -3010,20 +3029,25 @@ async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
         # renderer dead-zone. Cost: 60 ms once per call, regardless of length.
         await asyncio.sleep(0.060)
         for char in text:
+            _check_stop()
             keycode, flags = char_to_keycode(char)
             if keycode is not None:
                 _press_key_sync(keycode, flags, pid)
             else:
-                uni = (ctypes.c_uint16 * 1)(ord(char))
+                encoded = char.encode("utf-16-le")
+                units = len(encoded) // 2
+                uni = (ctypes.c_uint16 * units).from_buffer_copy(encoded)
                 ev_down = _cg.CGEventCreateKeyboardEvent(None, 0, True)
+                _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), 0)
                 _cg.CGEventKeyboardSetUnicodeString(
-                    ctypes.c_void_p(ev_down), 1, ctypes.cast(uni, ctypes.c_void_p)
+                    ctypes.c_void_p(ev_down), units, ctypes.cast(uni, ctypes.c_void_p)
                 )
                 post(ev_down)
                 time.sleep(0.005)
                 ev_up = _cg.CGEventCreateKeyboardEvent(None, 0, False)
+                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), 0)
                 _cg.CGEventKeyboardSetUnicodeString(
-                    ctypes.c_void_p(ev_up), 1, ctypes.cast(uni, ctypes.c_void_p)
+                    ctypes.c_void_p(ev_up), units, ctypes.cast(uni, ctypes.c_void_p)
                 )
                 post(ev_up)
             await asyncio.sleep(0.015)
@@ -3057,47 +3081,50 @@ async def drag(
 
         ev_down = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, src, kCGMouseButtonLeft)
         _post(ev_down)
-        await asyncio.sleep(0.05)
+        try:
+            await asyncio.sleep(0.05)
 
-        for i in range(1, steps + 1):
-            _check_stop()
-            t = i / steps
-            pt = CGPoint(
-                x=x1 + (x2 - x1) * t,
-                y=y1 + (y2 - y1) * t,
-            )
-            ev_drag = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, pt, kCGMouseButtonLeft)
-            _post(ev_drag)
-            time.sleep(step_delay)
-
-        if hover_target_seconds > 0:
-            # Spring-loaded hold at the destination. Slice into 50 ms chunks so
-            # the emergency-stop chord stays responsive — same pattern as
-            # long_press.
-            remaining = float(hover_target_seconds)
-            while remaining > 0:
+            for i in range(1, steps + 1):
                 _check_stop()
-                slice_s = min(0.05, remaining)
-                await asyncio.sleep(slice_s)
-                remaining -= slice_s
-                # Re-emit a dragged event at the target to keep the OS-side
-                # hover state alive — some apps drop the spring trigger if no
-                # events arrive for too long.
-                ev_idle = _cg.CGEventCreateMouseEvent(
-                    None, kCGEventLeftMouseDragged, dst, kCGMouseButtonLeft,
+                t = i / steps
+                pt = CGPoint(
+                    x=x1 + (x2 - x1) * t,
+                    y=y1 + (y2 - y1) * t,
                 )
-                _post(ev_idle)
-        else:
-            await asyncio.sleep(0.02)
-        ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, dst, kCGMouseButtonLeft)
-        _post(ev_up)
+                ev_drag = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, pt, kCGMouseButtonLeft)
+                _post(ev_drag)
+                await asyncio.sleep(step_delay)
+
+            if hover_target_seconds > 0:
+                # Spring-loaded hold at the destination. Slice into 50 ms chunks so
+                # the emergency-stop chord stays responsive — same pattern as
+                # long_press.
+                remaining = float(hover_target_seconds)
+                while remaining > 0:
+                    _check_stop()
+                    slice_s = min(0.05, remaining)
+                    await asyncio.sleep(slice_s)
+                    remaining -= slice_s
+                    # Re-emit a dragged event at the target to keep the OS-side
+                    # hover state alive — some apps drop the spring trigger if no
+                    # events arrive for too long.
+                    ev_idle = _cg.CGEventCreateMouseEvent(
+                        None, kCGEventLeftMouseDragged, dst, kCGMouseButtonLeft,
+                    )
+                    _post(ev_idle)
+            else:
+                await asyncio.sleep(0.02)
+        finally:
+            ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, dst, kCGMouseButtonLeft)
+            _post(ev_up)
 
 
 # ---------------------------------------------------------------------------
 # Scroll
 # ---------------------------------------------------------------------------
 
-async def scroll(x: int, y: int, direction: str, amount: int) -> None:
+async def scroll(x: int, y: int, direction: str, amount: int, modifiers: list[str] | None = None) -> None:
+    """Deliver visible scroll with explicit modifiers after the caller verifies targeting."""
     _check_stop()
     async with _input_lock:
         pt = CGPoint(x=float(x), y=float(y))
@@ -3113,6 +3140,8 @@ async def scroll(x: int, y: int, direction: str, amount: int) -> None:
             ev = _cg.CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 1, 0)
             _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev), kCGScrollWheelEventDeltaAxis2, delta)
 
+        _check_stop()
+        _cg.CGEventSetFlags(ctypes.c_void_p(ev), modifier_flags_from_list(modifiers))
         _post(ev)
 
 

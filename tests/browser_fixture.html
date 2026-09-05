@@ -1,0 +1,17 @@
+<!doctype html>
+<html lang="en"><meta charset="utf-8"><title>Klyk Browser Fixture</title>
+<style>body{font:24px system-ui;padding:70px}input,button{font:inherit;padding:12px;margin:12px}#result{margin:20px}</style>
+<h1>Klyk Browser Fixture</h1>
+<label>Fixture input <input aria-label="Fixture input" id="input"></label>
+<button id="increment">Increment browser</button><p id="result">Count 0</p>
+<script>
+// Report actual browser events to the disposable loopback test server.
+const input=document.getElementById('input');
+const increment=document.getElementById('increment');
+const result=document.getElementById('result');
+let count=0;
+function report(){fetch('/state',{method:'POST',body:JSON.stringify({count,text:input.value})});}
+increment.onclick=()=>{result.textContent='Count '+(++count);report();};
+input.oninput=report;
+report();
+</script></html>

@@ -12,4 +12,4 @@ Module-level access for Python library users:
 A higher-level Python library API may follow if there's demand.
 """
 
-__version__ = "0.4.1"
+__version__ = "0.5.0"

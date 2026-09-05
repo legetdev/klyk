@@ -77,9 +77,8 @@ def _alive(pid: int) -> bool:
 
 def _open():
     """Open the owner file (a+), creating the dir. Returns the handle, or
-    None if the filesystem won't cooperate (then ownership is unenforceable
-    and callers degrade to 'always allowed' — better flaky than refusing to
-    work)."""
+    None if the filesystem won't cooperate. Callers fail closed when control
+    ownership cannot be verified."""
     try:
         OWNER_PATH.parent.mkdir(parents=True, exist_ok=True)
         return open(OWNER_PATH, "a+")
@@ -88,14 +87,17 @@ def _open():
 
 
 def claim_ownership() -> int:
-    """Make THIS process the control owner. Always succeeds (latest claimer
-    wins). Returns the previous owner pid, or 0 if there was none / it was
-    us. This is the FORCEFUL claim — it is `take_control`. Startup uses
-    `claim_ownership_if_unowned` instead so a respawn doesn't yank control
-    from a live, active driver."""
+    """Make THIS process the control owner. Returns the previous owner pid,
+    or 0 if there was none / it was us. Raises when the owner file is
+    unavailable because control cannot be verified. This is the FORCEFUL
+    claim — it is `take_control`. Startup uses `claim_ownership_if_unowned`
+    instead so a respawn doesn't yank control from a live, active driver."""
     fh = _open()
     if fh is None:
-        return 0
+        raise RuntimeError(
+            "Cannot claim control: the klyk owner file is unavailable, "
+            "so control ownership cannot be verified."
+        )
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         prev = _read_pid(fh)
@@ -124,7 +126,7 @@ def claim_ownership_if_unowned() -> int:
     remains the one way to forcibly transfer."""
     fh = _open()
     if fh is None:
-        return _MY_PID  # unenforceable filesystem — behave as if we own
+        return 0
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         owner = _read_pid(fh)
@@ -146,7 +148,7 @@ def is_owner() -> bool:
     session never blocks us. Cheap: one short-lived flock per call."""
     fh = _open()
     if fh is None:
-        return True  # unenforceable — never block the user over a missing file
+        return False
     try:
         fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
         owner = _read_pid(fh)

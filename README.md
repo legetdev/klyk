@@ -8,14 +8,14 @@
 >
 > **Read this before you install.**
 >
-> klyk gives an AI agent real, OS-level control of your Mac — the same input a human has. It moves the cursor, fires keystrokes, and clicks what's on screen. In its default mode it does this **invisibly and autonomously**: no cursor movement you can watch, no confirmation prompts — acting on its own once the agent decides to.
+> klyk gives an AI agent real, OS-level control of your Mac — the same input a human has. It moves the cursor, fires keystrokes, and clicks what's on screen. In its default mode it **attempts invisible native input** and acts autonomously once the agent decides to. Chromium interactions, command shortcuts and paste, menus and dialogs, and some long presses may activate the app or use visible input; klyk does not guarantee that every native action stays invisible.
 >
 > **This is powerful, and it is dangerous.** Be clear-eyed about what that means:
 >
-> - **It can take real, irreversible actions.** A click is a click. klyk can press *Buy*, *Send*, *Confirm Transfer*, *Delete*, or *Sign* just as you could. The only guardrails are a window-bounds check and a text instruction asking the agent to confirm first — an instruction the agent *can ignore*. There is no sandbox and no spending limit.
+> - **It can take real, irreversible actions.** A click is a click. klyk can press *Buy*, *Send*, *Confirm Transfer*, *Delete*, or *Sign* just as you could. Klyk enforces checks such as target-window bounds, ownership, duplicate-label rejection, and its emergency latch, while confirmation guidance and a bounds override remain agent-cooperative and do not establish user approval. There is no sandbox and no spending limit.
 > - **It runs with your full user privileges.** Anything you can do on your Mac, klyk can do. It does not isolate itself or drop privileges.
 > - **It is a prompt-injection target.** If the agent driving klyk also reads untrusted content — a web page, an email, a document — a malicious instruction hidden there can become real clicks and keystrokes on your machine. "Reads the web" + "controls the Mac" is the high-risk combination. Run klyk only with an agent and a workflow you trust.
-> - **It relies on an undocumented Apple API.** Invisible input uses Apple's private SkyLight framework. Apple does not support or guarantee it; a macOS update can change or break it without notice (klyk falls back to a visible cursor when it can).
+> - **It relies on an undocumented Apple API.** Invisible native input uses Apple's private SkyLight framework. Apple does not support or guarantee it; a macOS update can change or break it without notice, and the affected actions may fall back to visible input or require activation.
 >
 > **What klyk is, honestly:** an early, experimental, open-source tool built by a solo author — a business student, not a professional developer — working with AI, in good faith. It has **not** had an independent professional security audit. Core paths are live-tested end-to-end against a real macOS session before every release, but treat it as early software: less-common paths may hold surprises.
 >
@@ -31,7 +31,7 @@
 
 AI assistants are increasingly asked to test, validate, or operate desktop apps end-to-end. Today they can't. Existing automation tools either require deep app instrumentation (XCUITest, Appium) or simulate user input at a layer too brittle to be trusted (pixel-only click frameworks, headless DOM scrapers). The result: agents that can write apps faster than ever, but can't verify they actually work.
 
-Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, real composited screenshots — and a clean MCP interface to drive it. The agent observes, decides, acts, verifies. The way a human would.
+Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, real composited screenshots — and a clean MCP interface to drive it. Native input attempts to stay invisible by default, with the activation and visible-input cases described above. The agent observes, decides, acts, verifies.
 
 ## What it does
 
@@ -39,7 +39,7 @@ Klyk closes that gap. It gives an AI agent the same input channel a human has �
 > screenshot the app, then click "Sign in"
 [ Klyk takes a real screenshot via CoreGraphics, returns it + the AX tree ]
 [ click_element finds "Sign in" via accessibility, falls back to OCR, then to template match ]
-[ Real click fires through the HID event tap — indistinguishable from a human pressing the button ]
+[ Real click fires through the HID event tap ]
 ```
 
 A flat, MECE tool surface across observation, interaction, evaluation, session management, and system operations. Three-tier click targeting (AX → on-device OCR → pixel template) so a label is reachable regardless of how the app exposes it. Cross-app drag, right-click-then-select, and multilingual OCR are all first-class. Per-call latency + reasoning-gap metrics so the agent can self-pace. Best-effort AX folded into screenshots so most tasks finish in one round-trip.
@@ -51,7 +51,7 @@ pipx install klyk        # isolated install — recommended
 klyk install
 ```
 
-> **Use `pipx` (or `uv tool install klyk`), not bare `pip`.** Klyk pulls a modern NumPy; installing it into your global Python can clash with other packages pinned to older versions. `pipx`/`uv` give klyk its own environment while still putting `klyk` and `klyk-call` on your PATH — same commands, zero blast radius. Plain `pip install klyk` works only if you want it in the current environment and accept that risk.
+> **Use `pipx` (or `uv tool install klyk`), not bare `pip`.** Klyk accepts NumPy `>=1.24`; installing it into your global Python can still clash with other packages pinned to different versions. `pipx`/`uv` give klyk its own environment while still putting `klyk` and `klyk-call` on your PATH — same commands, zero blast radius. Plain `pip install klyk` works if you want it in the current environment and accept that risk.
 
 `klyk install` is a turnkey first-run flow:
 
@@ -72,7 +72,7 @@ Restart Claude Code (or whichever MCP client you use) and klyk is live. Try `ins
 klyk update
 ```
 
-One command, always correct: it detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected AI client loads the new version on its next tool call, no client restarts, no config edits. Since all your clients point at the same klyk install, one update covers every agent at once.
+It detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected client that shares that installation loads the new version on its next tool call. Clients using pinned, bundled, or separate klyk installations need their own update.
 
 You never have to wonder whether you're behind, either:
 
@@ -80,7 +80,7 @@ You never have to wonder whether you're behind, either:
 - **The menu-bar eye** shows a one-line `⬆ Update available` notice when a newer release exists.
 - **`klyk update --check`** reports whether an update exists without changing anything.
 
-Behind these sits a single once-a-day check of klyk's own PyPI metadata (nothing about you or your screen is sent — see the Security model below), cached in `~/.klyk/update_check.json` and fully offline-safe. Set `KLYK_UPDATE_CHECK=0` to disable it entirely.
+Behind these sits a single once-a-day HTTPS check of klyk's own PyPI metadata, cached in `~/.klyk/update_check.json` and fully offline-safe. The check sends no screen data or captured content, but the normal network request exposes metadata such as your IP address to PyPI and the network path. Set `KLYK_UPDATE_CHECK=0` to disable it entirely.
 
 **One driver at a time.** Any number of MCP clients can have klyk configured and connected simultaneously (Claude Code *and* OpenCode *and* Cursor…) — each spawns its own klyk process, and none is ever refused. But only **one** session holds the control token and actually drives the Mac at a time, so two agents can never interleave clicks and keystrokes into the same app. A new session takes control automatically when the previous driver is gone; taking over from a *live* driver is an explicit `take_control` call. Exactly one menu-bar eye is visible: the active driver's.
 
@@ -198,11 +198,11 @@ For the full tool reference and behavior contracts, see the tool `description` f
 
 Klyk is a thin pipe between the agent and the OS. Its trust model is straightforward:
 
-- **Local only.** Your screen contents and inputs stay on your machine — screenshots, OCR results, AX labels, and tool responses never leave it via klyk. klyk's **only** network call is an optional once-daily version check against PyPI's public metadata for the `klyk` package (a plain HTTPS GET — it sends nothing about you, your screen, or your usage). Disable it with `KLYK_UPDATE_CHECK=0` and klyk makes no network calls at all.
+- **Local control with an optional metadata check.** Klyk does not send screenshots, OCR results, AX labels, or captured screen data in its optional once-daily HTTPS request to PyPI. The request still exposes ordinary network metadata, including your IP address, to PyPI and the network path. Results returned over stdio to the calling agent or client may then be transmitted to that client's model provider under its own settings. Disable the check with `KLYK_UPDATE_CHECK=0` and klyk makes no network calls itself.
 - **macOS permissions are the consent surface.** Accessibility and Screen Recording must be granted explicitly via System Settings; `klyk doctor` shows the current state.
-- **The agent controls every action.** Klyk doesn't decide what to click or type — it executes what the agent asks. Run klyk only with agents you trust to act on your behalf.
+- **The agent controls the intent.** Klyk doesn't decide what to click or type — it executes what the agent asks, subject to code-enforced ownership, target-window bounds, duplicate-label rejection, and the emergency latch. Run klyk only with agents you trust to act on your behalf.
 - **Stderr from launched apps is captured for the `verdict` payload.** klyk attempts to scrub common credential patterns (passwords, API keys, JWTs, AWS keys, bearer tokens) on a **best-effort** basis — it cannot catch every format, so do not rely on it as your only safeguard.
-- **Private framework usage.** Klyk uses Apple's private SkyLight framework for invisible input delivery (the "autonomous" mode). This is fine for CLI / PyPI distribution but is the reason klyk can't ship via the Mac App Store.
+- **Private framework usage.** Klyk uses Apple's private SkyLight framework for attempted invisible native input delivery (the "autonomous" mode); some browser, shortcut, menu, dialog, and long-press paths may activate or use visible input. This is fine for CLI / PyPI distribution but is the reason klyk can't ship via the Mac App Store.
 - **Reporting a vulnerability.** See [`SECURITY.md`](./SECURITY.md).
 
 ## License
@@ -211,7 +211,7 @@ MIT — see [`LICENSE`](./LICENSE).
 
 ## Disclaimer — No Warranty
 
-klyk is provided **"AS IS", without warranty of any kind**, express or implied, including merchantability, fitness for a particular purpose, and non-infringement (see [`LICENSE`](./LICENSE)). To the maximum extent permitted by law, the author is **not liable** for any damage, data loss, financial loss, account action, privacy exposure, or other harm arising from the use, misuse, or malfunction of klyk — whether caused by the software, the AI agent driving it, or a third-party dependency or macOS framework it relies on. Its safety measures (credential scrubbing, bounds checks, the emergency-stop chord, confirm-destructive flags) are **best-effort and agent-cooperative only** — not a guarantee, and not to be relied upon as your sole safeguard. **You run klyk at your own risk and are solely responsible for what you connect it to and what it does.**
+klyk is provided **"AS IS", without warranty of any kind**, express or implied, including merchantability, fitness for a particular purpose, and non-infringement (see [`LICENSE`](./LICENSE)). To the maximum extent permitted by law, the author is **not liable** for any damage, data loss, financial loss, account action, privacy exposure, or other harm arising from the use, misuse, or malfunction of klyk — whether caused by the software, the AI agent driving it, or a third-party dependency or macOS framework it relies on. Credential scrubbing is best-effort, and confirmation guidance is agent-cooperative; code-enforced bounds, ownership, duplicate-label checks, and the emergency latch do not guarantee safety or approve consequential actions. **You run klyk at your own risk and are solely responsible for what you connect it to and what it does.**
 
 ---
 

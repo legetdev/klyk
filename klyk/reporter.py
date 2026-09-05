@@ -49,9 +49,12 @@ def generate_verdict(session: "Session", test_description: str) -> dict:
         "screenshots_taken": session.screenshots_taken,
         "pass_threshold": threshold,
         "instruction": (
-            "Based on the screenshot and evidence above, determine if this app PASSES or FAILS. "
-            f"PASS requires: UI score >= {threshold}, zero console errors, zero network failures, "
-            "no broken states visible. "
-            "Respond with: result ('PASS'/'FAIL'), ui_score, ui_issues, functional_errors, recommendation."
+            "Assess the stated test using the screenshot, observed action outcomes, and available logs. "
+            "Separate confirmed results from missing or ambiguous evidence; report unverified areas. "
+            "Empty error lists do not prove console or network health, and diagnostic log lines are "
+            "not necessarily app failures. Do not infer successful completion from action delivery. "
+            f"If you score visual quality, explain the judgement (configured threshold: {threshold}). "
+            "Respond with result (PASS, FAIL, or UNVERIFIED), evidence, limitations, and recommendation."
+
         ),
     }

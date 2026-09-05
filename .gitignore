@@ -33,3 +33,7 @@ LIMITATIONS_REVIEW.md
 
 # Local roadmap-migration backups
 .roadmap-backup-*/
+
+# Private future planning and local verification evidence
+POLARSTAR.md
+.verification/
