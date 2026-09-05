@@ -5,6 +5,7 @@ import sys
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import klyk
 from klyk import launcher
 from klyk import session as session_module
 
@@ -57,7 +58,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             sys.modules,
             {"klyk.capture": capture, "klyk.launcher": launcher_fake},
-        ), patch.object(session_module, "_close_session", close), patch.object(
+        ), patch.object(klyk, "capture", capture, create=True), patch.object(klyk, "launcher", launcher_fake), patch.object(session_module, "_close_session", close), patch.object(
             launcher_fake, "terminate_pid", terminate, create=True
         ):
             with self.assertRaisesRegex(RuntimeError, "No app was closed"):
@@ -87,7 +88,7 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         with patch.dict(
             sys.modules,
             {"klyk.capture": capture, "klyk.launcher": launcher_fake},
-        ), patch.object(session_module, "create_session", create):
+        ), patch.object(klyk, "capture", capture, create=True), patch.object(klyk, "launcher", launcher_fake), patch.object(session_module, "create_session", create):
             with self.assertRaisesRegex(RuntimeError, "64-app session limit"):
                 await session_module.get_or_create_session("Fixture 64")
 
