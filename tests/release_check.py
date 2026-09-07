@@ -1,4 +1,4 @@
-"""Verify release contents and require fresh, private real-Mac evidence locally."""
+"""Verify release contents and fresh evidence proportionate to the changed behavior."""
 import argparse
 import hashlib
 import json
@@ -38,7 +38,10 @@ def main():
     parser.add_argument('--archives', action='store_true')
     parser.add_argument('--live', action='append', default=[])
     parser.add_argument('--desktop', action='append', default=[])
+    parser.add_argument('--targeted', action='append', default=[])
     args = parser.parse_args()
+    if args.targeted and (args.live or args.desktop):
+        raise ValueError('Choose targeted or full verification, not both')
     check_names(subprocess.check_output(['git', 'ls-files'], cwd=ROOT, text=True).splitlines())
     if args.archives:
         archives = [*ROOT.glob('dist/*.whl'), *ROOT.glob('dist/*.tar.gz')]
@@ -51,15 +54,21 @@ def main():
                 with tarfile.open(archive) as bundle: names = bundle.getnames()
             check_names(names)
             print(f'Archive privacy: {archive.name} ({len(names)} entries)')
-    for path in args.live + args.desktop:
+    for path in args.live + args.desktop + args.targeted:
         report = json.loads(Path(path).read_text())
         if report.get('fingerprint') != fingerprint():
-            raise ValueError(f'Live evidence is stale: {path}; rerun tests/live_smoke.py')
-        if not report.get('completed') or report.get('error') or not all(c['passed'] for c in report['checks']):
+            raise ValueError(f'Evidence is stale: {path}; rerun the applicable checks')
+        if not report.get('completed') or report.get('error') or not report.get('checks') or not all(c['passed'] is True for c in report['checks']):
             raise ValueError(f'Live evidence is incomplete or failed: {path}')
+        if path in args.targeted and (
+            report.get('scope') != 'minor'
+            or not isinstance(report.get('rationale'), str)
+            or not report['rationale'].strip()
+        ):
+            raise ValueError(f'Targeted evidence needs scope=minor and a change-specific rationale: {path}')
         if path in args.live and set(report['tools']) != {c['tool'] for c in report['calls']}:
             raise ValueError(f'Live tool coverage is incomplete: {path}')
-        print(f'Live candidate verified: {path}')
+        print(f'Candidate evidence verified: {path}')
     print('Publication checks passed')
 
 

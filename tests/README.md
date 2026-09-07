@@ -41,12 +41,22 @@ Reports contain environment versions, tool calls, timings, payload sizes, indepe
 
 ## Release gate
 
-After the final source edit, rerun both native SDK environments and the desktop check. A report becomes stale when runtime, public documentation, tests, or release controls change.
+Choose verification by behavior and risk, not the version number. Full native checks on both supported MCP SDKs and the Chrome/Electron suite are required only for major functionality changes: substantial input delivery, targeting, capture, session/ownership, safety, or cross-app workflow changes. Minor setup, documentation, diagnostics, metadata, and schema corrections use targeted checks of the affected behavior; do not rerun unrelated desktop workflows or stop other sessions for them.
+
+Every release still runs the portable regressions, package metadata/privacy checks, fresh-install doctor, and an MCP connection smoke check. Recheck changed behavior after relevant edits. Keep unrelated known failures recorded without representing them as fixed; they do not force a full suite for a minor release. A regression introduced or worsened by the candidate must be resolved before publication.
+
+For a minor release, save a private JSON report with `scope: "minor"`, a nonempty `rationale` describing why the change is minor and what was checked, the current `fingerprint()` from `tests/release_check.py`, `completed: true`, and a nonempty `checks` array of `{name, passed: true}` objects. Include evidence references and remaining limitations. The report is a record of actual verification, not permission to mark unrun checks as passed.
+
+```sh
+./release.sh vX.Y.Z --targeted .verification/targeted.json --notes-file /tmp/release-notes.md --dry-run
+```
+
+For major functionality changes, supply fresh full-suite evidence:
 
 ```sh
 python3 tests/release_check.py --live .verification/native.json --desktop .verification/desktop.json
 python3 tests/release_check.py --archives
-./release.sh vX.Y.Z --live .verification/native.json --desktop .verification/desktop.json --notes-file /tmp/release-notes.md --dry-run
+./release.sh vX.Y.Z --live .verification/native-mcp1.json --live .verification/native-mcp2.json --desktop .verification/desktop.json --notes-file /tmp/release-notes.md --dry-run
 ```
 
-The release script requires a reviewed, committed candidate on synchronized `main`, passing portable tests, fresh live evidence, and clean package archives. Omit `--dry-run` only when publication is authorized. GitHub CI runs portable tests on both MCP major versions; Linux CI does not replace the real Mac checks.
+The release script requires a reviewed, committed candidate on synchronized `main`, passing portable tests, fresh evidence for the selected scope, and clean package archives. Omit `--dry-run` only when publication is authorized. GitHub CI runs portable tests on both MCP major versions; Linux CI does not replace any real Mac checks required by the changed behavior.

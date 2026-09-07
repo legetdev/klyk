@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Publish a verified, committed candidate through the existing PyPI Trusted Publisher.
-# Usage: ./release.sh vX.Y.Z --live report.json --desktop desktop.json [--live second.json] [--notes-file notes.md] [--dry-run]
+# Usage: ./release.sh vX.Y.Z (--targeted report.json | --live native.json --desktop desktop.json) [--notes-file notes.md] [--dry-run]
 set -euo pipefail
 cd "$(dirname "${BASH_SOURCE[0]}")"
 PY="${KLYK_RELEASE_PYTHON:-$HOME/.klyk/venv/bin/python}"
@@ -8,9 +8,10 @@ REPO="legetdev/klyk"
 # Stop before publication when any release condition is missing.
 die() { printf '%s\n' "$*" >&2; exit 1; }
 VERSION="${1:-}"; [ -n "$VERSION" ] && shift || true
-NOTES_FILE=""; DRY=0; EVIDENCE=(); HAS_NATIVE=0; HAS_DESKTOP=0
+NOTES_FILE=""; DRY=0; EVIDENCE=(); HAS_NATIVE=0; HAS_DESKTOP=0; HAS_TARGETED=0
 while [ "$#" -gt 0 ]; do
   case "$1" in
+    --targeted) [ "$#" -ge 2 ] || die 'Missing targeted report'; EVIDENCE+=(--targeted "$2"); HAS_TARGETED=1; shift 2 ;;
     --live) [ "$#" -ge 2 ] || die 'Missing live report'; EVIDENCE+=(--live "$2"); HAS_NATIVE=1; shift 2 ;;
     --desktop) [ "$#" -ge 2 ] || die 'Missing desktop report'; EVIDENCE+=(--desktop "$2"); HAS_DESKTOP=1; shift 2 ;;
     --notes-file) [ "$#" -ge 2 ] || die 'Missing notes file'; NOTES_FILE="$2"; shift 2 ;;
@@ -20,7 +21,11 @@ while [ "$#" -gt 0 ]; do
 done
 [[ "$VERSION" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || die 'Version must look like v1.2.3'
 [ -x "$PY" ] || die "Python not found: $PY"
-[ "$HAS_NATIVE" = 1 ] && [ "$HAS_DESKTOP" = 1 ] || die 'Fresh native and browser/Electron evidence is required: --live native.json --desktop desktop.json'
+if [ "$HAS_TARGETED" = 1 ]; then
+  [ "$HAS_NATIVE" = 0 ] && [ "$HAS_DESKTOP" = 0 ] || die 'Choose targeted or full verification, not both'
+else
+  [ "$HAS_NATIVE" = 1 ] && [ "$HAS_DESKTOP" = 1 ] || die 'Minor changes: --targeted report.json; major functionality changes: --live native.json --desktop desktop.json'
+fi
 [ -z "$NOTES_FILE" ] || [ -f "$NOTES_FILE" ] || die 'Release notes file is missing'
 [ "$(git branch --show-current)" = main ] || die 'Release from main'
 [ -z "$(git status --porcelain)" ] || die 'Commit the reviewed candidate first (including its version bump)'
