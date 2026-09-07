@@ -39,11 +39,14 @@ CRITERIA_BY_PLATFORM = {
 
 
 def grade_ui(session: "Session") -> dict:
+    """Capture the current window geometry and return platform grading criteria."""
     from . import capture
 
     win = capture.get_window_for_pid(session.pid)
     if win:
         session.window_id = win["window_id"]
+        session.win_x = int(win["bounds"]["X"])
+        session.win_y = int(win["bounds"]["Y"])
         session.width = int(win["bounds"]["Width"])
         session.height = int(win["bounds"]["Height"])
 

@@ -213,12 +213,7 @@ def launch_native_app(
     else:
         raise ValueError("Either app_name or bundle_id must be provided")
 
-    # If the app was already running, we don't need the full launch settle —
-    # the PID is known. For a cold launch, give the process a moment to
-    # register before osascript queries System Events.
-    if was_already_running and prior_pid is not None:
-        return prior_pid, True
-
+    # Give a cold launch time to register before querying System Events.
     time.sleep(1.0)
     pid = _find_pid_for_app(bundle_id=bundle_id, app_name=app_name)
     return pid, False
@@ -339,7 +334,7 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
         except ProcessLookupError:
             return True
         except OSError:
-            return True
+            return False  # Permission failure does not prove the process exited.
         time.sleep(0.1)
 
     # SIGTERM ignored — escalate.
@@ -357,5 +352,5 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
     except ProcessLookupError:
         return True
     except OSError:
-        return True
+        return False
     return False

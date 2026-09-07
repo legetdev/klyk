@@ -12,9 +12,9 @@ all manipulation is dispatched via klyk.ui_thread.ui. Subscribers from the
 activity recorder run on whatever thread fired the action — they enqueue a
 refresh onto the UI thread; the actual NSMenu mutation happens there.
 
-Refresh strategy: throttled to ~10 Hz. Per-action refreshes coalesce so
-a fast action burst doesn't drown the run loop in NSMenu rebuilds; idle
-state is exactly zero NSMenu work.
+Refresh strategy: per-action refreshes coalesce until the next UI queue
+drain, so a burst queues only one NSMenu rebuild. An ownership change
+also refreshes the menu; unchanged idle state triggers no rebuilds.
 
 Design considerations:
 - 3. Alienation: this surface IS the seamless story's user feedback.
@@ -251,7 +251,7 @@ class MenuBarController:
 
         # Header item — non-clickable status line. Shows whether THIS session
         # is the active driver: only one klyk session drives the Mac at a
-        # time (latest-wins), and a superseded session is the blocked one.
+        # time; startup preserves a live owner until an explicit transfer.
         active = self._is_active_driver()
         if active:
             header_title = f"klyk — active · {n_apps} session{'s' if n_apps != 1 else ''}"
@@ -264,7 +264,7 @@ class MenuBarController:
         new_menu.addItem_(header)
         if not active:
             note = NSMenuItem.alloc().initWithTitle_action_keyEquivalent_(
-                "  control passed to a newer session", None, "",
+                "  another session currently has control", None, "",
             )
             note.setEnabled_(False)
             new_menu.addItem_(note)

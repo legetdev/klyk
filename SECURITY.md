@@ -39,6 +39,7 @@ Mitigations are operational, not technical: run klyk only with agents and workfl
 Stderr from apps launched by klyk is run through credential scrubbers at capture time before being stored in the in-session log buffer. The scrubbed patterns:
 
 - `password=…`, `secret=…`, `token=…`, `api_key=…`, `access_key=…`, `auth=…`, `bearer=…` (key visible, value replaced with `***`)
+- Quoted JSON credential fields such as `"password": "…"`, including spaces and escaped quotes in the value
 - `Authorization: Bearer …` HTTP headers
 - AWS access key IDs (`AKIA*`, `ASIA*`, …)
 - JWTs (`eyJ…`.`…`.`…`)
@@ -48,6 +49,7 @@ This is defense-in-depth — agents shouldn't be trusted to filter credentials d
 ## What's deliberately not scrubbed
 
 - Screenshots and OCR text returned to the agent: the agent asked for the pixels, so it gets them. Don't run klyk on screens with content you can't show the agent.
+- A failed window/region capture returns an error rather than retrying the whole desktop. Composited captures can still include overlapping windows inside the requested region.
 - AX labels and values: same rationale — the agent asked.
 
 ## Out of scope

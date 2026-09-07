@@ -1252,20 +1252,18 @@ def take_screenshot(
         result = subprocess.run(cmd, capture_output=True, timeout=10)
 
         if result.returncode != 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) < 100:
-            fb = subprocess.run(
-                ["screencapture", "-x", "-t", "png", raw_path],
-                timeout=10, capture_output=True
+            # Never widen a failed window/region request to the whole desktop:
+            # that exposes unrelated content and invalidates window coordinates.
+            raise RuntimeError(
+                "screencapture failed for the requested area. Ensure Screen Recording "
+                "permission is granted and the target window is still available."
             )
-            if fb.returncode != 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) < 100:
-                raise RuntimeError(
-                    "screencapture failed. Ensure Screen Recording permission is granted to your terminal."
-                )
 
         if logical_width and logical_height:
             max_dim = max(logical_width, logical_height)
             subprocess.run(
                 ["sips", "-Z", str(max_dim), raw_path, "--out", out_path],
-                capture_output=True, timeout=10
+                capture_output=True, timeout=10, check=True
             )
             final_path = out_path
             final_w, final_h = logical_width, logical_height
@@ -1273,7 +1271,7 @@ def take_screenshot(
             scale = get_scale_factor()
             info = subprocess.run(
                 ["sips", "-g", "pixelWidth", "-g", "pixelHeight", raw_path],
-                capture_output=True, text=True, timeout=10
+                capture_output=True, text=True, timeout=10, check=True
             )
             pw, ph = _parse_sips_dimensions(info.stdout)
             final_w = int(pw / scale)
@@ -1281,7 +1279,7 @@ def take_screenshot(
             if scale > 1.0:
                 subprocess.run(
                     ["sips", "-Z", str(max(final_w, final_h)), raw_path, "--out", out_path],
-                    capture_output=True, timeout=10
+                    capture_output=True, timeout=10, check=True
                 )
                 final_path = out_path
             else:
@@ -1289,6 +1287,8 @@ def take_screenshot(
 
         with open(final_path, "rb") as f:
             data = f.read()
+        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
+            raise RuntimeError("Screenshot conversion produced no valid PNG image.")
 
         return base64.b64encode(data).decode("utf-8"), final_w, final_h
 
@@ -1301,6 +1301,7 @@ def take_screenshot(
 
 
 def _parse_sips_dimensions(sips_output: str) -> tuple[int, int]:
+    """Read actual image dimensions; never invent coordinates after probe failure."""
     pw = ph = 0
     for line in sips_output.splitlines():
         line = line.strip()
@@ -1308,7 +1309,9 @@ def _parse_sips_dimensions(sips_output: str) -> tuple[int, int]:
             pw = int(line.split(":")[-1].strip())
         elif line.startswith("pixelHeight:"):
             ph = int(line.split(":")[-1].strip())
-    return pw or 1280, ph or 800
+    if pw <= 0 or ph <= 0:
+        raise RuntimeError("Could not determine screenshot dimensions.")
+    return pw, ph
 
 
 def check_screen_recording() -> None:

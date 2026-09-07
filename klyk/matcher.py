@@ -238,6 +238,11 @@ def find(
         h, w = haystack.shape[:2]
         sx1, sy1 = max(0, sx1), max(0, sy1)
         sx2, sy2 = min(w, sx2), min(h, sy2)
+        if sx2 <= sx1 or sy2 <= sy1:
+            raise ValueError(
+                f"Invalid search region: ({sx1},{sy1})→({sx2},{sy2}) "
+                f"for screenshot {w}×{h}"
+            )
         haystack = haystack[sy1:sy2, sx1:sx2]
         offset_x, offset_y = sx1, sy1
 
@@ -271,7 +276,3 @@ def find(
             offset_y + int(max_y) + nh,
         ],
     }
-
-
-
-

@@ -18,10 +18,12 @@ from __future__ import annotations
 import argparse
 import base64
 import json
+import math
 import os
 import select
 import subprocess
 import sys
+import time
 from pathlib import Path
 
 # This module lives inside the `klyk` package; the repo root is its grandparent.
@@ -52,9 +54,14 @@ class KlykClient:
         # MCP config); never a bare file path, because the server uses relative
         # imports and only resolves as a package module.
         self._cmd = server_cmd or [sys.executable, "-m", "klyk.mcp_server"]
+        if not math.isfinite(timeout) or timeout <= 0:
+            raise KlykError("timeout must be a finite positive number")
         self._timeout = timeout
         self._proc = None
         self._next_id = 0
+        self._stdout_buffer = bytearray()
+        self._stderr_tail = b""
+        self._stderr_open = False
 
     # -- lifecycle ---------------------------------------------------------
     def __enter__(self):
@@ -66,6 +73,10 @@ class KlykClient:
 
     def start(self):
         """Launch the server and complete the MCP initialize handshake."""
+        if self._proc is not None:
+            raise KlykError("client already started")
+        self._stdout_buffer.clear()
+        self._stderr_tail = b""
         env = os.environ.copy()
         env["PYTHONPATH"] = os.pathsep.join(
             p for p in (str(_REPO_ROOT), env.get("PYTHONPATH", "")) if p
@@ -75,34 +86,47 @@ class KlykClient:
             stdin=subprocess.PIPE,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
-            text=True,
-            bufsize=1,
+            bufsize=0,
             env=env,
         )
-        init = self._request(
-            "initialize",
-            {
-                "protocolVersion": _PROTOCOL_VERSION,
-                "capabilities": {},
-                "clientInfo": {"name": "klyk-stdio-client", "version": "1.0"},
-            },
-        )
-        # The server expects an `initialized` notification before any tool call.
-        self._notify("notifications/initialized")
-        return init
+        self._stderr_open = True
+        try:
+            os.set_blocking(self._proc.stdin.fileno(), False)
+            init = self._request(
+                "initialize",
+                {
+                    "protocolVersion": _PROTOCOL_VERSION,
+                    "capabilities": {},
+                    "clientInfo": {"name": "klyk-stdio-client", "version": "1.0"},
+                },
+            )
+            # The server expects initialized before any tool call.
+            self._notify("notifications/initialized")
+            return init
+        except BaseException:
+            # __exit__ is never called if the context manager's __enter__ fails.
+            self.close()
+            raise
 
     def close(self):
-        """Shut the server down cleanly (closing stdin triggers its exit)."""
-        if not self._proc:
+        """Close every pipe and reap the child, including failed handshakes."""
+        proc = self._proc
+        if proc is None:
             return
         try:
-            if self._proc.stdin and not self._proc.stdin.closed:
-                self._proc.stdin.close()
-            self._proc.wait(timeout=3)
-        except Exception:
-            self._proc.kill()
+            if proc.stdin and not proc.stdin.closed:
+                proc.stdin.close()
+            proc.wait(timeout=3)
+        except (OSError, subprocess.TimeoutExpired):
+            if proc.poll() is None:
+                proc.kill()
+            proc.wait()
         finally:
+            for pipe in (proc.stdin, proc.stdout, proc.stderr):
+                if pipe is not None:
+                    pipe.close()
             self._proc = None
+            self._stderr_open = False
 
     # -- public API --------------------------------------------------------
     def list_tools(self):
@@ -116,11 +140,33 @@ class KlykClient:
         )
 
     # -- JSON-RPC plumbing -------------------------------------------------
-    def _send(self, message):
+    def _send(self, message, deadline=None):
+        """Send even large requests without blocking on a chatty server's pipes."""
         if not self._proc:
             raise KlykError("client not started")
-        self._proc.stdin.write(json.dumps(message) + "\n")
-        self._proc.stdin.flush()
+        if deadline is None:
+            deadline = time.monotonic() + self._timeout
+        try:
+            pending = memoryview((json.dumps(message) + "\n").encode("utf-8"))
+            while pending:
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise self._connection_error(
+                        f"timed out after {self._timeout}s sending request to klyk"
+                    )
+                pipes = [self._proc.stdout]
+                if self._stderr_open:
+                    pipes.append(self._proc.stderr)
+                ready, writable, _ = select.select(pipes, [self._proc.stdin], [], remaining)
+                self._consume_output(ready)
+                if writable:
+                    try:
+                        written = os.write(self._proc.stdin.fileno(), pending[:65536])
+                    except BlockingIOError:
+                        continue
+                    pending = pending[written:]
+        except OSError as exc:
+            raise KlykError(f"could not send request to klyk: {exc}") from exc
 
     def _notify(self, method, params=None):
         msg = {"jsonrpc": "2.0", "method": method}
@@ -131,56 +177,66 @@ class KlykClient:
     def _request(self, method, params):
         self._next_id += 1
         req_id = self._next_id
-        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params})
-        return self._await_response(req_id)
+        deadline = time.monotonic() + self._timeout
+        self._send({"jsonrpc": "2.0", "id": req_id, "method": method, "params": params}, deadline)
+        return self._await_response(req_id, deadline)
 
-    def _await_response(self, req_id):
+    def _await_response(self, req_id, deadline):
         """Read stdout until the response with our id arrives (skip noise)."""
         while True:
-            line = self._read_line()
+            line = self._read_line(deadline)
             try:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue  # ignore any non-JSON line the server may emit
-            if msg.get("id") != req_id:
+            if not isinstance(msg, dict) or msg.get("id") != req_id:
                 continue  # skip notifications / unrelated responses
             if "error" in msg:
                 raise KlykError(msg["error"].get("message", str(msg["error"])))
             return msg.get("result", {})
 
-    def _read_line(self):
-        """Block (up to timeout) for one line of server stdout."""
-        ready, _, _ = select.select([self._proc.stdout], [], [], self._timeout)
-        if not ready:
-            err = self._drain_stderr()
-            raise KlykError(
-                f"timed out after {self._timeout}s waiting for klyk"
-                + (f"; stderr: {err}" if err else "")
-            )
-        line = self._proc.stdout.readline()
-        if not line:
-            err = self._drain_stderr()
-            raise KlykError(
-                "klyk server closed the connection unexpectedly"
-                + (f"; stderr: {err}" if err else "")
-            )
-        return line
+    def _read_line(self, deadline):
+        """Read complete stdout lines while draining stderr under one deadline.
 
-    def _drain_stderr(self):
-        """Best-effort, non-blocking read of buffered stderr for diagnostics."""
-        out = []
-        try:
-            while True:
-                ready, _, _ = select.select([self._proc.stderr], [], [], 0)
-                if not ready:
-                    break
-                line = self._proc.stderr.readline()
-                if not line:
-                    break
-                out.append(line.rstrip())
-        except Exception:
-            pass
-        return " | ".join(out[-5:])
+        Binary reads avoid TextIOWrapper read-ahead hiding ready lines from
+        select, and never block waiting for a newline after a partial write.
+        """
+        while True:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                raise self._connection_error(
+                    f"timed out after {self._timeout}s waiting for klyk"
+                )
+            newline = self._stdout_buffer.find(b"\n")
+            if newline >= 0:
+                line = bytes(self._stdout_buffer[:newline + 1])
+                del self._stdout_buffer[:newline + 1]
+                return line.decode("utf-8", errors="replace")
+            pipes = [self._proc.stdout]
+            if self._stderr_open:
+                pipes.append(self._proc.stderr)
+            ready, _, _ = select.select(pipes, [], [], remaining)
+            self._consume_output(ready)
+
+    def _consume_output(self, ready):
+        """Drain ready pipes during both request writes and response reads."""
+        # Drain stderr first so diagnostics emitted just before EOF survive.
+        if self._proc.stderr in ready:
+            chunk = os.read(self._proc.stderr.fileno(), 65536)
+            self._stderr_open = bool(chunk)
+            self._stderr_tail = (self._stderr_tail + chunk)[-8192:]
+        if self._proc.stdout in ready:
+            chunk = os.read(self._proc.stdout.fileno(), 65536)
+            if not chunk:
+                raise self._connection_error(
+                    "klyk server closed the connection unexpectedly"
+                )
+            self._stdout_buffer.extend(chunk)
+
+    def _connection_error(self, message):
+        """Attach a bounded recent diagnostic tail to transport failures."""
+        err = " | ".join(self._stderr_tail.decode("utf-8", errors="replace").splitlines()[-5:])
+        return KlykError(message + (f"; stderr: {err}" if err else ""))
 
 
 def _emit(obj):

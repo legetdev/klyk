@@ -6,53 +6,59 @@ Internals reference for working on the klyk codebase. The "why this code is shap
 
 ## How It Works
 
-All interaction goes through Apple's CoreGraphics framework via Python `ctypes` — no third-party computer use libraries. The physical cursor moves, real keystrokes fire, and screenshots capture the actual composited screen.
+Input uses Apple's CoreGraphics and private SkyLight APIs via Python `ctypes`; supported semantic controls can also use Accessibility actions. Autonomous mode attempts invisible native input, while humanoid mode uses the visible cursor. Screenshots capture the rendered app; no third-party computer-use library is involved.
 
 Sessions are keyed by app name. Agents never handle a `session_id` — they just use the app's name:
 
 ```python
 screenshot(app="Youty")              # launches Youty if not running, returns screenshot
-fill_field(app="Youty", x, y, text)  # type into a field
-click(app="Youty", x, y)             # click a button
-verdict(app="Youty", test_description="...")  # PASS or FAIL
+fill_field(app="Youty", x=100, y=100, text="Example")  # type into a field
+click(app="Youty", x=100, y=100)             # click a button
+verdict(app="Youty", test_description="...")  # evidence for the agent to assess
 ```
 
-The first call to any tool for a given app automatically launches it. Subsequent calls reuse the session.
+Tools that create an app session automatically launch the app if needed. Subsequent calls reuse the session.
 
 ---
 
 ## File Structure
 
-```
-klyk/
-├── mcp_server.py        # MCP server, tool definitions, handlers
-├── session.py           # Session registry, auto-create by app name, template cache
-├── computer.py          # CoreGraphics input synthesis (click, drag, keyboard, scroll, AX)
-├── capture.py           # CoreGraphics screen capture (CG primary, screencapture fallback)
-├── launcher.py          # App launch (browsers get --force-renderer-accessibility)
-├── logs.py              # Log capture (native app stderr buffer + reader)
-├── ocr.py               # Apple Vision OCR — click_element + accurate-mode fallback
-├── matcher.py           # Pure-NumPy template matching — get_template / find_template / wait_for_visual
-├── grader.py            # UI grading — platform-specific criteria
+```text
+klyk/                   # Runtime package
+├── mcp_server.py        # Tool contracts, validation, dispatch, and handlers
+├── client.py            # klyk-call shell client and capture cache
+├── session.py           # App sessions, window labels, and template cache
+├── computer.py          # CoreGraphics input and Accessibility operations
+├── capture.py           # Screenshots, pixel sampling, and PNG codecs
+├── skylight.py          # Private invisible-input bindings and delivery self-test
+├── launcher.py          # Native app launch and Chromium detection
+├── ocr.py               # On-device Apple Vision text recognition
+├── matcher.py           # NumPy template matching
+├── ownership.py         # Cross-process control token
+├── activity.py          # Bounded action history and observers
+├── menubar.py           # Activity and control menu
+├── visibility.py        # Per-app Dock badges
+├── ui_thread.py         # Main-thread AppKit dispatch
+├── cli.py               # Install, uninstall, doctor, update, and restart
+├── doctor.py            # Health and permission diagnostics
+├── clients.py           # Supported-client registry and config editing
+├── jsonc.py             # Comment-preserving OpenCode config edits
+├── updates.py           # Cached update checks and upgrade-command selection
+├── grader.py            # UI evaluation criteria
 ├── reporter.py          # Verdict evidence aggregation
-├── keycodes.py          # macOS virtual key code table (regular keys)
-├── ax_roles.py          # Shared AX role catalogs — INTERACTIVE / BROWSER_INTERACTIVE
-├── skylight.py          # Private SkyLight framework binding — invisible mouse path
-├── clients.py           # MCP-client registry + safe JSON/JSONC/TOML config writers
-├── jsonc.py             # Atomic comment-preserving OpenCode config edits
-├── cli.py               # Install, uninstall, doctor, update, and restart commands
-├── updates.py           # Update awareness — daily cached PyPI check + install-method
-│                        #   detection driving `klyk update` (pipx / uv / pip / editable).
-│                        #   Shared state: ~/.klyk/update_check.json (single small file,
-│                        #   atomic overwrite, 24 h TTL, offline-safe, KLYK_UPDATE_CHECK=0
-│                        #   opt-out). Surfaced in `klyk doctor` + the menu-bar line —
-│                        #   never in agent-facing tool responses (token consideration 4).
-├── requirements.txt
-├── README.md            # Install, permissions, usage
-├── ARCHITECTURE.md      # This file — internals reference
-├── AGENTS.md            # Orientation for contributors and non-Claude agents
-├── SECURITY.md          # Security policy, trust model, vulnerability reporting
-└── LICENSE              # MIT
+├── logs.py              # Bounded, scrubbed application stderr
+├── keycodes.py          # Virtual key code table
+├── ax_roles.py          # Shared accessibility role catalogs
+└── __init__.py          # Package version
+
+tests/                  # Portable regressions and opt-in macOS fixtures
+pyproject.toml          # Dependencies, entrypoints, and package build rules
+release.sh              # Verification and publication gate
+README.md               # Installation and usage
+ARCHITECTURE.md         # This internals reference
+AGENTS.md               # Contributor orientation
+SECURITY.md             # Trust model and vulnerability reporting
+LICENSE                 # MIT
 ```
 
 ---
@@ -79,7 +85,7 @@ klyk supports three input-delivery modes selectable per session via the `set_mod
 - **background** — same invisible-first preference as autonomous, but BAILS instead of activating. When SkyLight can't deliver, returns `requires_foreground: true` with a reason and the agent decides what to do. Strict "never touch my foreground" mode.
 - **humanoid** — cursor-warp behavior. Real cursor moves to the click point, target app becomes frontmost, focus changes. The pre-Phase 2 default; opt in via `set_mode` when the user wants to watch each action visibly.
 
-**SkyLight is a private Apple framework** at `/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight`. klyk `dlopen`s it via `ctypes` and resolves two symbols: `SLEventPostToPid(pid_t, CGEventRef)` for routing and `SLEventSetWindowLocation(CGEventRef, CGPoint)` for stamping the window-local destination. **Risk:** Apple does not document these and could change or remove them in any macOS release. The same APIs underpin Codex Mac's "Background Computer Use" and yabai's window-management daemon; both have shipped against them across multiple macOS versions without breakage, so empirical track record is good, but there is no Apple guarantee. If SkyLight fails to load, `skylight.is_available()` returns `False`; autonomous mode can fall back to visible input after verified activation, while background mode refuses it. See [Known Limitations & Risks](#known-limitations--risks) for the consolidated risk register — including the **silent-delivery-failure** mode that this load-time check does *not* cover.
+**SkyLight is a private Apple framework** at `/System/Library/PrivateFrameworks/SkyLight.framework/SkyLight`. klyk `dlopen`s it via `ctypes` and resolves two symbols: `SLEventPostToPid(pid_t, CGEventRef)` for routing and `SLEventSetWindowLocation(CGEventRef, CGPoint)` for stamping the window-local destination. **Risk:** Apple does not document these and could change or remove them in any macOS release. The implementation draws on open-source window-management and input-delivery techniques; their use elsewhere does not establish compatibility with every macOS version or target app. If SkyLight fails to load, `skylight.is_available()` returns `False`; autonomous mode can fall back to visible input after verified activation, while background mode refuses it. See [Known Limitations & Risks](#known-limitations--risks) for the consolidated risk register — including the **silent-delivery-failure** mode that this load-time check does *not* cover.
 
 **Field-stamping recipe (the hard-won detail):** a CGEvent posted via `SLEventPostToPid` is silently dropped unless the following fields are stamped on it before posting. The first seven are universal across event types; the bottom three apply only to specific events (and were added in Phase 2.5):
 
@@ -140,7 +146,7 @@ The flag only applies on cold launch — if the user already has the browser run
 `click_element` falls back to Apple's Vision framework (`VNRecognizeTextRequest`) when the AX tree has no match. Runs on-device via PyObjC, ~50–150 ms per full-window screenshot, no model download. Catches anything rendered as visible text in canvas surfaces, Electron apps, or browser content where AX comes up empty. The fallback is invisible to the agent — `click_element` returns `via: "ocr"` to indicate which path hit.
 
 ### Template matching
-`get_template` / `find_template` use a normalized cross-correlation (the `TM_CCOEFF_NORMED` metric), implemented in **pure NumPy** — the numerator via an FFT (5-smooth-padded for speed), the per-window sums for zero-normalization via integral images. PNG decode/encode go through klyk's first-party CoreGraphics codec (`capture.decode_png_to_rgb_array` / `encode_rgb_array_to_png_b64`). There is no OpenCV dependency: it was the only package forcing `numpy>=2`, which broke shared Python environments. The result is bit-for-bit equivalent to OpenCV's `matchTemplate` (verified elementwise, max|Δ|≈2.6e-7); a full-window (1800×1169) match runs in ~430 ms, an order of magnitude faster with a `search_region`. The reason this is exposed as two explicit tools (rather than folded into `click_element`) is that it needs the agent to first identify a region from one screenshot, then locate it later — a different mental model from "find by label." Use it for icons, custom graphics, and anything else without text.
+`get_template` / `find_template` use a normalized cross-correlation (the `TM_CCOEFF_NORMED` metric), implemented in **pure NumPy** — the numerator via an FFT (5-smooth-padded for speed), the per-window sums for zero-normalization via integral images. PNG decode/encode go through klyk's first-party CoreGraphics codec (`capture.decode_png_to_rgb_array` / `encode_rgb_array_to_png_b64`). There is no OpenCV dependency: it was the only package forcing `numpy>=2`, which broke shared Python environments. The result is numerically close to OpenCV's `matchTemplate` in the recorded comparison (elementwise max|Δ|≈2.6e-7); a full-window (1800×1169) match runs in ~430 ms, an order of magnitude faster with a `search_region`. The reason this is exposed as two explicit tools (rather than folded into `click_element`) is that it needs the agent to first identify a region from one screenshot, then locate it later — a different mental model from "find by label." Use it for icons, custom graphics, and anything else without text.
 
 ### Template cache
 `get_template` stores the captured PNG in `session.template_cache` (per-session dict, cap 50, FIFO eviction) and returns a short `template_id` like `tpl_abc123`. `find_template` and `wait_for_visual` accept either `template_id` or raw `template_b64`. The cache exists because large base64 PNGs are fragile when the LLM transcribes them — the short id is the safer reference. On miss, the error names the cache and tells the agent how to refresh.
@@ -234,7 +240,7 @@ The single authoritative register of every known limitation and operational risk
 
 **Why it's a risk.** SkyLight is an undocumented Apple private framework (`/System/Library/PrivateFrameworks/SkyLight.framework`). Apple publishes no API contract: the symbols, their argument order, and the exact set of CGEvent fields that must be stamped for delivery can change or disappear in any macOS release, with no notice and no SLA. The required field-stamping recipe (`klyk/skylight.py` → `_stamp_routing` + `_stamp_mouse_event`) is reverse-engineered from open-source clients, not documented by Apple.
 
-**Empirical track record.** yabai and OpenAI's Codex Mac "Background Computer Use" ship against the same APIs across many macOS versions without breakage. The path is empirically stable — but that is a track record, not a guarantee.
+**Verification boundary.** The repository's delivery self-test and opt-in live fixtures establish behavior only on the tested machine and software versions. They do not establish another product's implementation or future macOS compatibility.
 
 **Fallback on load failure — handled.** If the framework or its symbols fail to load at import, `skylight.is_available()` returns `False`, every `post_*` returns `False`, and autonomous mode can attempt visible input after verified activation. Background mode refuses that fallback; failed activation is reported before input.
 
@@ -251,7 +257,7 @@ Invisibility is a delivery option, not a guarantee for every native control. Men
 
 ### 3. Permissions (TCC) dependency
 
-klyk requires macOS **Accessibility** and **Screen Recording** grants; without both, all input synthesis and screen capture fail. The grant is bound to the specific binary/interpreter that launches klyk — so if you drive klyk from a different launcher than the one you granted (e.g. a new terminal app), the grant won't carry over and you'll need to add that binary too.
+klyk needs macOS **Accessibility** for input and accessibility reads, and **Screen Recording** for screen capture. Missing either grant prevents the corresponding operations; doctor checks them separately. The grant is bound to the specific binary/interpreter that launches klyk — so if you drive klyk from a different launcher than the one you granted (e.g. a new terminal app), the grant won't carry over and you'll need to add that binary too.
 
 ### 4. Dependency & environment caveats
 
@@ -260,7 +266,7 @@ klyk requires macOS **Accessibility** and **Screen Recording** grants; without b
 
 ### 5. Maturity caveat — early, but core paths live-verified
 
-klyk is early and experimental. The core input paths have been live-verified end-to-end against real macOS apps — the repository includes repeatable native, browser, and Electron fixture checks with independent before/after outcomes (see `tests/README.md`). The invisible-input differentiator rests on **undocumented Apple private symbols** (`SLEventPostToPid`, `SLEventSetWindowLocation`, `SLPSPostEventRecordTo`, `GetProcessForPID`); each is empirically stable and guarded by a load check + delivery self-test with a clean visible-cursor fallback, but Apple offers no contract, so a future macOS could change delivery semantics (see risk #1). Treat exotic or rarely-exercised control types as unproven until they've fired against a real app — the look → act → verify workflow (screenshot / `inspect` after acting) is the standing backstop.
+klyk is early and experimental. The core input paths have been live-verified end-to-end against real macOS apps — the repository includes repeatable native, browser, and Electron fixture checks with independent before/after outcomes (see `tests/README.md`). The invisible-input differentiator rests on **undocumented Apple private symbols**, including `SLEventPostToPid`, `SLEventSetWindowLocation`, and `SLPSPostEventRecordTo`. Load checks and the delivery self-test cover specific failure modes, with visible fallback where the selected mode permits it; they do not verify every key-window or control interaction. Apple offers no compatibility contract, so a future macOS could change delivery semantics (see risk #1). Treat exotic or rarely-exercised control types as unproven until they've fired against a real app — the look → act → verify workflow (screenshot / `inspect` after acting) is the standing backstop.
 
 ### API-level hard limits
 
@@ -310,4 +316,4 @@ Constraints that come from the macOS APIs klyk is built on. Not roadmap items �
 
 ## Regression and release verification
 
-`tests/README.md` documents portable contract tests and opt-in macOS fixture workflows. Portable tests replace native boundaries; they do not establish real input delivery. Live tests retain their reports and screenshots locally in `.verification/`. `release.sh` checks those reports against a fingerprint of the candidate, runs portable tests, builds both archives, and rejects private planning or generated evidence before tagging. CI repeats portable tests and archive checks; GUI evidence remains a local release prerequisite.
+`tests/README.md` documents portable contract tests and opt-in macOS fixture workflows. Portable tests replace native boundaries; they do not establish real input delivery. Live tests retain their reports and screenshots locally in `.verification/`. `release.sh` checks those reports against a fingerprint of the candidate, runs portable tests, builds both archives, and rejects private planning or generated evidence before tagging. CI repeats portable tests and archive checks. Full GUI evidence is required for major functionality changes; minor releases use targeted evidence as described in the release procedure.

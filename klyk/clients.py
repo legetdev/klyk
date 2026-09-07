@@ -243,11 +243,11 @@ def write_context_block(client: Client) -> str:
         if existing[bounds[0]:bounds[1]].strip() == block.strip():
             return "unchanged"
         new_text = existing[:bounds[0]] + block + existing[bounds[1]:]
-        p.write_text(new_text, encoding="utf-8")
+        jsonc.atomic_write(p, new_text)
         return "updated"
     p.parent.mkdir(parents=True, exist_ok=True)
     sep = "" if not existing else ("\n" if existing.endswith("\n") else "\n\n")
-    p.write_text(existing + sep + block + "\n", encoding="utf-8")
+    jsonc.atomic_write(p, existing + sep + block + "\n")
     return "added"
 
 
@@ -262,7 +262,7 @@ def remove_context_block(client: Client) -> bool:
     if not bounds:
         return False
     remaining = (text[:bounds[0]] + text[bounds[1]:]).strip("\n")
-    p.write_text(remaining + "\n" if remaining else "", encoding="utf-8")
+    jsonc.atomic_write(p, remaining + "\n" if remaining else "")
     return True
 
 
@@ -392,9 +392,7 @@ def _write_json(client: Client) -> str:
     if existing == client.entry:
         return "unchanged"
     servers[SERVER_KEY] = client.entry
-    with open(client.path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    jsonc.atomic_write(client.path, json.dumps(data, indent=2) + "\n")
     return "updated" if existing is not None else "added"
 
 
@@ -414,9 +412,9 @@ def _write_toml(client: Client) -> str:
     if client.path.exists():
         prev = client.path.read_text(encoding="utf-8")
         sep = "" if prev.endswith("\n\n") else ("\n" if prev.endswith("\n") else "\n\n")
-        client.path.write_text(prev + sep + block, encoding="utf-8")
+        jsonc.atomic_write(client.path, prev + sep + block)
     else:
-        client.path.write_text(block, encoding="utf-8")
+        jsonc.atomic_write(client.path, block)
     return "added"
 
 
@@ -441,9 +439,7 @@ def remove_entry(client: Client) -> bool:
     if SERVER_KEY not in servers:
         return False
     del servers[SERVER_KEY]
-    with open(client.path, "w", encoding="utf-8") as f:
-        json.dump(data, f, indent=2)
-        f.write("\n")
+    jsonc.atomic_write(client.path, json.dumps(data, indent=2) + "\n")
     return True
 
 

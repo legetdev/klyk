@@ -489,6 +489,7 @@ TOOLS = [
     types.Tool(
         name="screenshot",
         description=(
+            "A failed window capture returns an error; it never widens to the full desktop. "
             "Capture only the app image, without AX elements. Use inspect for an unknown UI when both pixels and actionable labels are useful; use AX-only reads for known structural checks. Screenshot is appropriate for rendering, layout, and visual before/after verification. Window coordinates, focus_warning, overlap_warning, and save_path follow inspect. display (index from screen_info or 'main') captures a whole display in screen coordinates and overrides window_id. A successful capture is evidence to inspect, not proof an earlier action succeeded."
         ),
         inputSchema={
@@ -1440,8 +1441,9 @@ TOOLS = [
             "navigates through a matching sidebar location; arbitrary nested folders outside "
             "sidebar locations are unsupported and return an error without saving. Without path, "
             "save uses the panel's current filename and directory. A supplied save path is checked "
-            "for file existence; this does not prove file contents or that an existing file was "
-            "updated. Open may use Go To Folder and reports input delivery, not independent "
+            "for creation or a metadata change and a closed save/confirmation panel; unchanged "
+            "existing files return saved=false. This does not verify file contents. "
+            "Open may use Go To Folder and reports input delivery, not independent "
             "document verification. Inspect the dialog first and verify the resulting file/document"
             " afterward."
         )
@@ -4775,6 +4777,18 @@ async def call_tool(
             elif action == "save":
                 import os as _os
                 saved_path = _os.path.abspath(_os.path.expanduser(path)) if path else None
+
+                def file_signature():
+                    """Distinguish a new or changed destination from a preexisting file."""
+                    if not saved_path:
+                        return None
+                    try:
+                        info = _os.stat(saved_path)
+                    except FileNotFoundError:
+                        return None
+                    return (info.st_ino, info.st_size, info.st_mtime_ns, info.st_ctime_ns)
+
+                before_save = file_signature()
                 loop = asyncio.get_event_loop()
                 # Wait only for panel readiness; never send a speculative Return
                 # to the document behind a missing or still-opening sheet.
@@ -4865,8 +4879,6 @@ async def call_tool(
                 dialog_error = None
                 ext = _os.path.splitext(saved_path)[1] if saved_path else ""
                 for _ in range(3):
-                    if saved_path and _os.path.exists(saved_path):
-                        break
                     alert = await loop.run_in_executor(
                         None, lambda: computer.ax_read_alert(session.pid)
                     )
@@ -4896,13 +4908,18 @@ async def call_tool(
                 #    success, and surface the OS's own reason when it refused.
                 result: dict = {"ok": True, "action": action, "path": saved_path}
                 if saved_path:
-                    exists = _os.path.exists(saved_path)
-                    result["saved"] = exists
+                    after_save = file_signature()
+                    changed = after_save is not None and after_save != before_save
+                    active_panel = await loop.run_in_executor(
+                        None, lambda: computer.ax_read_alert(session.pid, include_save_panel=True)
+                    )
+                    saved = changed and not active_panel and not dialog_error
+                    result["saved"] = bool(saved)
                     if nav_to:
                         result["navigated_to"] = nav_to
-                    if not exists:
+                    if not saved:
                         result["ok"] = False
-                        # The save didn't land — dismiss the still-open panel via
+                        # Save was not confirmed — dismiss the still-open panel via
                         # AX Cancel so a leftover modal sheet can't block the app
                         # (a stuck save panel made subsequent activations hang for
                         # minutes). Focus-independent; safe if already closed.
@@ -4921,6 +4938,16 @@ async def call_tool(
                                 f"{dialog_error}"
                             )
                             result["dialog_message"] = dialog_error
+                        elif active_panel:
+                            result["error"] = (
+                                "The save or confirmation panel remained open after Save; the save was not confirmed. "
+                                "Inspect the current dialog state and verify the destination before continuing."
+                            )
+                        elif before_save is not None and not changed:
+                            result["error"] = (
+                                "The destination already existed and no file update was observed; "
+                                "the save was not confirmed. Verify the destination before continuing."
+                            )
                         elif directory and not nav_to:
                             result["error"] = (
                                 f"Couldn't navigate the save panel to {directory!r}: it "

@@ -1765,14 +1765,15 @@ def _collect_sheet_contents(elem: int) -> tuple:
     return texts, buttons, has_save_as[0]
 
 
-def ax_read_alert(pid: int) -> dict | None:
+def ax_read_alert(pid: int, include_save_panel: bool = False) -> dict | None:
     """Read an alert sheet's message + buttons, if one is open — e.g. the error
     macOS raises when a save is refused ("you don't have permission", "the
     volume is read-only") or a confirmation ("you used the extension .txt …").
     Returns {'text': str, 'buttons': [str]} for the alert, or None. Excludes the
     save/open panel itself (which carries a 'Save As:' field), so the caller can
     tell a real alert apart from the panel and surface — not silently dismiss —
-    the reason a save failed."""
+    the reason a save failed. Set include_save_panel=True when verifying that
+    a save has completed: an open Save As panel then returns save_panel=True."""
     try:
         app = _appserv.AXUIElementCreateApplication(pid)
         if not app:
@@ -1798,8 +1799,10 @@ def ax_read_alert(pid: int) -> dict | None:
                 is_alert = bool(buttons) and not has_save_as and (
                     desc == "alert" or any(len(t) > 12 for t in texts)
                 )
-                if is_alert:
+                if is_alert or (include_save_panel and has_save_as):
                     found[0] = {"text": msg[:500], "buttons": buttons}
+                    if has_save_as:
+                        found[0]["save_panel"] = True
                     return
             ch = _ax_read_attr_ptr(e, b"AXChildren")
             if ch:
@@ -2669,11 +2672,14 @@ async def click(x: int, y: int, button: str = "left", modifiers: list[str] | Non
         if flags:
             _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
         _post(ev_down)
-        await asyncio.sleep(0.005)
-        ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
-        if flags:
-            _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-        _post(ev_up)
+        try:
+            await asyncio.sleep(0.005)
+        finally:
+            # Cancellation must release the button before relinquishing input.
+            ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
+            if flags:
+                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
+            _post(ev_up)
 
 
 async def long_press(x: int, y: int, duration: float = 1.0, button: str = "left") -> None:
@@ -2718,12 +2724,15 @@ async def double_click(x: int, y: int, modifiers: list[str] | None = None) -> No
             if flags:
                 _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
             _post(ev_down)
-            await asyncio.sleep(0.02)
-            ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
-            _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
-            if flags:
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-            _post(ev_up)
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                # Preserve click-state and modifiers even when cancelled mid-pair.
+                ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
+                _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
+                if flags:
+                    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
+                _post(ev_up)
             await asyncio.sleep(0.02)
 
 
@@ -2740,12 +2749,15 @@ async def triple_click(x: int, y: int, modifiers: list[str] | None = None) -> No
             if flags:
                 _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
             _post(ev_down)
-            await asyncio.sleep(0.02)
-            ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
-            _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
-            if flags:
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-            _post(ev_up)
+            try:
+                await asyncio.sleep(0.02)
+            finally:
+                # Preserve click-state and modifiers even when cancelled mid-pair.
+                ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
+                _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
+                if flags:
+                    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
+                _post(ev_up)
             await asyncio.sleep(0.02)
 
 

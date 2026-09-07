@@ -8,6 +8,8 @@ python3 -B -m unittest discover -s tests
 
 The portable tests cover validation, batch failures, targeting, emergency-latch enforcement, input cleanup, Unicode and clipboard preservation, ownership, session limits, configuration editing, and publication privacy. Native boundaries are controlled fakes; these tests do not prove real macOS input delivery.
 
+Focused regressions also exercise real subprocess pipes (large requests, noisy stderr, partial responses, timeouts, and cleanup), failed atomic configuration/cache writes, capture-scope refusal, cancelled click pairs, and save-result evidence. These run without opening apps or operating the desktop.
+
 ## Real Mac verification
 
 The opt-in native check compiles `Fixture.swift` using `xcrun swiftc`, starts disposable AppKit apps, and drives all 48 tools through the real stdio MCP server:

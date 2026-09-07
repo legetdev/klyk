@@ -274,8 +274,7 @@ def _resolve_client(rest: list[str]):
 
 
 def _configure_client(client) -> bool:
-    """Write klyk into the client's config. Prompts before replacing a
-    differing entry; prints a paste snippet when a file can't be auto-edited.
+    """Refresh the client's klyk entry; print a paste snippet if it cannot be edited.
     Returns True if the client is left configured."""
     try:
         clients.current_entry(client)
@@ -417,10 +416,8 @@ def _install(rest: list[str]) -> None:
             if c.context_file is not None:
                 _write_context_guide(c)
 
-    # Finally, offer to wire every other AI client on the Mac. Permissions are
-    # already granted (they attach to the user, not the client), so the rest is
-    # pure config writes — one prompt instead of a command per client. Skipped in
-    # --all mode, which already configured everything detected.
+    # List other detected clients without changing their configuration. Each
+    # launcher's macOS permission chain still needs its own verification.
     if not all_mode:
         print()
         _wire_other_clients(targets[0])
@@ -510,7 +507,7 @@ def _wire_other_clients(configured) -> None:
 
     if pending:
         width = max(len(c.key) for c in pending) + 2
-        print("Other AI clients detected (permissions already carry over):")
+        print("Other AI clients detected (verify permissions from each launcher):")
         for c in pending:
             print(f"    klyk install {c.key:<{width}} {c.label}")
         print("    …or `klyk install --all` to wire every detected client at once.")

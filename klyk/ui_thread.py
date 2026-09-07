@@ -23,7 +23,7 @@ Design considerations:
 - 5. Failure coupling: every dispatched block runs in its own try/except.
   One bad block cannot block another, and cannot block tool dispatch.
 - 9. Hidden state: this module owns one main-loop drain timer and the
-  process-level NSApp. start() is idempotent; shutdown is wired into
+  process-level NSApp. install_on_main_thread() is idempotent; shutdown is wired into
   the asyncio worker's finally clause so the main thread exits cleanly.
 """
 
@@ -92,7 +92,7 @@ class UIThread:
         try:
             self._app = NSApplication.sharedApplication()
             # Accessory: no Dock icon, no app menu. klyk's only AppKit
-            # surfaces are the status item and the per-app Dock badges.
+            # surface is the menu-bar status item.
             self._app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
 
             def _drain(_timer):

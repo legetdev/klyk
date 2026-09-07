@@ -68,7 +68,8 @@ def _alive(pid: int) -> bool:
         return False
     try:
         os.kill(pid, 0)
-    except ProcessLookupError:
+    except (ProcessLookupError, OverflowError):
+        # Corrupt tokens can contain an integer outside the platform PID range.
         return False
     except OSError:
         return True  # exists but signalling denied — treat as alive

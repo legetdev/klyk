@@ -39,6 +39,14 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result, (731, True))
         popen.assert_not_called()
 
+    def test_permission_error_does_not_claim_process_terminated(self):
+        """An inaccessible process remains unverified at both termination polls."""
+        with patch.object(launcher.os, "kill", side_effect=PermissionError):
+            self.assertFalse(launcher.terminate_pid(731, term_timeout=1))
+        with patch.object(launcher.os, "kill", side_effect=[None, None, PermissionError]), \
+             patch.object(launcher.time, "sleep"):
+            self.assertFalse(launcher.terminate_pid(731, term_timeout=0))
+
     async def test_missing_live_window_does_not_close_or_terminate_app(self):
         """A vanished selected window fails closed while preserving the live app."""
         existing = session_module.Session(

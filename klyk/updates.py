@@ -28,9 +28,11 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 import sys
 import threading
+import tempfile
 import time
 import urllib.request
 from pathlib import Path
@@ -94,6 +96,12 @@ def _read_cache() -> dict | None:
         data = json.loads(_CACHE_PATH.read_text())
         if not isinstance(data, dict):
             raise ValueError("cache is not a JSON object")
+        checked_at = data.get("checked_at")
+        if (isinstance(checked_at, bool) or not isinstance(checked_at, (int, float))
+                or not math.isfinite(checked_at) or checked_at < 0):
+            raise ValueError("cache checked_at must be a finite nonnegative timestamp")
+        if data.get("latest") is not None and not isinstance(data["latest"], str):
+            raise ValueError("cache latest must be a version string or null")
     except (OSError, ValueError) as e:
         log.warning("update cache %s unreadable (%s) — will refetch", _CACHE_PATH, e)
         return None
@@ -106,13 +114,24 @@ def _write_cache(latest: str | None) -> None:
     """Atomically overwrite the cache. latest=None records a failed fetch so
     we still respect the TTL and don't hammer PyPI while offline."""
     data = {"checked_at": time.time(), "latest": latest}
+    tmp = None
     try:
         _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
-        tmp = _CACHE_PATH.with_suffix(".json.tmp")
-        tmp.write_text(json.dumps(data))
+        # Each process owns its temporary file; concurrent servers cannot
+        # truncate or rename one another's pending cache writes.
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
+                dir=_CACHE_PATH.parent, prefix=".update-check-", delete=False) as handle:
+            tmp = Path(handle.name)
+            handle.write(json.dumps(data))
         os.replace(tmp, _CACHE_PATH)
     except OSError as e:
         log.warning("could not write update cache %s: %s", _CACHE_PATH, e)
+    finally:
+        if tmp is not None:
+            try:
+                tmp.unlink(missing_ok=True)
+            except OSError:
+                pass
 
 
 def _fetch_latest() -> str | None:
@@ -138,7 +157,7 @@ def check(force: bool = False) -> dict:
     if not enabled():
         return status()
     cache = _read_cache()
-    fresh = cache is not None and (time.time() - cache.get("checked_at", 0)) < _TTL_S
+    fresh = cache is not None and 0 <= (time.time() - cache["checked_at"]) < _TTL_S
     if force or not fresh:
         _write_cache(_fetch_latest())
     return status()

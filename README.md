@@ -17,7 +17,7 @@
 > - **It is a prompt-injection target.** If the agent driving klyk also reads untrusted content — a web page, an email, a document — a malicious instruction hidden there can become real clicks and keystrokes on your machine. "Reads the web" + "controls the Mac" is the high-risk combination. Run klyk only with an agent and a workflow you trust.
 > - **It relies on an undocumented Apple API.** Invisible native input uses Apple's private SkyLight framework. Apple does not support or guarantee it; a macOS update can change or break it without notice, and the affected actions may fall back to visible input or require activation.
 >
-> **What klyk is, honestly:** an early, experimental, open-source tool built by a solo author — a business student, not a professional developer — working with AI, in good faith. It has **not** had an independent professional security audit. Core paths are live-tested end-to-end against a real macOS session before every release, but treat it as early software: less-common paths may hold surprises.
+> **What klyk is, honestly:** an early, experimental, open-source tool built by a solo author — a business student, not a professional developer — working with AI, in good faith. It has **not** had an independent professional security audit. Core paths have repeatable live macOS tests; releases use full or targeted verification according to the changed behavior (see [the release procedure](./tests/README.md#release-gate)). Treat it as early software: less-common paths may hold surprises.
 >
 > **No warranty. Use at your own risk.** klyk is provided "as is" under the MIT license, with no warranty of any kind. You are responsible for what the agent does on your machine. Don't point it at anything — money, accounts, irreplaceable files — you aren't willing to have an autonomous agent touch.
 
@@ -37,12 +37,12 @@ Klyk closes that gap. It gives an AI agent the same input channel a human has �
 
 ```
 > screenshot the app, then click "Sign in"
-[ Klyk takes a real screenshot via CoreGraphics, returns it + the AX tree ]
-[ click_element finds "Sign in" via accessibility, falls back to OCR, then to template match ]
-[ Real click fires through the HID event tap ]
+[ inspect returns a CoreGraphics screenshot plus a bounded AX element list ]
+[ click_element finds "Sign in" via accessibility, then on-device OCR if needed ]
+[ Klyk performs an AX action or sends input using the app and session delivery mode ]
 ```
 
-A flat, MECE tool surface across observation, interaction, evaluation, session management, and system operations. Three-tier click targeting (AX → on-device OCR → pixel template) so a label is reachable regardless of how the app exposes it. Cross-app drag, right-click-then-select, and multilingual OCR are all first-class. Per-call latency + reasoning-gap metrics so the agent can self-pace. Best-effort AX folded into screenshots so most tasks finish in one round-trip.
+Tools cover observation, interaction, evaluation, session management, and system operations. Label targeting uses AX → on-device OCR; separate template tools locate previously captured icons or graphics without text. Cross-app drag, right-click-then-select, and multilingual OCR are all first-class. Per-call latency + reasoning-gap metrics so the agent can self-pace. `inspect` combines a screenshot with best-effort AX targeting data in one round-trip; `screenshot` returns only the image.
 
 ## Install
 
@@ -121,16 +121,13 @@ Any other MCP client works too — klyk speaks MCP natively. Add this entry to i
 { "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-m", "klyk.mcp_server"] } } }
 ```
 
-Permissions, the singleton lock, and `klyk doctor` work identically regardless of which client launches klyk.
+Permissions, control ownership, and `klyk doctor` work identically regardless of which client launches klyk.
 
 ### Choosing a model — the speed vs. intelligence trade-off
 
-klyk runs at the same OS speed no matter what's driving it — the latency and accuracy you *feel* are the **model's**, not klyk's. Because klyk is model-agnostic, you pick where you want to sit on a very real trade-off:
+Klyk is model-agnostic. The time between tool calls and the quality of target selection depend on the driving model, its reasoning settings, and the client. Klyk's own latency varies with the app, accessibility tree, capture size, and action.
 
-- **Frontier models (e.g. Claude Opus).** Long gaps between actions — sometimes **minutes** while the model reasons — but each action is usually well-chosen, correctly targeted, and efficient. Fewer wrong clicks, fewer wasted round-trips. Best for high-stakes or irreversible work where a misfire is expensive.
-- **Fast, smaller models (e.g. Gemini Flash).** Often **under ~10 seconds** between actions — snappy and cheap — but they misfire more: wrong element, wrong order, premature verdict. They lean harder on klyk's observe→act→verify loop to catch and recover from mistakes. Best for fast, iterative, low-stakes tasks where throughput beats precision.
-
-There's no universally "right" model — it's a deliberate choice per task. Match the model to the cost of being wrong: the smarter-but-slower model when an errant click matters, the faster-but-looser model when speed and volume matter and recovery is cheap.
+Choose a model by testing a representative workflow: check whether it observes before acting, resolves ambiguous targets, and verifies the outcome without repeating consequential actions. A faster model can reduce waiting, but model choice does not replace user authorization or supervision for irreversible work.
 
 ### Drive klyk from any AI (no MCP integration required)
 
@@ -155,8 +152,8 @@ echo '{"tool":"screen_info","args":{}}' | klyk-call --batch   # many calls, one 
 ## Quick example
 
 ```
-screenshot(app="Google Chrome")
-# → returns the image plus the AX element list
+inspect(app="Google Chrome")
+# → returns the image plus a bounded AX element list
 
 run(app="Google Chrome", actions=[
     {"tool": "click", "x": 580, "y": 389},
@@ -165,7 +162,7 @@ run(app="Google Chrome", actions=[
 ])
 # → executes the full sequence at OS speed, returns one batched response
 
-verdict(app="Google Chrome", test_description="Posted a comment on a YouTube video")
+verdict(app="Google Chrome", test_description="Entered the expected text in the comment field")
 # → returns final screenshot + logs + grading criteria for the agent to synthesize PASS/FAIL
 ```
 
@@ -174,7 +171,7 @@ verdict(app="Google Chrome", test_description="Posted a comment on a YouTube vid
 The interesting product decisions weren't tools to build but tools to *not* build:
 
 - **No third-party computer-use libraries.** Everything runs through Apple's CoreGraphics, Vision, and Accessibility frameworks via Python's `ctypes`. Keeps the dependency footprint tiny and the failure surface predictable.
-- **No visual grounding models.** UI-TARS and OmniParser would have closed the "no AX, no text" gap — at the cost of a multi-GB model download and 1–2s per call. Rejected. Template matching covers the same case at 30ms with zero ML dependencies.
+- **No visual grounding models.** UI-TARS and OmniParser would have closed the "no AX, no text" gap — at the cost of a multi-GB model download and 1–2s per call. Rejected. Template matching locates a previously captured visual target without an additional model; it requires a reference crop and does not provide general visual understanding.
 - **No Chrome DevTools Protocol.** It would have helped only Chromium browsers and broken the "like a human" model. Skipped in favor of forcing the renderer-accessibility flag, which gets the entire web AX tree for free.
 - **macOS only.** Cross-platform compromises every primitive. The honest framing: ship one OS well rather than three OSes badly.
 

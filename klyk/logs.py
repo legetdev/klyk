@@ -22,7 +22,7 @@ import re
 import threading
 from collections import deque
 from dataclasses import dataclass, field
-from typing import Deque
+from typing import Callable, Deque
 
 _LOG_CHANNEL_CAP = 500
 
@@ -30,7 +30,16 @@ _LOG_CHANNEL_CAP = 500
 # leading key/label (group 1) plus `=***`. Patterns deliberately leave the
 # *key* visible — the agent still sees "password=" so it can reason about
 # the surrounding failure — and just hide the *value*.
-_SCRUBBERS: list[tuple[re.Pattern, str]] = [
+_SCRUBBERS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
+    # JSON strings can contain whitespace and escaped quotes; redact the whole
+    # value, including quoted keys that the plain key/value rule cannot match.
+    (
+        re.compile(
+            r'(?i)("(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|'
+            r'auth(?:orization)?)"\s*:\s*)"(?:\\.|[^"\\])*"'
+        ),
+        lambda m: f'{m.group(1)}"***"',
+    ),
     # `Authorization: Bearer …` headers — before the generic key/value rule
     # so the generic rule does not consume only the word "Bearer" and leave
     # the actual token visible. Tokens are intentionally any non-whitespace
