@@ -65,6 +65,10 @@ def main():
             check('48 tools discovered',len(tools)==48)
             call(client,'take_control')
             call(client,'screen_info')
+            # MCP can reject invalid input before dispatch with a plain-text error.
+            invalid_focus=client.call('focus_window',{'app':'Klyk Fixture'})
+            report['invalid_focus']=invalid_focus
+            check('app-only focus rejected',invalid_focus.get('isError') is True)
             windows=call(client,'list_windows',bundle_id='org.klyk.regression.fixture',app_path=str(bundle))
             observation=call(client,'inspect',detail='full')
             call(client,'ax_snapshot')

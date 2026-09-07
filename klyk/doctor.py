@@ -399,10 +399,12 @@ def check_mcp_client_entries() -> CheckResult:
     problems: list[str] = []
     repair_keys: list[str] = []
     for client in clients.CLIENTS.values():
-        if not clients.config_files(client):
-            continue
         try:
             entry = clients.current_entry(client)
+            if entry is None and clients.legacy_antigravity_entry(client) is not None:
+                problems.append(f"{client.label}: klyk exists only in the legacy config; current agy reads {client.path}")
+                repair_keys.append(client.key)
+                continue
         except Exception as exc:
             problems.append(f"{client.label}: unreadable config ({exc})")
             repair_keys.append(client.key)
@@ -450,7 +452,7 @@ def check_mcp_client_entries() -> CheckResult:
         )
     if valid:
         return CheckResult(
-            "MCP client config", "ok", f"configured: {', '.join(valid)}",
+            "MCP client config", "ok", f"configured: {', '.join(valid)} (configuration only; client connection not checked)",
         )
     return CheckResult(
         "MCP client config", "warn", "klyk is not configured in a supported client",

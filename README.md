@@ -58,9 +58,9 @@ klyk install
 1. Adds Klyk to `~/.claude.json` (so it appears in every Claude Code session).
 2. Walks you through granting the two macOS permissions Klyk needs — opens the exact System Settings panes for **Accessibility** and **Screen Recording**, waits for you to add your terminal app, then **verifies the grant actually came through** before continuing.
 3. Runs a final `klyk doctor` pass to confirm every piece is green.
-4. Detects every *other* AI client on your Mac and offers to wire them all in one confirmation — permissions carry over, so it's a single prompt, not a setup pass per client.
+4. Lists other detected AI clients. Use `klyk install --all` to configure them; verify permissions and the connection in each actual client.
 
-For clients that read a natural-language context file (Gemini CLI's `GEMINI.md`), `install` also *offers* — opt-in, defaults to no — to add a short, clearly-marked klyk note there, so the agent can fall back to the `klyk-call` shell if its own MCP ever fails to surface klyk. It never edits that file without an explicit yes, merges around your existing content, and `uninstall` removes it.
+For clients that read a natural-language context file (Gemini CLI's `GEMINI.md`), `install --ambient` explicitly opts into a short, marked shell-fallback guide. Normal installation does not edit that file. The guide preserves surrounding content, is refreshed when `--ambient` is repeated, and is removable on uninstall.
 
 Restart Claude Code (or whichever MCP client you use) and klyk is live. Try `inspect Finder` to see it in action. To wire every detected client up front in one shot: `klyk install --all`.
 
@@ -103,7 +103,7 @@ klyk install --list      # show every supported client and its config path
 | OpenAI Codex CLI | `~/.codex/config.toml` |
 | OpenCode CLI | `~/.config/opencode/opencode.json` or `opencode.jsonc` (legacy `config.json` is honored) |
 | Gemini CLI | `~/.gemini/settings.json` |
-| Antigravity CLI (`agy`) | `~/.gemini/antigravity-cli/mcp_config.json` |
+| Antigravity CLI (`agy`) | `~/.gemini/config/mcp_config.json` |
 | Grok CLI (xAI) | `~/.grok/config.toml` |
 
 For OpenCode, setup and verification are two commands:
@@ -134,7 +134,7 @@ There's no universally "right" model — it's a deliberate choice per task. Matc
 
 ### Drive klyk from any AI (no MCP integration required)
 
-MCP support varies a lot between agent harnesses — some gate it, some implement it incompletely, some don't have it. So klyk ships an extra front door that works even when a client's own MCP plumbing doesn't. It reaches the **same** persistent klyk session.
+Use native MCP when available: the client keeps a server connected and exposes its tool schemas. For agents without native MCP, `klyk-call` provides the same tools over the shell. Each invocation starts and closes its **own** server; it does not share a native MCP session. `--batch` keeps one server alive for its input lines. Batch only predictable steps; observe the UI before deciding subsequent actions.
 
 **`klyk-call` — one shell command, any tool.** For any agent that can run a shell command (great for smaller models — no handshake to reason about):
 
@@ -145,6 +145,10 @@ klyk-call --tool inspect --app Finder         # call any tool
 klyk-call --tool screenshot --app Finder      # screenshot → saved to disk, path returned
 echo '{"tool":"screen_info","args":{}}' | klyk-call --batch   # many calls, one session
 ```
+
+**Antigravity setup:** `klyk install antigravity` (or `klyk install agy`) writes the [documented global config](https://antigravity.google/docs/mcp). Start a new agy session and check `/mcp` to verify the connection; `klyk doctor` verifies configuration and local health, not which tools an existing client session has loaded. Workspace `.agents/mcp_config.json` can also affect the loaded servers. If klyk exists only in the old `~/.gemini/antigravity-cli/mcp_config.json`, doctor reports the mismatch and `klyk doctor --fix` or installation creates the current entry, retaining custom klyk settings and leaving the legacy file intact for older clients. Native MCP needs no `GEMINI.md` instructions; `--ambient` remains an optional shell-fallback guide.
+
+**Control ownership:** a dead driver is reclaimed automatically. Taking over from a live driver requires user authorization. A standalone `klyk-call --tool take_control` ends with that invocation, so it cannot grant control to later shell commands. Use a persistent native MCP connection for interactive workflows.
 
 **Vision over the shell.** When a tool returns a screenshot (`screenshot`, `inspect`, `verdict`, image-producing `run` steps), `klyk-call` writes the PNG to `~/.klyk/captures/` and returns its `saved_path` instead of dumping base64 — so the agent *views* the capture with its own image reader (Claude Code's file read, Gemini's `@path`, etc.) and keeps the same observe→act→verify loop the native MCP transport has, with no context-flooding payload. The cache keeps the most recent 20 captures.
 

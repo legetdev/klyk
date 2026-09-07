@@ -1574,7 +1574,8 @@ TOOLS = [
     types.Tool(
         name="focus_window",
         description=(
-            "Bring a specific window (by 'window' label from list_windows) to front and make it "
+            "Bring a specific window to front: supply either 'window' (label from list_windows) "
+            "or 'window_id'; 'app' alone is invalid. Make it "
             "the key window. Required before sending keyboard input that must land in a specific "
             "window — keys route to whichever window of the app is currently key. "
             "Most tools (screenshot, click, press_key, run) accept the 'window' label directly and "
@@ -1589,9 +1590,11 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
-                **_WINDOW_ID_PARAM,
+                "window": {"type": "string", "description": "Window label from list_windows. Required unless window_id is supplied."},
+                "window_id": {"type": "integer", "description": "Raw CG window ID. Required unless window is supplied."},
             },
             "required": ["app"],
+            "anyOf": [{"required": ["window"]}, {"required": ["window_id"]}],
         },
     ),
     types.Tool(
@@ -2967,8 +2970,7 @@ async def call_tool(
                 "blocked": "not_active_session",
                 "message": (
                     "Control is unavailable: another session owns it, or the local owner file cannot be accessed. Run klyk doctor for details. "
-                    "only one session drives klyk at a time, and control "
-                    "passed to a more recently active session. Do NOT reclaim "
+                    "Only one session drives klyk at a time. Do NOT reclaim "
                     "automatically: the other session may be mid-task, and if "
                     "both sessions grabbed control back on every block they'd "
                     "fight over it endlessly. Instead, tell the user klyk is "

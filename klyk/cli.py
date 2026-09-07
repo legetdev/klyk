@@ -125,7 +125,8 @@ def _doctor_fix() -> None:
         try:
             existing = clients.current_entry(c)
             default_claude = c.key == "claude" and clients.is_present(c)
-            if (existing is not None or default_claude) and existing != c.entry:
+            legacy_agy = existing is None and clients.legacy_antigravity_entry(c) is not None
+            if (existing is not None or default_claude or legacy_agy) and existing != c.entry:
                 clients.write_entry(c)
                 fixed.append(f"refreshed the {c.label} config entry")
         except Exception:
@@ -410,7 +411,7 @@ def _install(rest: list[str]) -> None:
         print("then run `klyk doctor` to confirm everything's ready.")
 
     # Context-file note (GEMINI.md etc.) — opt-in via --ambient, never prompted.
-    # It's only a fallback for clients whose native MCP is flaky; most never need it.
+    # Native MCP remains the default; shell access is an optional fallback.
     if ambient:
         for c in targets:
             if c.context_file is not None:
@@ -481,7 +482,7 @@ def _verify_opencode_connection() -> bool:
 
 def _write_context_guide(client) -> None:
     """--ambient: write the short klyk-call note into the client's context file
-    (e.g. GEMINI.md) so the agent can fall back to the shell if its MCP is flaky."""
+    (e.g. GEMINI.md) so the agent can fall back when native MCP is unavailable."""
     if clients.context_block_present(client):
         print(f"  ✓ klyk note already in {client.context_file}")
         return

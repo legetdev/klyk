@@ -28,6 +28,16 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
             with self.subTest(x=x,y=y): self.assertFalse((await self.s._check_click_safety(self.session,x,y))[0])
         self.assertTrue((await self.s._check_click_safety(self.session,99,99))[0])
 
+    async def test_focus_requires_a_target_before_app_or_input_access(self):
+        """Reject app-only focus early while accepting both existing selector forms."""
+        validator = self.s._TOOL_VALIDATORS['focus_window']
+        for selector in ({'window': 'A'}, {'window_id': 7}, {'window': 'A', 'window_id': 7}):
+            validator.validate({'app': 'Fixture', **selector})
+        result = payload(await self.s.call_tool('focus_window', {'app': 'Fixture'}))
+        self.assertFalse(result['ok'])
+        self.s._get_session.assert_not_awaited()
+        self.s.computer._check_stop.assert_not_called()
+
     async def test_missing_bounds_fail_closed(self):
         """Unresolved window geometry is not permission to click arbitrary screen pixels."""
         for width,height in [(0,0),(-1,100),(100,0)]:

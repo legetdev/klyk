@@ -122,6 +122,102 @@ class JsoncEditorTests(unittest.TestCase):
 class ClientAdapterTests(unittest.TestCase):
     """Verify client adapters against disposable config paths."""
 
+    def test_antigravity_migration_preserves_legacy_and_custom_settings(self) -> None:
+        """Repair old-path setup without touching older clients or unrelated settings."""
+        from klyk import doctor
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            client = replace(clients.get("agy"), path=base / "config" / "mcp_config.json")
+            legacy = base / "antigravity-cli" / "mcp_config.json"
+            legacy.parent.mkdir()
+            custom = {"command": "/old/python", "args": ["-m", "klyk.mcp_server"],
+                      "env": {"KLYK_UPDATE_CHECK": "0"}, "enabledTools": ["inspect"]}
+            legacy.write_text(json.dumps({"mcpServers": {"klyk": custom, "other": {"keep": True}}}))
+            original = legacy.read_bytes()
+            with mock.patch.object(clients, "CLIENTS", {"antigravity": client}):
+                result = doctor.check_mcp_client_entries()
+                self.assertEqual(result.status, "fail")
+                self.assertIn("legacy", result.detail)
+            self.assertTrue(clients.is_present(client))
+            self.assertEqual(clients.write_entry(client), "added")
+            self.assertEqual(legacy.read_bytes(), original)
+            migrated = clients.current_entry(client)
+            self.assertEqual(migrated["command"], client.entry["command"])
+            self.assertEqual(migrated["env"], custom["env"])
+            self.assertEqual(migrated["enabledTools"], custom["enabledTools"])
+            self.assertEqual(clients.write_entry(client), "unchanged")
+            with mock.patch.object(clients, "CLIENTS", {"antigravity": client}):
+                self.assertEqual(doctor.check_mcp_client_entries().status, "ok")
+            self.assertTrue(clients.remove_entry(client))
+            self.assertEqual(legacy.read_bytes(), original)
+
+    def test_antigravity_current_config_takes_precedence_and_preserves_mode(self) -> None:
+        """Current custom fields win over legacy setup and a repeat install is inert."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            client = replace(clients.get("agy"), path=base / "config" / "mcp_config.json")
+            client.path.parent.mkdir()
+            data = {"setting": "保持", "mcpServers": {"other": {"keep": True},
+                    "klyk": {"command": "/old", "args": [], "env": {"CUSTOM": "keep"}, "disabled": True}}}
+            client.path.write_text(json.dumps(data))
+            client.path.chmod(0o640)
+            self.assertEqual(clients.write_entry(client), "updated")
+            updated = json.loads(client.path.read_text())
+            self.assertEqual(updated["setting"], data["setting"])
+            self.assertEqual(updated["mcpServers"]["other"], data["mcpServers"]["other"])
+            self.assertTrue(updated["mcpServers"]["klyk"]["disabled"])
+            self.assertEqual(updated["mcpServers"]["klyk"]["env"], {"CUSTOM": "keep"})
+            self.assertEqual(client.path.stat().st_mode & 0o777, 0o640)
+            original = client.path.read_bytes()
+            with mock.patch.object(clients, "legacy_antigravity_entry", side_effect=AssertionError("must not read legacy")):
+                self.assertEqual(clients.write_entry(client), "unchanged")
+            self.assertEqual(client.path.read_bytes(), original)
+
+    def test_antigravity_invalid_config_and_failed_write_preserve_original(self) -> None:
+        """Refuse malformed input and leave the destination intact on write failure."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("agy"), path=Path(directory) / "mcp_config.json")
+            for text in ('{', '[]', '{"mcpServers": []}', '{"mcpServers": {"klyk": []}}'):
+                client.path.write_text(text)
+                with self.assertRaises((ValueError, clients.ConfigFormatError)):
+                    clients.write_entry(client)
+                self.assertEqual(client.path.read_text(), text)
+            client.path.write_text('{"keep": true}')
+            with mock.patch.object(clients.jsonc.os, "replace", side_effect=OSError("disk error")):
+                with self.assertRaises(OSError):
+                    clients.write_entry(client)
+            self.assertEqual(client.path.read_text(), '{"keep": true}')
+
+    def test_doctor_fix_migrates_only_previously_configured_antigravity(self) -> None:
+        """Repair the old-path installation without enrolling an unconfigured client."""
+        from klyk import cli, doctor
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            client = replace(clients.get("agy"), path=base / "config" / "mcp_config.json")
+            with mock.patch.object(clients, "CLIENTS", {"antigravity": client}), \
+                 mock.patch.object(Path, "home", return_value=base), \
+                 mock.patch.object(doctor, "run_all_checks", return_value=[doctor.CheckResult("fixture", "ok", "ready")]), \
+                 mock.patch("builtins.print"):
+                cli._doctor_fix()
+                self.assertFalse(client.path.exists())
+                legacy = base / "antigravity-cli" / "mcp_config.json"
+                legacy.parent.mkdir()
+                legacy.write_text(json.dumps({"mcpServers": {"klyk": client.entry}}))
+                cli._doctor_fix()
+                self.assertEqual(clients.current_entry(client), client.entry)
+
+    def test_all_other_client_config_paths_remain_unchanged(self) -> None:
+        """Keep every existing non-agy client registry contract stable."""
+        paths = {"claude": ".claude.json", "cursor": ".cursor/mcp.json",
+                 "windsurf": ".codeium/windsurf/mcp_config.json", "continue": ".continue/config.json",
+                 "cline": "Library/Application Support/Code/User/globalStorage/saoudrizwan.claude-dev/settings/cline_mcp_settings.json",
+                 "codex": ".codex/config.toml", "opencode": ".config/opencode/opencode.json",
+                 "gemini": ".gemini/settings.json", "grok": ".grok/config.toml"}
+        for key, path in paths.items():
+            self.assertEqual(clients.get(key).path, Path.home() / path)
+            self.assertIsNone(clients.legacy_antigravity_entry(clients.get(key)))
+        self.assertEqual(clients.get("agy").path, Path.home() / ".gemini/config/mcp_config.json")
+
     def test_opencode_write_preserves_jsonc_and_is_idempotent(self) -> None:
         """Install into OpenCode's selected config without losing user content."""
         with tempfile.TemporaryDirectory() as directory:

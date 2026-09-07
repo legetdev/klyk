@@ -310,6 +310,7 @@ def main(argv=None):
                         "description": t.get("description", ""),
                         "required": required,
                         "optional": [p for p in props if p not in required],
+                        **({"anyOf": schema["anyOf"]} if "anyOf" in schema else {}),
                     })
                 _emit(out)
                 return 0

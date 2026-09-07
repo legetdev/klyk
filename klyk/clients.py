@@ -25,7 +25,7 @@ import json
 import shutil
 import sys
 import tomllib
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from . import jsonc
@@ -124,9 +124,10 @@ CLIENTS: dict[str, Client] = {
     ),
     "antigravity": Client(
         "antigravity", "Antigravity CLI (agy)",
-        _h(".gemini", "antigravity-cli", "mcp_config.json"), "json",
-        "Antigravity's native MCP can be unreliable — if tools don't appear, "
-        "drive klyk with `klyk-call` instead (see README).",
+        _h(".gemini", "config", "mcp_config.json"), "json",
+        "Configuration saved; this does not verify a running Antigravity connection. "
+        "Start a new agy session, then use /mcp to confirm klyk is connected. "
+        "Workspace .agents/mcp_config.json can also affect the loaded servers.",
         context_file=_h(".gemini", "GEMINI.md"),
     ),
     "grok": Client(
@@ -150,6 +151,8 @@ def is_present(client: Client) -> bool:
     """Heuristic: is this client installed on this Mac? True when its config file
     exists or its config directory does — both are created on the client's first
     run, so this reliably distinguishes installed clients from the full catalog."""
+    if client.key == "antigravity" and (client.path.parent.parent / "antigravity-cli").is_dir():
+        return True
     if client.fmt == "opencode":
         return (
             shutil.which("opencode") is not None
@@ -195,9 +198,10 @@ _CTX_START = "<!-- klyk:start -->"
 _CTX_END = "<!-- klyk:end -->"
 
 _GUIDE = """## Computer use via klyk
-Control this Mac with klyk. If the klyk MCP tools are loaded, use them; otherwise drive the same session from the shell with `klyk-call`:
+Use native klyk MCP tools when loaded. If missing in agy, run `klyk install antigravity`, then start a new session and check /mcp. Use `klyk-call` only when native MCP is unavailable:
 - `klyk-call --list` (all tools + params) · `klyk-call --schema <tool>` (one tool) · `klyk-call --tool <name> --args '<json>'` (call it)
-- e.g. `klyk-call --tool inspect --app "Finder"`. Screenshots return a `saved_path` to open. Emergency stop: Cmd+Shift+Esc."""
+- e.g. `klyk-call --tool inspect --app "Finder"`. Screenshots return a `saved_path` to open.
+- Each shell invocation starts a separate server; it does not share a native MCP session. `--batch` keeps one server for its input lines. A standalone take_control does not carry over to the next invocation. Never reclaim a live driver's control without user authorization. Emergency stop: Cmd+Shift+Esc."""
 
 
 def context_block() -> str:
@@ -279,6 +283,14 @@ def list_text() -> str:
 ConfigFormatError = jsonc.ConfigFormatError
 
 
+def legacy_antigravity_entry(client: Client):
+    """Read an old agy installation for migration without altering its config."""
+    if client.key != "antigravity":
+        return None
+    legacy = replace(client, path=client.path.parent.parent / "antigravity-cli" / "mcp_config.json")
+    return current_entry(legacy)
+
+
 def snippet(client: Client) -> str:
     """The exact config block a user would paste for this client."""
     if client.fmt == "toml":
@@ -327,11 +339,33 @@ def write_entry(client: Client) -> str:
     """Add/refresh klyk in this client's config. Returns a status word:
     "added" | "updated" | "unchanged". Raises ManualEditRequired when a TOML
     file already has a differing entry (we won't risk clobbering it)."""
+    if client.key == "antigravity":
+        return _write_antigravity(client)
     if client.fmt == "toml":
         return _write_toml(client)
     if client.fmt == "opencode":
         return _write_opencode(client)
     return _write_json(client)
+
+
+def _write_antigravity(client: Client) -> str:
+    """Configure current agy atomically, preserving custom fields and legacy files."""
+    text = client.path.read_text(encoding="utf-8") if client.path.exists() else ""
+    data = json.loads(text.strip() or "{}")
+    if not isinstance(data, dict) or not isinstance(data.get("mcpServers", {}), dict):
+        raise ConfigFormatError(f"{client.path}: expected an object with an 'mcpServers' object")
+    servers = data.setdefault("mcpServers", {})
+    existing = servers.get(SERVER_KEY)
+    source = existing if existing is not None else legacy_antigravity_entry(client)
+    if source is not None and not isinstance(source, dict):
+        raise ConfigFormatError(f"{client.path}: klyk entry must be an object")
+    entry = {**client.entry, **(source or {}),
+             "command": client.entry["command"], "args": client.entry["args"]}
+    if existing == entry:
+        return "unchanged"
+    servers[SERVER_KEY] = entry
+    jsonc.atomic_write(client.path, json.dumps(data, indent=2) + "\n")
+    return "updated" if existing is not None else "added"
 
 
 def _write_opencode(client: Client) -> str:
