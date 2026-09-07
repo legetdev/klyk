@@ -43,6 +43,8 @@ Reports contain environment versions, tool calls, timings, payload sizes, indepe
 
 ## Release gate
 
+Use a release environment with the project dependencies, `build`, and `twine>=7` (older Twine rejects current Core Metadata 2.5). Update existing tooling with `python -m pip install --upgrade build 'twine>=7'`. The script defaults to `~/.klyk/venv/bin/python`; set `KLYK_RELEASE_PYTHON` to use an isolated release environment.
+
 Choose verification by behavior and risk, not the version number. Full native checks on both supported MCP SDKs and the Chrome/Electron suite are required only for major functionality changes: substantial input delivery, targeting, capture, session/ownership, safety, or cross-app workflow changes. Minor setup, documentation, diagnostics, metadata, and schema corrections use targeted checks of the affected behavior; do not rerun unrelated desktop workflows or stop other sessions for them.
 
 Every release still runs the portable regressions, package metadata/privacy checks, fresh-install doctor, and an MCP connection smoke check. Recheck changed behavior after relevant edits. Keep unrelated known failures recorded without representing them as fixed; they do not force a full suite for a minor release. A regression introduced or worsened by the candidate must be resolved before publication.
