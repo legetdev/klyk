@@ -252,5 +252,93 @@ class ObservationContractTests(unittest.IsolatedAsyncioTestCase):
                 getattr(self.server.computer, native_method).assert_not_called()
 
 
+    async def test_click_hint_is_bounded_to_the_selected_window(self):
+        """A helpful label must not come from a covered sibling window."""
+        self.server.computer.ax_snapshot.return_value = [
+            {"label": "Save", "role": "AXButton", "x": 30, "y": 50}
+        ]
+        hint = await self.server._nearby_ax_hint(self.session, 20, 30)
+        self.assertEqual(hint["label"], "Save")
+        self.server.computer.ax_snapshot.assert_called_once_with(
+            123, window_id=77, max_results=100, deadline_seconds=0.15
+        )
+
+    async def test_expanded_ax_bounds_labels_as_well_as_values(self):
+        """An app-provided accessibility label cannot flood agent context."""
+        self.server.computer.ax_snapshot.return_value = [
+            {"label": "L" * 10000, "value": "V" * 10000, "x": 30, "y": 50}
+        ]
+        result = payload(await self.server.call_tool("ax_snapshot", {"app": "Fixture"}))
+        element = result["elements"][0]
+        self.assertEqual(len(element["label"]), 201)
+        self.assertEqual(len(element["value"]), 201)
+
+    async def test_visual_absence_requires_a_successful_observation(self):
+        """Failed capture or matching cannot prove that a spinner disappeared."""
+        for failure in ("capture", "match", None):
+            with self.subTest(failure=failure):
+                self.server._take_screenshot = AsyncMock(
+                    return_value=("pixels", 100, 80, None),
+                    side_effect=RuntimeError("capture unavailable") if failure == "capture" else None)
+                self.server.matcher.find = MagicMock(return_value=None,
+                    side_effect=RuntimeError("match unavailable") if failure == "match" else None)
+                result = payload(await self.server.call_tool("wait_for_visual", {
+                    "app": "Fixture", "template_b64": "template", "present": False, "timeout": 0,
+                }))
+                self.assertEqual(result["ok"], failure is None)
+                if failure:
+                    self.assertIn("unavailable", result["last_error"])
+
+    async def test_native_option_background_refuses_all_visible_input(self):
+        """Native option selection has no hidden exception to background mode."""
+        self.session.mode = "background"
+        result = payload(await self.server.call_tool("select_option", {
+            "app": "Fixture", "x": 20, "y": 30, "option": "Second",
+        }))
+        self.assertTrue(result["requires_foreground"])
+        self.server.computer.click.assert_not_called()
+        self.server.computer.type_text_char_by_char.assert_not_called()
+        self.server.computer.press_key.assert_not_called()
+
+    async def test_native_option_bounds_failure_precedes_activation(self):
+        """Out-of-window option coordinates stop without changing focus."""
+        self.server._ensure_key_delivery = AsyncMock()
+        result = payload(await self.server.call_tool("select_option", {
+            "app": "Fixture", "x": 100, "y": 30, "option": "Second",
+        }))
+        self.assertFalse(result["ok"])
+        self.server._ensure_key_delivery.assert_not_awaited()
+        self.server.computer.click.assert_not_called()
+
+    async def test_native_option_failed_focus_sends_no_input(self):
+        """A blocked selected window cannot redirect popup input into another window."""
+        self.server._ensure_key_delivery = AsyncMock(return_value=None)
+        self.server._focus_if_needed = AsyncMock(side_effect=RuntimeError("window blocked"))
+        result = payload(await self.server.call_tool("select_option", {
+            "app": "Fixture", "x": 20, "y": 30, "option": "Second",
+        }))
+        self.assertFalse(result["ok"])
+        self.server.computer.click.assert_not_called()
+
+    async def test_native_option_exact_readback_stays_in_selected_window(self):
+        """A prefix sibling is not a verified selection, and readback is scoped."""
+        self.server._ensure_key_delivery = AsyncMock(return_value=None)
+        self.server._focus_if_needed = AsyncMock()
+        self.server.computer.click = AsyncMock()
+        self.server.computer.type_text_char_by_char = AsyncMock()
+        self.server.computer.press_key = AsyncMock()
+        for value, expected in (("Second sibling", False), ("Second", True)):
+            with self.subTest(value=value), patch.object(self.server.asyncio, "sleep", AsyncMock()):
+                self.server.computer.ax_value_at_detailed.return_value = (value, "ok")
+                result = payload(await self.server.call_tool("select_option", {
+                    "app": "Fixture", "window_id": 77, "x": 20, "y": 30, "option": "Second",
+                }))
+                self.assertEqual(result["verified"], expected)
+                self.server.computer.ax_value_at_detailed.assert_called_with(
+                    30.0, 50.0, expected_pid=123, window_id=77
+                )
+                self.server._focus_if_needed.assert_awaited_with(self.session, 77)
+
+
 if __name__ == "__main__":
     unittest.main()

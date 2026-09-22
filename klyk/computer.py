@@ -565,18 +565,10 @@ async def activate_app(pid: int) -> None:
 
 
 def is_frontmost_app(pid: int) -> bool:
-    """
-    True if `pid` owns the topmost user-level on-screen window — the
-    WindowServer's notion of the active app. Used by the seamless-mode
-    click handlers to decide whether SkyLight delivery can succeed.
+    """Check the actual active process, not the owner of the highest visible window.
 
-    Implementation reads CGWindowList live each call rather than
-    NSWorkspace.frontmostApplication(). NSWorkspace updates via
-    distributed notifications that require a pumped AppKit main run
-    loop; klyk's MCP server pumps asyncio, not AppKit, so the cached
-    value goes stale within seconds of a Cmd-Tab. CGWindowList is
-    WindowServer-live and matches every other window primitive in klyk.
-    Returns False on any error so callers treat "unknown" as "not active".
+    Process Manager reads avoid stale AppKit caches and correctly handle active
+    apps with no normal windows. Unknown foreground state fails closed.
     """
     try:
         from . import capture

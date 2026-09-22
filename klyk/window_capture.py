@@ -1,7 +1,7 @@
 """Fresh, window-only ScreenCaptureKit screenshots through the existing PyObjC bridge.
 
 Only native filter/configuration objects are cached, never pixels. The bounded
-cache expires after two seconds; a failed capture evicts its plan immediately.
+cache expires after ten seconds; a failed capture evicts its plan immediately.
 """
 
 import base64
@@ -13,7 +13,7 @@ _lock = threading.RLock()
 _classes = None
 _plans = OrderedDict()
 _CAPACITY = 16
-_TTL = 2.0
+_TTL = 10.0
 _TIMEOUT = 2.0
 
 

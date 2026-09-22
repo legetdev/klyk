@@ -133,8 +133,8 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
     // Atomically expose fixture state for independent assertions without inspecting private apps.
     func writeState() {
-        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "clicks":clicks,"opened":opened,"selections":selections,
-            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height]}]
+        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive, "clicks":clicks,"opened":opened,"selections":selections,
+            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["id":$0.windowNumber,"title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height]}]
         if let encoded = try? JSONSerialization.data(withJSONObject:data,options:[.sortedKeys]) { try? encoded.write(to:URL(fileURLWithPath:statePath),options:.atomic) }
     }
 }

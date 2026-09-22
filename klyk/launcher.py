@@ -12,9 +12,8 @@ import time
 # --force-renderer-accessibility so the AX tree exposes web content
 # (buttons, links, fields inside pages) — not just the chrome around tabs.
 # Only takes effect when Klyk launches the browser cold; if the user
-# already has it running, the flag is a no-op until they restart. The
-# `was_already_running` return from launch_native_app surfaces this so
-# callers can warn the agent that AX is likely empty for web content.
+# already has it running, attachment preserves that configuration. Inspection
+# reports the AX content actually available instead of assuming it is empty.
 CHROMIUM_BROWSERS = {
     "Google Chrome", "Google Chrome Canary", "Google Chrome Beta", "Google Chrome Dev",
     "Chromium", "Brave Browser", "Microsoft Edge", "Arc", "Vivaldi", "Opera",
@@ -132,55 +131,35 @@ def probe_web_ax_alive(pid: int) -> bool:
 
 
 def _validate_app_identifier(value: str, field: str) -> None:
-    """
-    Reject control characters and AppleScript-quote-breaking characters in
-    values that will be interpolated into an osascript string. Defense in
-    depth alongside _as_quote(): even if escaping ever regresses, control
-    characters (newline / CR / NUL) and embedded double-quote / backslash
-    chains can't slip into the AppleScript layer.
-    """
+    """Reject empty, excessive or control-containing application identifiers."""
     if not value or len(value) > 256:
         raise ValueError(f"{field} must be 1–256 chars (got {len(value)}).")
     if any(ch in value for ch in ('\n', '\r', '\0')):
         raise ValueError(f"{field} contains control characters: {value!r}")
 
 
-def _as_quote(value: str) -> str:
-    """
-    Escape a string for safe interpolation inside double-quoted AppleScript.
-    Inside AS double-quoted literals the only meta-characters are `\\` and
-    `\"`. Escape both. Together with `_validate_app_identifier`, this closes
-    the AppleScript-injection surface in the PID-lookup path.
-    """
-    return value.replace('\\', '\\\\').replace('"', '\\"')
-
-
 def _quick_pid_for_app(bundle_id: str | None, app_name: str | None) -> int | None:
-    """Single-attempt PID lookup, ~50 ms. Returns None if app isn't running."""
-    try:
-        if bundle_id:
-            _validate_app_identifier(bundle_id, "bundle_id")
-            script = (
-                f'tell application "System Events" to '
-                f'get unix id of first process whose bundle identifier is "{_as_quote(bundle_id)}"'
-            )
-        elif app_name:
-            _validate_app_identifier(app_name, "app_name")
-            script = (
-                f'tell application "System Events" to '
-                f'get unix id of first process whose name is "{_as_quote(app_name)}"'
-            )
-        else:
-            return None
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip().isdigit():
-            return int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
+    """Query native running apps; an uncertain lookup must never relaunch an existing app."""
+    if not bundle_id and not app_name:
         return None
-    return None
+    _validate_app_identifier(bundle_id or app_name, "bundle_id" if bundle_id else "app_name")
+    try:
+        from AppKit import NSRunningApplication, NSWorkspace
+        if bundle_id:
+            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id)
+        else:
+            name = app_name.casefold().removesuffix(".app")
+            apps = [app for app in NSWorkspace.sharedWorkspace().runningApplications()
+                    if str(app.localizedName() or "").casefold() == name
+                    or (app.bundleURL() is not None and
+                        str(app.bundleURL().lastPathComponent()).casefold().removesuffix(".app") == name)]
+        pids = {int(app.processIdentifier()) for app in apps
+                if not app.isTerminated() and int(app.processIdentifier()) > 0}
+    except Exception as error:
+        raise RuntimeError('Could not check running applications; app identity is unknown. Inspect the target before retrying.') from error
+    if len(pids) > 1:
+        raise RuntimeError('More than one running application matches; use a unique app name or bundle identifier.')
+    return next(iter(pids), None)
 
 
 def launch_native_app(
@@ -190,11 +169,9 @@ def launch_native_app(
     """
     Launch a native macOS app. Returns (pid, was_already_running).
 
-    was_already_running=True means the app was running before Klyk called
-    `open -a`, so the --force-renderer-accessibility flag for Chromium browsers
-    was silently ignored. In practice Chromium's lazy a11y still enables on
-    first external query (klyk auto-retries the inspect AX walk if it comes
-    back empty on a browser), so the agent rarely sees an empty tree.
+    Attach to a running app without opening or activating it. Cold Chromium
+    launches request renderer accessibility; already-running browsers retain
+    their current configuration and inspection reports the observed AX state.
     """
     prior_pid = _quick_pid_for_app(bundle_id, app_name)
     was_already_running = prior_pid is not None
@@ -213,8 +190,8 @@ def launch_native_app(
     else:
         raise ValueError("Either app_name or bundle_id must be provided")
 
-    # Give a cold launch time to register before querying System Events.
-    time.sleep(1.0)
+    # Return as soon as native process registration is visible; session creation
+    # independently waits for a window instead of imposing a blind launch delay.
     pid = _find_pid_for_app(bundle_id=bundle_id, app_name=app_name)
     return pid, False
 
@@ -247,32 +224,16 @@ def _find_pid_for_app(
     app_name: str | None,
     timeout: float = 10.0,
 ) -> int:
-    """Find PID of a running app by bundle ID or name via osascript."""
-    import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        try:
-            if bundle_id:
-                _validate_app_identifier(bundle_id, "bundle_id")
-                script = (
-                    f'tell application "System Events" to '
-                    f'get unix id of first process whose bundle identifier is "{_as_quote(bundle_id)}"'
-                )
-            else:
-                _validate_app_identifier(app_name or "", "app_name")
-                script = (
-                    f'tell application "System Events" to '
-                    f'get unix id of first process whose name is "{_as_quote(app_name or "")}"'
-                )
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip().isdigit():
-                return int(result.stdout.strip())
-        except (subprocess.TimeoutExpired, ValueError):
-            pass
-        _time.sleep(0.5)
+    """Wait only for native process registration, preserving lookup errors and ambiguity."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        pid = _quick_pid_for_app(bundle_id, app_name)
+        if pid is not None:
+            return pid
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
     raise RuntimeError(
         f"Could not find PID for app (bundle_id={bundle_id!r}, name={app_name!r}). "
         "Likely causes: app isn't installed in /Applications, the bundle id is "

@@ -100,7 +100,8 @@ def main():
             if now != foreground:
                 report['foreground_transitions'].append({'before': foreground, 'after': now,
                                                         'fixture': fixture.pid, 'server': server_pid})
-            return now not in (fixture.pid, server_pid) if now is not None else True
+            fixture_active = json.loads(state.read_text()).get('active')
+            return now is not None and now not in (fixture.pid, server_pid) and fixture_active is False
 
         def current():
             """Read actual fixture state, independent of the agent's action response."""
@@ -126,6 +127,7 @@ def main():
             check('fixture launch stayed in background', foreground_safe())
             time.sleep(.3)  # One launch-animation settle, never an input retry.
             with KlykClient(timeout=20) as client:
+                check('MCP startup preserved foreground', foreground_safe(client._proc.pid))
                 tools = client.list_tools()
                 report['schema_bytes'] = len(json.dumps(tools))
                 check('48 tools discovered over real MCP', len(tools) == 48)
@@ -144,11 +146,17 @@ def main():
 
                 call('list_windows', bundle_id='org.klyk.parity.fixture', app_path=str(bundle))
                 call('set_mode', mode='background')
-                ids = {}
-                for window in capture.list_windows_for_pid(fixture.pid):
-                    nodes = computer.ax_snapshot(fixture.pid, window_id=window['window_id'], max_results=60)
-                    label = next(e['label'] for e in nodes if e.get('label', '').startswith('Input '))
-                    ids['Klyk Fixture A' if label == 'Input 0' else 'Klyk Fixture B'] = window['window_id']
+                before_selection = current()['selections']
+                refused = payload(client.call('select_option', {'app': 'KlykParityFixture',
+                    'x': 95, 'y': 485, 'option': 'Second'}))
+                check('native option refuses visible input in background', refused.get('requires_foreground') is True)
+                check('refused native option sent no selection', current()['selections'] == before_selection)
+                check('refused native option preserved foreground', foreground_safe(client._proc.pid))
+                # Bootstrap expected identity from the fixture itself, not the AX
+                # traversal under test (which may still be warming up on first read).
+                ids = {window['title']: window['id'] for window in current()['windows']}
+                check('fixture identities agree with captured windows', set(ids.values()) == {
+                    window['window_id'] for window in capture.list_windows_for_pid(fixture.pid)})
                 for index, title in enumerate(('Klyk Fixture A', 'Klyk Fixture B')):
                     wid = ids[title]
                     data, result = call('inspect', window_id=wid)

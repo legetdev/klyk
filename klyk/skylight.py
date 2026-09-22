@@ -499,9 +499,14 @@ def self_test(timeout: float = 0.6) -> bool:
         import os as _os
         from AppKit import (
             NSApplication, NSWindow, NSBackingStoreBuffered,
-            NSApplicationActivationPolicyAccessory, NSMakeRect,
+            NSMakeRect,
         )
         from Foundation import NSTimer
+        from .ui_thread import ui
+        # Doctor also calls this without the MCP bootstrap. Both paths must
+        # finish AppKit launch without activating before creating the sink.
+        if not ui.install_on_main_thread():
+            raise RuntimeError("Background AppKit initialization is unavailable")
         _build_selftest_classes()
     except Exception as e:
         # No AppKit / harness can't be built → verdict unknown (fail open)
@@ -514,10 +519,6 @@ def self_test(timeout: float = 0.6) -> bool:
     win = None
     try:
         app = NSApplication.sharedApplication()
-        try:
-            app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-        except Exception:
-            pass
         # Parked far off any display so it is never visible, yet still gets a
         # real CG window number under app.run() and receives the stamped click
         # (both verified empirically). No flash, no focus change at startup.

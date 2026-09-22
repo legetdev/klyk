@@ -19,6 +19,7 @@ import time
 
 _cg = ctypes.CDLL(ctypes.util.find_library("CoreGraphics"))
 _cf = ctypes.CDLL(ctypes.util.find_library("CoreFoundation"))
+_appserv = ctypes.CDLL(ctypes.util.find_library("ApplicationServices"))
 
 try:
     _imageio = ctypes.CDLL(ctypes.util.find_library("ImageIO"))
@@ -29,6 +30,11 @@ except Exception:
 # ---------------------------------------------------------------------------
 # Structs
 # ---------------------------------------------------------------------------
+
+class _ProcessSerialNumber(ctypes.Structure):
+    """Stable native process identity shared by concurrent foreground queries."""
+    _fields_ = [("high", ctypes.c_uint32), ("low", ctypes.c_uint32)]
+
 
 class CGRect(ctypes.Structure):
     _fields_ = [
@@ -337,38 +343,20 @@ def get_window_for_pid(pid: int) -> dict | None:
 
 
 def frontmost_pid() -> int | None:
-    """
-    PID owning the topmost user-level (layer 0) on-screen window — the
-    WindowServer's view of the active app. Reads CGWindowList live each
-    call. NSWorkspace.frontmostApplication caches via distributed
-    notifications that never reach a process without a pumped main run
-    loop, so this is the only reliable check inside a long-running asyncio
-    MCP server. Returns None only when no normal-level windows are on
-    screen (rare; login window or all apps minimized).
-    """
-    win_list = _cg.CGWindowListCopyWindowInfo(
-        kCGWindowListOptionOnScreenOnly, kCGNullWindowID,
-    )
-    if not win_list:
-        return None
+    """Read the active application directly; topmost window order is not keyboard focus."""
     try:
-        count = _cf.CFArrayGetCount(win_list)
-        for i in range(count):
-            win_dict = _cf.CFArrayGetValueAtIndex(win_list, i)
-            if not win_dict:
-                continue
-            layer_ref = _cf.CFDictionaryGetValue(
-                win_dict, ctypes.c_void_p(_kCGWindowLayer),
-            )
-            if _cf_num_to_int(layer_ref) != 0:
-                continue
-            pid_ref = _cf.CFDictionaryGetValue(
-                win_dict, ctypes.c_void_p(_kCGWindowOwnerPID),
-            )
-            return _cf_num_to_int(pid_ref)
-        return None
-    finally:
-        _cf.CFRelease(ctypes.c_void_p(win_list))
+        front = _appserv.GetFrontProcess
+        front.argtypes = [ctypes.POINTER(_ProcessSerialNumber)]
+        front.restype = ctypes.c_int32
+        get_pid = _appserv.GetProcessPID
+        get_pid.argtypes = [ctypes.POINTER(_ProcessSerialNumber), ctypes.POINTER(ctypes.c_int32)]
+        get_pid.restype = ctypes.c_int32
+        serial, pid = _ProcessSerialNumber(), ctypes.c_int32()
+        if front(ctypes.byref(serial)) == 0 and get_pid(ctypes.byref(serial), ctypes.byref(pid)) == 0:
+            return int(pid.value) if pid.value > 0 else None
+    except (AttributeError, OSError):
+        pass
+    return None
 
 
 def get_window_for_name(name_fragment: str) -> dict | None:

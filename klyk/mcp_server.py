@@ -303,9 +303,10 @@ async def _nearby_ax_hint(session, x: int, y: int, radius: int = 20) -> dict | N
     """If a labeled AX element sits within `radius` px of (x, y) in window space, return
     a hint suggesting click_element. Coords passed in are window-relative."""
     try:
-        from . import computer as _computer
         elements = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _computer.ax_snapshot(session.pid)
+            None, lambda: computer.ax_snapshot(
+                session.pid, window_id=session.window_id, max_results=100, deadline_seconds=0.15,
+            )
         )
     except Exception:
         return None
@@ -1517,18 +1518,21 @@ TOOLS = [
     types.Tool(
         name="select_option",
         description=(
-            "Select an option from a native dropdown, popup button, or combobox. "
-            "Clicks the control at (x, y) to open it, then selects the option by name. "
-            "Use for NSPopupButton, NSComboBox, and native macOS option controls. "
-            "For web dropdowns, use Playwright MCP select_option instead."
+            "Select a native dropdown or combobox using keyboard type-to-select. Coordinates "
+            "are window-relative. Autonomous/humanoid focus the selected window and use visible "
+            "input; background refuses. Returns verified=true only when the selected value "
+            "matches the requested option exactly after text normalization. For custom web "
+            "menus, inspect and click_element provide the normal visual workflow."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x": {"type": "number", "description": "X coordinate of the control"},
                 "y": {"type": "number", "description": "Y coordinate of the control"},
-                "option": {"type": "string", "description": "Exact text of the option to select"},
+                "option": {"type": "string", "minLength": 1, "maxLength": 1000,
+                           "description": "Exact text of the option to select"},
             },
             "required": ["app", "x", "y", "option"],
         },
@@ -3890,7 +3894,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     last_error = f"{e}"
                     log.warning(f"wait_for_visual poll failed: {last_error}")
                 matched = last_match is not None
-                if matched == present:
+                if last_error is None and matched == present:
                     elapsed = round(_time.monotonic() - start, 2)
                     result: dict = {
                         "ok": True, "elapsed": elapsed, "polls": polls,
@@ -4249,7 +4253,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                         None,
                         lambda: computer.ax_snapshot(
                             session.pid, max_children_per_node=80,
-                            max_results=0, deadline_seconds=0.8,
+                            window_id=session.window_id, max_results=200, deadline_seconds=0.8,
                         ),
                     )
                     cands = [
@@ -5029,22 +5033,40 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             session, _ = await _get_session(args, name)
             x, y = int(args["x"]), int(args["y"])
             option = args["option"]
+            if session.mode == "background":
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "requires_foreground": True,
+                    "reason": "native_option_requires_visible_input",
+                }))]
+            window_id = _resolve_window(args, session.app) or session.window_id
+            await _refresh_window(session, window_id=window_id)
+            allowed, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not allowed:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
+            gate = await _ensure_key_delivery(session, name, command_shortcut=True)
+            if gate is not None:
+                return [types.TextContent(type="text", text=json.dumps(gate))]
+            await _focus_if_needed(session, window_id)
+            await _refresh_window(session, window_id=window_id)
+            allowed, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not allowed:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.click(sx, sy)
             await asyncio.sleep(0.25)
             await computer.type_text_char_by_char(option, session.pid)
             await asyncio.sleep(0.1)
             await computer.press_key("Return", session.pid)
-            # Read the control back so the result reflects what was ACTUALLY
-            # selected — type-to-select matches on a prefix and can land on the
-            # wrong item, so we must not blindly report ok:true. ax_value_at
-            # reads the popup's AXValue (its selected item's title) at the
-            # control's screen position.
-            value = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_value_at(float(sx), float(sy))
+            # Type-to-select can choose a prefix sibling. Verify the exact value
+            # in this process and window rather than reading an overlapping app.
+            value, status = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: computer.ax_value_at_detailed(
+                    float(sx), float(sy), expected_pid=session.pid, window_id=window_id,
+                )
             )
-            ok = value is not None and _normalize_label(option) in _normalize_label(value)
-            payload: dict = {"ok": ok, "selected": value, "requested": option}
+            ok = status == "ok" and value is not None and _normalize_label(option) == _normalize_label(value)
+            payload: dict = {"ok": ok, "verified": ok, "selected": value, "requested": option,
+                             "window_id": window_id, "via": "cursor_warp+keys"}
             if not ok:
                 payload["warning"] = (
                     "Selected value doesn't match the requested option — the popup "
@@ -5076,9 +5098,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             total = len(elements)
             kept = elements[:_AX_SNAPSHOT_CAP]
             for elem in kept:
-                v = elem.get("value")
-                if isinstance(v, str) and len(v) > 200:
-                    elem["value"] = v[:200] + "…"
+                for key in ("label", "value"):
+                    text = elem.get(key)
+                    if isinstance(text, str) and len(text) > 200:
+                        elem[key] = text[:200] + "…"
             payload: dict = {
                 "element_count": total,
                 "window_id": session.window_id,
@@ -5098,9 +5121,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             # back nearly empty on a browser. No stale cached flag.
             if is_browser(session.app) and len(elements) < 5:
                 payload["ax_disabled_warning"] = (
-                    f"{session.app}'s web AX tree is empty — this snapshot covers "
-                    "only browser-shell elements (toolbar, tabs). Web content "
-                    "(page buttons, links, form fields) isn't reaching the AX layer. "
+                    f"{session.app}'s accessibility snapshot is sparse; it may omit page controls. "
                     "Use the image from inspect or read_text for visible page text."
                 )
             return [types.TextContent(type="text", text=json.dumps(payload))]
@@ -5653,8 +5674,8 @@ def _run_on_macos() -> None:
 
     Bootstrap order:
       1. install UI thread (NSApp + activation policy + drain timer)
-      2. install the always-on menubar status item
-      3. spawn the asyncio worker (MCP stdio server)
+      2. verify input delivery and warm the keyboard layout
+      3. start MCP, then schedule the menu-bar indicator
       4. block the main thread on NSApp.run() until the worker requests
          shutdown (stdin closed)
     """
@@ -5666,15 +5687,6 @@ def _run_on_macos() -> None:
     # 1b. Parent-death watch — if the client is hard-killed, exit so we
     #     don't linger as a stray process / stale menu-bar item.
     _install_parent_death_watch()
-    # 2. Menu-bar status item — always-on; shows klyk is alive even when
-    #    no session has been created yet. Per-app dock-tile badges appear
-    #    automatically whenever a session opens (no opt-in).
-    try:
-        from .menubar import menubar as _menubar
-        _menubar.install_if_needed()
-    except Exception as e:
-        log.warning("menubar install failed at startup: %s", e)
-
     # 2b. SkyLight delivery self-test — confirm the invisible-input path doesn't
     #     just LOAD but actually DELIVERS on this macOS build. Runs its own
     #     bounded NSApp loop on the main thread (off-screen sink, no focus
@@ -5682,8 +5694,8 @@ def _run_on_macos() -> None:
     #     populated before the first click. If delivery is broken (e.g. a macOS
     #     update changed the private API), the seamless dispatch falls back to
     #     the visible cursor instead of silently no-op'ing. Best-effort and
-    #     self-bounding (its finish timer always stops the loop) — never blocks
-    #     boot; one retry guards against a transient first-attempt miss.
+    #     bounded by its finish timer once AppKit dispatches events; one retry
+    #     guards against a first-attempt miss during window registration.
     try:
         if skylight.is_available():
             verified = skylight.self_test(timeout=0.4) or skylight.self_test(timeout=0.4)
@@ -5739,6 +5751,14 @@ def _run_on_macos() -> None:
     import threading as _threading
     worker_thread = _threading.Thread(target=_worker, name="klyk", daemon=False)
     worker_thread.start()
+
+    # A slow NSStatusBar call must not delay the protocol handshake or run inside
+    # the bounded input self-test. Schedule the optional indicator only afterward.
+    try:
+        from .menubar import menubar as _menubar
+        _menubar.install_if_needed()
+    except Exception as e:
+        log.warning("menubar install failed at startup: %s", e)
 
     # 4. Block the main thread on NSApp.run() — returns when worker
     #    finishes and calls _ui.shutdown().
