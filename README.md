@@ -13,7 +13,7 @@
 > **This is powerful, and it is dangerous.** Be clear-eyed about what that means:
 >
 > - **It can take real, irreversible actions.** A click is a click. klyk can press *Buy*, *Send*, *Confirm Transfer*, *Delete*, or *Sign* just as you could. Klyk enforces checks such as target-window bounds, ownership, duplicate-label rejection, and its emergency latch, while confirmation guidance and a bounds override remain agent-cooperative and do not establish user approval. There is no sandbox and no spending limit.
-> - **It runs with your full user privileges.** Anything you can do on your Mac, klyk can do. It does not isolate itself or drop privileges.
+> - **It runs under your user account.** Klyk inherits the permissions granted to its host process. It does not isolate itself or drop privileges.
 > - **It is a prompt-injection target.** If the agent driving klyk also reads untrusted content — a web page, an email, a document — a malicious instruction hidden there can become real clicks and keystrokes on your machine. "Reads the web" + "controls the Mac" is the high-risk combination. Run klyk only with an agent and a workflow you trust.
 > - **It relies on an undocumented Apple API.** Invisible native input uses Apple's private SkyLight framework. Apple does not support or guarantee it; a macOS update can change or break it without notice, and the affected actions may fall back to visible input or require activation.
 >
@@ -29,15 +29,15 @@
 
 ## The problem
 
-AI assistants are increasingly asked to test, validate, or operate desktop apps end-to-end. Today they can't. Existing automation tools either require deep app instrumentation (XCUITest, Appium) or simulate user input at a layer too brittle to be trusted (pixel-only click frameworks, headless DOM scrapers). The result: agents that can write apps faster than ever, but can't verify they actually work.
+Agents operating desktop apps need to see the correct window, send input to the intended control, and check what actually changed. Klyk provides these capabilities for visible macOS interfaces and cross-app workflows through a local MCP connection.
 
-Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, real composited screenshots — and a clean MCP interface to drive it. Native input attempts to stay invisible by default, with the activation and visible-input cases described above. The agent observes, decides, acts, verifies.
+Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, window-only screenshots — and a clean MCP interface to drive it. Native input attempts to stay invisible by default, with the activation and visible-input cases described above. The agent observes, decides, acts, verifies.
 
 ## What it does
 
 ```
 > screenshot the app, then click "Sign in"
-[ inspect returns a CoreGraphics screenshot plus a bounded AX element list ]
+[ inspect returns a fresh window screenshot plus a bounded AX element list ]
 [ click_element finds "Sign in" via accessibility, then on-device OCR if needed ]
 [ Klyk performs an AX action or sends input using the app and session delivery mode ]
 ```
@@ -184,7 +184,7 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 | `mcp_server.py` | MCP server, tool definitions, dispatch |
 | `session.py` | Per-app session registry, auto-launch, template cache |
 | `computer.py` | CoreGraphics input synthesis (click, drag, keyboard, scroll, AX) |
-| `capture.py` | CoreGraphics screenshot capture (in-memory primary, screencapture fallback) |
+| `capture.py`, `window_capture.py` | ScreenCaptureKit window screenshots, bounded capture-plan cache, scoped compatibility fallbacks |
 | `launcher.py` | App launch with browser-aware AX flag injection |
 | `ocr.py` | Apple Vision OCR (two-pass: fast then accurate) |
 | `matcher.py` | Pure-NumPy template matching (FFT + integral-image NCC) with template cache support |

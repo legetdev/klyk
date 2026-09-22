@@ -77,6 +77,8 @@ _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
 _cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
 _cf.CFStringGetCString.restype = ctypes.c_bool
 _cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
+_cf.CFStringGetLength.restype = ctypes.c_long
+_cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
 _cf.CFCopyDescription.restype = ctypes.c_void_p
 _cf.CFCopyDescription.argtypes = [ctypes.c_void_p]
 _cf.CFGetTypeID.restype = ctypes.c_ulong
@@ -253,6 +255,7 @@ _stop_engaged     = [False]
 _last_chord_t     = [0.0]
 _CHORD_DEBOUNCE_S = 0.6   # ignore key-repeat / panic double-taps within this window
 _stop_lock        = threading.Lock()
+_worker_state = threading.local()
 
 
 class EmergencyStop(RuntimeError):
@@ -260,6 +263,10 @@ class EmergencyStop(RuntimeError):
 
 
 def _check_stop() -> None:
+    """Stop new input after a physical stop or cancellation of its owning request."""
+    cancelled = getattr(_worker_state, 'cancelled', None)
+    if cancelled is not None and cancelled.is_set():
+        raise RuntimeError('Input request was cancelled; no further input will be sent.')
     with _stop_lock:
         if not _stop_engaged[0]:
             return
@@ -268,6 +275,37 @@ def _check_stop() -> None:
         "ONLY by the user pressing Cmd+Shift+Escape again; the resume tool cannot "
         "clear it. Tell the user to press the chord to resume."
     )
+
+
+async def run_input(function):
+    """Keep ownership until a cancelled native input worker has released its input."""
+    cancelled = threading.Event()
+
+    def run():
+        """Make cancellation visible at the native worker's existing stop checkpoints."""
+        _worker_state.cancelled = cancelled
+        try:
+            _check_stop()
+            return function()
+        finally:
+            del _worker_state.cancelled
+
+    worker = asyncio.get_running_loop().run_in_executor(None, run)
+    try:
+        return await asyncio.shield(worker)
+    except asyncio.CancelledError:
+        cancelled.set()
+        # Repeated cancellation must not release the request lock ahead of the worker.
+        while not worker.done():
+            try:
+                await asyncio.shield(worker)
+            except asyncio.CancelledError:
+                continue
+            except Exception:
+                break
+        if not worker.cancelled():
+            worker.exception()  # Retrieve a stopped worker's exception without masking cancellation.
+        raise
 
 
 def emergency_stop_active() -> bool:
@@ -370,10 +408,15 @@ def _post_to_pid(pid: int, event_ptr: int) -> None:
 
 
 def _cfstr_to_py(cf_str: int) -> str:
+    """Decode bounded native text without dropping values beyond the old 2 KB buffer."""
     if not cf_str:
         return ""
-    buf = ctypes.create_string_buffer(2048)
-    ok = _cf.CFStringGetCString(ctypes.c_void_p(cf_str), buf, 2048, kCFStringEncodingUTF8)
+    length = _cf.CFStringGetLength(ctypes.c_void_p(cf_str))
+    if length > 100_000:
+        return ""  # Bound native allocations; oversized writes remain explicitly unverified.
+    size = max(1, length * 4 + 1)
+    buf = ctypes.create_string_buffer(size)
+    ok = _cf.CFStringGetCString(ctypes.c_void_p(cf_str), buf, size, kCFStringEncodingUTF8)
     return buf.value.decode("utf-8", errors="replace") if ok else ""
 
 
@@ -562,7 +605,7 @@ def ax_value_at(x: float, y: float, max_retries: int = 4, settle_ms: int = 150) 
     return value
 
 
-def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: int = 150, expected_pid: int | None = None) -> tuple[str | None, str]:
+def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: int = 150, expected_pid: int | None = None, window_id: int | None = None) -> tuple[str | None, str]:
     """
     Same as ax_value_at but returns (value, status). Status is one of:
         "ok"         — value was read successfully
@@ -575,15 +618,8 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
         if attempt > 0:
             time.sleep(settle_ms / 1000)
         try:
-            sys_elem = _appserv.AXUIElementCreateSystemWide()
-            if not sys_elem:
-                continue
-            elem_ref = ctypes.c_void_p(0)
-            err = _appserv.AXUIElementCopyElementAtPosition(
-                ctypes.c_void_p(sys_elem), float(x), float(y), ctypes.byref(elem_ref)
-            )
-            _cf.CFRelease(ctypes.c_void_p(sys_elem))
-            if err != 0 or not elem_ref.value:
+            elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id))
+            if not elem_ref.value:
                 continue
             try:
                 if not _ax_matches_pid(int(elem_ref.value), expected_pid):
@@ -595,6 +631,10 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
                 )
                 _cf.CFRelease(ctypes.c_void_p(attr_key))
                 if err != 0:
+                    if val_ref.value:
+                        _cf.CFRelease(val_ref)
+                    if err in (-25205, -25212):  # Unsupported attribute or no value is stable.
+                        return (None, "no_value")
                     continue
                 if not val_ref.value:
                     # Element resolved, attribute call ok, but no value present.
@@ -619,7 +659,7 @@ def _ax_matches_pid(element: int, expected_pid: int | None) -> bool:
             and pid.value == expected_pid)
 
 
-def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | None = None) -> dict:
+def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | None = None, window_id: int | None = None) -> dict:
     """
     Resolve the AX element at (x, y) and invoke AXUIElementPerformAction with
     the named action (e.g. AXPress, AXShowMenu, AXIncrement).
@@ -641,16 +681,8 @@ def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | No
     _check_stop()
     action_bytes = action.encode("utf-8")
 
-    sys_elem = _appserv.AXUIElementCreateSystemWide()
-    if not sys_elem:
-        return {"ok": False, "action": action, "status": "no_element",
-                "error": "AXUIElementCreateSystemWide returned NULL"}
-    elem_ref = ctypes.c_void_p(0)
-    err = _appserv.AXUIElementCopyElementAtPosition(
-        ctypes.c_void_p(sys_elem), float(x), float(y), ctypes.byref(elem_ref)
-    )
-    _cf.CFRelease(ctypes.c_void_p(sys_elem))
-    if err != 0 or not elem_ref.value:
+    elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id))
+    if not elem_ref.value:
         return {"ok": False, "action": action, "status": "no_element"}
 
     try:
@@ -700,6 +732,8 @@ def ax_resolve_and_act(
     action_chain: tuple[str, ...] = ("AXPress", "AXOpen"),
     max_levels_up: int = 2,
     expected_pid: int | None = None,
+    window_id: int | None = None,
+    expected_label: str | None = None,
 ) -> dict:
     """
     Resolve the AX element at (x, y) and try each action in action_chain in
@@ -727,17 +761,9 @@ def ax_resolve_and_act(
         resolves at the coordinate.
     """
     _check_stop()
-    sys_elem = _appserv.AXUIElementCreateSystemWide()
-    if not sys_elem:
-        return {"ok": False, "action": None, "status": "no_element",
-                "error": "AXUIElementCreateSystemWide returned NULL"}
-    elem_ref = ctypes.c_void_p(0)
-    err = _appserv.AXUIElementCopyElementAtPosition(
-        ctypes.c_void_p(sys_elem), float(x), float(y), ctypes.byref(elem_ref)
-    )
-    _cf.CFRelease(ctypes.c_void_p(sys_elem))
-    if err != 0 or not elem_ref.value:
-        return {"ok": False, "action": None, "status": "no_element"}
+    elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id, expected_label))
+    if not elem_ref.value:
+        return {"ok": False, "action": None, "status": "stale_target" if expected_label else "no_element"}
 
     def _available(eptr: int) -> list[str]:
         names_ref = ctypes.c_void_p(0)
@@ -763,7 +789,7 @@ def ax_resolve_and_act(
                 continue
             if _ax_perform_action(eptr, action.encode("utf-8")):
                 return action, avail
-            # supported but perform_failed — keep trying the rest of the chain
+            raise RuntimeError("The accessibility action failed; its effect is unknown. Observe before retrying.")
         return None, avail
 
     # Track parent refs we own so we can release them in `finally`.
@@ -854,6 +880,22 @@ def ax_cell_text_at(x: float, y: float) -> str | None:
                     _cf.CFRelease(ctypes.c_void_p(p))
     finally:
         _cf.CFRelease(elem_ref)
+
+
+def ax_grid_text(pid: int, window_id: int, points: list[tuple[float, float]]) -> list[str | None]:
+    """Read grid cells from one bounded window tree; pixels remain the color authority."""
+    elements = ax_snapshot(pid, window_id=window_id, max_results=600, max_children_per_node=80)
+    values = []
+    for x, y in points:
+        candidates = [e for e in elements if (e.get('value') or e.get('label'))
+                      and e.get('width', 0) > 0 and e.get('height', 0) > 0
+                      and abs(e['x'] - x) <= e['width'] / 2
+                      and abs(e['y'] - y) <= e['height'] / 2
+                      and e.get('role') not in ('AXWindow', 'AXGroup', 'AXScrollArea')]
+        target = min(candidates, key=lambda e: e['width'] * e['height'], default=None)
+        value = (target.get('value') or target.get('label')) if target else None
+        values.append(str(value)[:200] if value is not None else None)
+    return values
 
 
 # ---------------------------------------------------------------------------
@@ -1145,9 +1187,10 @@ def ax_snapshot(
     max_children_per_node: int = _AX_SNAPSHOT_CHILDREN_CAP,
     deadline_seconds: float = 0.9,
     max_results: int = 0,
+    window_id: int | None = None,
 ) -> list[dict]:
     """
-    Return labeled/interactive UI elements across all windows of the app.
+    Return labeled/interactive elements from the selected window, or all app windows if omitted.
     Each element: {role, label?, value?, x, y, width, height} in screen
     coords. Single-IPC-per-element via batched attribute reads.
 
@@ -1156,8 +1199,8 @@ def ax_snapshot(
         walk so huge homogeneous collections (Finder Desktop icons,
         browser DOM list rows) don't dominate latency.
       - `deadline_seconds` (default 0.9 s) is a wall-clock cut-off — the
-        walker returns whatever it has when it crosses, never overrunning
-        the 1 s tool budget even on pathologically slow trees.
+        walker returns whatever it has when it crosses, plus any in-flight
+        native call's bounded messaging timeout.
       - `max_results` (default 0 = unlimited) — early-terminate the walk
         when the raw collection reaches this count. inspect surfaces only
         50 elements to the agent, so walking many more is wasted IPC on
@@ -1188,6 +1231,16 @@ def ax_snapshot(
         # focused element (rare, e.g. just after launch).
         focused_ref = _ax_read_attr_ptr(app_ptr, b"AXFocusedUIElement") or 0
         try:
+            if window_id is not None:
+                root = _ax_exact_window(pid, window_id)
+                if not root:
+                    return []
+                try:
+                    _ax_collect(root, results, 0, max_depth, max_children_per_node,
+                                deadline_ts, max_results, focused_ref)
+                    return results
+                finally:
+                    _cf.CFRelease(ctypes.c_void_p(root))
             wins_ptr = _ax_read_attr_ptr(app_ptr, b"AXWindows")
             had_windows = False
             if wins_ptr:
@@ -1929,6 +1982,7 @@ def ax_search_focused(
     max_children_per_node: int = 20,
     max_results: int = 20,
     deadline_seconds: float = 0.8,
+    window_id: int | None = None,
 ) -> list[dict]:
     """
     Find UI elements in AXFocusedWindow whose label or value contains
@@ -1963,7 +2017,8 @@ def ax_search_focused(
             pass
         results: list[dict] = []
         try:
-            focused_ptr = _ax_read_attr_ptr(app_ptr, b"AXFocusedWindow")
+            focused_ptr = (_ax_exact_window(pid, window_id) if window_id is not None
+                           else _ax_read_attr_ptr(app_ptr, b"AXFocusedWindow"))
             if focused_ptr:
                 try:
                     children_ptr = _ax_read_attr_ptr(focused_ptr, b"AXChildren")
@@ -2206,24 +2261,109 @@ def set_window_bounds(pid: int, x: int, y: int, width: int | None = None, height
 # ---------------------------------------------------------------------------
 # Multi-window: bridge CG window IDs to AX AXWindow refs
 # ---------------------------------------------------------------------------
-# CG window IDs (CGWindowID) don't appear in the AX API directly. To target a
-# specific window for raise/move/resize, we enumerate the app's AXWindows and
-# match by position (AXPosition vs CG bounds X/Y). Position is reliable because
-# two real windows of the same app cannot share an exact origin in macOS's
-# window server. Falls back to size match if position matching fails (e.g.
-# during a window animation).
+# Prefer Apple's native identity bridge. Older surfaces without it may use a
+# unique geometry match; overlapping equal-sized windows must never be guessed.
+
+def _ax_exact_window(pid: int, window_id: int) -> int:
+    """Resolve a live window owned by this PID; return a retained AX reference."""
+    from . import capture
+    win = capture.get_window_by_id(window_id)
+    if not win or win['pid'] != pid:
+        return 0
+    return _ax_window_for_cg_id(pid, window_id, win['x'], win['y'], win['width'], win['height'])
+
+
+def _ax_element_at(x: float, y: float, expected_pid: int | None = None,
+                   window_id: int | None = None, expected_label: str | None = None) -> int:
+    """Resolve within the requested window, including when another window covers it.
+
+    App-scoped hit testing is the fast path. A bounded subtree search handles
+    overlapping windows of the same app. The caller owns the returned reference.
+    """
+    root = (_appserv.AXUIElementCreateApplication(expected_pid) if expected_pid is not None
+            else _appserv.AXUIElementCreateSystemWide())
+    if not root:
+        return 0
+    window = 0
+
+    def matches_label(element):
+        """Require the observed label to remain attached to the selected control."""
+        return expected_label is None or any(
+            _ax_str_attr(element, attr) == expected_label
+            for attr in (b'AXTitle', b'AXDescription', b'AXValue')
+        )
+
+    try:
+        window = _ax_exact_window(expected_pid, window_id) if window_id is not None and expected_pid is not None else 0
+        if window_id is not None and not window:
+            return 0
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(root), _AX_MESSAGING_TIMEOUT_SECONDS)
+        found = ctypes.c_void_p()
+        err = _appserv.AXUIElementCopyElementAtPosition(
+            ctypes.c_void_p(root), float(x), float(y), ctypes.byref(found))
+        if found.value:
+            valid = err == 0 and _ax_matches_pid(found.value, expected_pid)
+            if valid and window:
+                owner = _ax_read_attr_ptr(found.value, b'AXWindow')
+                try:
+                    valid = bool(owner and _cf.CFEqual(ctypes.c_void_p(owner), ctypes.c_void_p(window)))
+                finally:
+                    if owner:
+                        _cf.CFRelease(ctypes.c_void_p(owner))
+            if valid and matches_label(found.value):
+                return found.value
+            _cf.CFRelease(found)
+        if not window:
+            return 0
+        deadline = time.monotonic() + 0.6
+        best, best_depth, visited = 0, -1, 0
+
+        def visit(element, depth):
+            """Find the deepest containing control without traversing unrelated windows."""
+            nonlocal best, best_depth, visited
+            if depth > 30 or visited >= 400 or time.monotonic() >= deadline:
+                return
+            visited += 1
+            pos, size = _ax_cgpoint(element), _ax_cgsize(element)
+            contains = bool(pos and size and pos[0] <= x < pos[0] + size[0]
+                            and pos[1] <= y < pos[1] + size[1])
+            if pos and size and size[0] > 0 and size[1] > 0 and not contains:
+                return
+            if contains and depth > best_depth and matches_label(element):
+                if best:
+                    _cf.CFRelease(ctypes.c_void_p(best))
+                best = _cf.CFRetain(ctypes.c_void_p(element)) or 0
+                best_depth = depth
+            children = _ax_read_attr_ptr(element, b'AXChildren')
+            if children:
+                try:
+                    for index in range(min(80, _cf.CFArrayGetCount(ctypes.c_void_p(children)))):
+                        if visited >= 400 or time.monotonic() >= deadline:
+                            break
+                        child = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children), index)
+                        if child:
+                            visit(child, depth + 1)
+                finally:
+                    _cf.CFRelease(ctypes.c_void_p(children))
+        try:
+            visit(window, 0)
+            return best
+        except BaseException:
+            if best:
+                _cf.CFRelease(ctypes.c_void_p(best))
+            raise
+    finally:
+        if window:
+            _cf.CFRelease(ctypes.c_void_p(window))
+        _cf.CFRelease(ctypes.c_void_p(root))
+
 
 def _ax_window_for_cg_id(pid: int, target_window_id: int, target_x: float, target_y: float, target_w: float, target_h: float, tolerance: float = 4.0) -> int:
     """
     Find the AXWindow ref corresponding to a CG window_id. Strategy, in order:
 
-    1. Position AND size match unique → use it. This disambiguates a fullscreen
-       overlay window that shares an origin with a smaller quadrant window
-       (e.g. fullscreen at (0,30) 1920x1050 vs. quadrant at (0,30) 960x540).
-    2. Position-only match unique → use it (size unavailable / mid-animation).
-    3. Size-only match unique → use it (window animating to new position).
-    4. Ambiguous → pair by z-order index between the app's CG and AX window
-       lists. Both APIs return front-to-back ordering.
+    Prefer the native AX-to-CG identity bridge. If it is unavailable, require
+    one unique position-and-size match. Similar size or z-order is not identity.
 
     Caller must CFRelease the returned ref. Returns 0 if no match found.
     """
@@ -2232,17 +2372,33 @@ def _ax_window_for_cg_id(pid: int, target_window_id: int, target_x: float, targe
     if not app_ptr:
         return 0
     try:
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app_ptr), _AX_MESSAGING_TIMEOUT_SECONDS)
         wins_ptr = _ax_read_attr_ptr(app_ptr, b"AXWindows")
         if not wins_ptr:
             return 0
         try:
             count = _cf.CFArrayGetCount(ctypes.c_void_p(wins_ptr))
 
+            try:
+                identity = _appserv._AXUIElementGetWindow
+                identity.restype = ctypes.c_int32
+                identity.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_uint32)]
+            except AttributeError:
+                identity = None
             ax_entries = []
+            deadline = time.monotonic() + 0.6
             for i in range(count):
+                if time.monotonic() >= deadline:
+                    return 0  # An incomplete search cannot establish unique geometry.
                 win = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(wins_ptr), i)
                 if not win:
                     continue
+                if identity is not None:
+                    native_id = ctypes.c_uint32()
+                    if identity(ctypes.c_void_p(win), ctypes.byref(native_id)) == 0:
+                        if native_id.value == target_window_id:
+                            return _cf.CFRetain(ctypes.c_void_p(win)) or 0
+                        continue  # A known different ID cannot qualify by geometry.
                 pos = _ax_cgpoint(win)
                 size = _ax_cgsize(win)
                 ax_entries.append((win, pos, size))
@@ -2253,34 +2409,11 @@ def _ax_window_for_cg_id(pid: int, target_window_id: int, target_x: float, targe
             def _size_ok(size) -> bool:
                 return bool(size) and abs(size[0] - target_w) <= tolerance and abs(size[1] - target_h) <= tolerance
 
-            # Pass 1: position + size both match — strongest signal.
+            # Compatibility for surfaces without native window identity.
             pos_size_matches = [idx for idx, (_, pos, size) in enumerate(ax_entries) if _pos_ok(pos) and _size_ok(size)]
             if len(pos_size_matches) == 1:
                 return _cf.CFRetain(ctypes.c_void_p(ax_entries[pos_size_matches[0]][0])) or 0
 
-            # Pass 2: position only.
-            pos_matches = [idx for idx, (_, pos, _) in enumerate(ax_entries) if _pos_ok(pos)]
-            if len(pos_matches) == 1:
-                return _cf.CFRetain(ctypes.c_void_p(ax_entries[pos_matches[0]][0])) or 0
-
-            # Pass 3: size only — useful if the window is mid-animation to a new origin.
-            size_matches = [idx for idx, (_, _, size) in enumerate(ax_entries) if _size_ok(size)]
-            if len(size_matches) == 1:
-                return _cf.CFRetain(ctypes.c_void_p(ax_entries[size_matches[0]][0])) or 0
-
-            # Pass 4: ambiguous — pair by z-order index (front-to-back) with the
-            # CG list. The CG and AX window lists can be filtered/ordered
-            # differently (CG drops sub-50px windows; AX doesn't), so a blind
-            # index pair can land on the WRONG window. Only trust it if the
-            # paired window's geometry actually lines up with the target —
-            # otherwise return no-match (0) and let the caller handle it, rather
-            # than silently raising/moving the wrong window.
-            cg_windows = capture.list_windows_for_pid(pid)
-            cg_index = next((i for i, w in enumerate(cg_windows) if w["window_id"] == target_window_id), None)
-            if cg_index is not None and cg_index < len(ax_entries):
-                _, pos, size = ax_entries[cg_index]
-                if _pos_ok(pos) or _size_ok(size):
-                    return _cf.CFRetain(ctypes.c_void_p(ax_entries[cg_index][0])) or 0
         finally:
             _cf.CFRelease(ctypes.c_void_p(wins_ptr))
     finally:
@@ -2378,16 +2511,16 @@ def _ax_is_web_backed(elem: int, max_hops: int = 12) -> bool:
             _cf.CFRelease(cur_ref)
 
 
-def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = None) -> dict:
+def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = None,
+                    window_id: int | None = None) -> dict:
     """
     Try to set the AXValue of the element at (x, y) to `text` — the fully
     invisible alternative to click+Cmd+A+paste for native text inputs.
 
     Cascade: resolve element → reject if web-area-rooted → reject if role
-    isn't a known text input → reject if AXValue isn't settable → set →
-    return success. Any rejection returns ok=False with a `status` field
-    naming the bail reason so the caller falls back to click+paste with
-    enough context to log the choice.
+    isn't a known text input → reject if AXValue isn't settable → set → read
+    back. Rejections before writing permit a fallback. An uncertain write raises
+    or returns attempted=True, verified=False; the caller must not repeat input.
 
     Returns:
       {ok: True,  role, status: "set", via: "ax_set_value"}            on success
@@ -2395,18 +2528,11 @@ def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = No
       {ok: False, role, status: "web_backed"}                          inside AXWebArea — JS won't see set
       {ok: False, role, status: "not_text_input"}                      role isn't in _AX_TEXT_INPUT_ROLES
       {ok: False, role, status: "not_settable"}                        AXValue is read-only on this element
-      {ok: False, role, status: "set_failed", err}                     AXSetAttributeValue itself returned non-zero
+      {ok: False, role, status: "unverified", attempted: True}        accepted write differs on readback
     """
     _check_stop()
-    sys_elem = _appserv.AXUIElementCreateSystemWide()
-    if not sys_elem:
-        return {"ok": False, "status": "no_element"}
-    elem_ref = ctypes.c_void_p(0)
-    err = _appserv.AXUIElementCopyElementAtPosition(
-        ctypes.c_void_p(sys_elem), float(x), float(y), ctypes.byref(elem_ref)
-    )
-    _cf.CFRelease(ctypes.c_void_p(sys_elem))
-    if err != 0 or not elem_ref.value:
+    elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id))
+    if not elem_ref.value:
         return {"ok": False, "status": "no_element"}
 
     try:
@@ -2436,16 +2562,19 @@ def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = No
         finally:
             _cf.CFRelease(ctypes.c_void_p(cfstr))
         if not ok:
-            return {"ok": False, "role": role, "status": "set_failed", "err": "ax_set_returned_nonzero"}
-        return {"ok": True, "role": role, "status": "set", "via": "ax_set_value"}
+            raise RuntimeError('The accessibility write failed; its effect is unknown. Observe before retrying.')
+        # Acceptance alone is not evidence that the native control changed.
+        verified = _ax_str_attr(int(elem_ref.value), b'AXValue') == text
+        return {"ok": verified, "role": role, "status": "set" if verified else "unverified",
+                "attempted": True, "verified": verified, "via": "ax_set_value"}
     finally:
         _cf.CFRelease(elem_ref)
 
 
-def _verify_focused_window(pid: int, target_x: float, target_y: float, target_w: float, target_h: float, tolerance: float = 4.0) -> bool:
+def _verify_focused_window(pid: int, target_x: float, target_y: float, target_w: float, target_h: float, tolerance: float = 4.0, window_id: int | None = None) -> bool:
     """
-    Read the app's AXFocusedWindow and check whether its position+size matches
-    the target. This is the post-condition for raise_window: even if AXRaise
+    Read the app's AXFocusedWindow and compare exact identity when available,
+    otherwise geometry. This is the post-condition for raise_window: even if AXRaise
     returned ok, the actual key window for keystrokes may differ when multiple
     windows overlap. Returns True iff the focused window matches the target.
     """
@@ -2457,6 +2586,13 @@ def _verify_focused_window(pid: int, target_x: float, target_y: float, target_w:
         if not focused_ptr:
             return False
         try:
+            if window_id is not None:
+                target = _ax_exact_window(pid, window_id)
+                try:
+                    return bool(target and _cf.CFEqual(ctypes.c_void_p(focused_ptr), ctypes.c_void_p(target)))
+                finally:
+                    if target:
+                        _cf.CFRelease(ctypes.c_void_p(target))
             pos = _ax_cgpoint(focused_ptr)
             size = _ax_cgsize(focused_ptr)
             if pos is None:
@@ -2485,7 +2621,7 @@ def is_window_key(pid: int, window_id: int) -> bool:
             return False
         return _verify_focused_window(
             pid, float(win["x"]), float(win["y"]),
-            float(win["width"]), float(win["height"]),
+            float(win["width"]), float(win["height"]), window_id=window_id,
         )
     except Exception:
         return False
@@ -2502,7 +2638,7 @@ async def raise_window(pid: int, window_id: int) -> dict:
         via       — 'ax' (AXRaise worked), 'ax_retry' (worked after retry),
                     'ax_no_match' (couldn't find AXWindow ref for this CG id),
                     'ax_raise_failed' (AXRaise + retries didn't make target key).
-        focused   — True iff AXFocusedWindow matches target position+size.
+        focused   — True iff AXFocusedWindow matches the exact target window.
         window_id — echoed for convenience.
         warning   — present iff ok=False; human-readable hint for the agent.
 
@@ -2533,7 +2669,7 @@ async def raise_window(pid: int, window_id: int) -> dict:
         # No AX match — app is active but we can't raise the specific window.
         # Verify whether it happens to already be the focused window anyway
         # (single-window app, or it was already on top).
-        focused = _verify_focused_window(pid, tx, ty, tw, th)
+        focused = _verify_focused_window(pid, tx, ty, tw, th, window_id=window_id)
         return {
             "ok": focused,
             "window_id": window_id,
@@ -2550,14 +2686,14 @@ async def raise_window(pid: int, window_id: int) -> dict:
     try:
         ok = _ax_perform_action(ax_win, b"AXRaise")
         await asyncio.sleep(0.03)
-        if _verify_focused_window(pid, tx, ty, tw, th):
+        if _verify_focused_window(pid, tx, ty, tw, th, window_id=window_id):
             return {"ok": True, "window_id": window_id, "via": "ax", "focused": True}
 
         # Post-condition failed: AXRaise returned ok=True (or False) but the
         # focused window is still something else. Retry once after a longer settle.
         _ax_perform_action(ax_win, b"AXRaise")
         await asyncio.sleep(0.08)
-        if _verify_focused_window(pid, tx, ty, tw, th):
+        if _verify_focused_window(pid, tx, ty, tw, th, window_id=window_id):
             return {"ok": True, "window_id": window_id, "via": "ax_retry", "focused": True}
 
         return {

@@ -6,9 +6,8 @@ no element matching a label (common in canvas surfaces, browser content
 without forced a11y, and Electron apps), Klyk reads the screen as text and
 clicks the matching glyph directly.
 
-Runs locally on Apple Silicon — no network, no model download, ~50-150ms per
-full-window screenshot. Returns coordinates in the same window-relative pixel
-space the rest of Klyk uses.
+Runs locally through Apple Vision with no network or model download. Returns
+coordinates in the same window-relative pixel space the rest of Klyk uses.
 """
 
 from __future__ import annotations
@@ -16,7 +15,8 @@ from __future__ import annotations
 import base64
 
 try:
-    from Foundation import NSData, NSLocale
+    import objc
+    from Foundation import NSData, NSDictionary, NSArray, NSLocale
     from Quartz import (
         CGImageSourceCreateWithData,
         CGImageSourceCreateImageAtIndex,
@@ -61,10 +61,26 @@ def _require() -> None:
         )
 
 
+def _configure_compute(request) -> None:
+    """Choose supported CPU stages to avoid accelerator compilation on interactive OCR."""
+    if hasattr(request, 'supportedComputeStageDevicesAndReturnError_'):
+        stages, error = request.supportedComputeStageDevicesAndReturnError_(None)
+        if error is not None or stages is None:
+            raise RuntimeError('Text recognition compute devices are unavailable.')
+        cpu_class = objc.lookUpClass('MLCPUComputeDevice')
+        for stage, devices in stages.items():
+            cpu = next((device for device in devices if device.isKindOfClass_(cpu_class)), None)
+            if cpu is not None:
+                request.setComputeDevice_forComputeStage_(cpu, stage)
+    else:
+        request.setUsesCPUOnly_(True)  # Compatibility with macOS before per-stage selection.
+
+
 def recognize_all(
     image_b64: str,
     level: int = 1,
     languages: list[str] | None = None,
+    region: tuple[float, float, float, float] | None = None,
 ) -> list[dict]:
     """
     Run OCR on a base64 PNG and return every recognized text observation.
@@ -73,8 +89,7 @@ def recognize_all(
     x, y are the center of the bounding box in top-left-origin pixel coords
     matching the input image's dimensions. Sorted by confidence descending.
 
-    level=1 (fast) is the default — ~3-5× quicker on Apple Silicon and adequate
-    for crisp UI text. level=0 (accurate) is slower but catches small,
+    level=1 (fast) is the default for crisp UI text. level=0 (accurate) catches small,
     low-contrast, or stylized text that fast mode misses.
 
     `languages` is a list of BCP-47 codes (["de-DE", "en-US"], ["zh-Hans"], ...).
@@ -98,21 +113,32 @@ def recognize_all(
     width = CGImageGetWidth(cg_image)
     height = CGImageGetHeight(cg_image)
 
-    handler = VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, {})
+    # Native NSDictionary returns nil for absent option keys. A bridged Python
+    # dict raises on those lookups in recent Vision builds, before OCR starts.
+    handler = VNImageRequestHandler.alloc().initWithCGImage_options_(cg_image, NSDictionary.dictionary())
     request = VNRecognizeTextRequest.alloc().init()
+    if region is not None:
+        x, y, w, h = region
+        if x < 0 or y < 0 or w <= 0 or h <= 0 or x + w > width or y + h > height:
+            raise ValueError('OCR region must fit inside the captured window.')
+        # Vision expects a normalized rectangle with its origin at bottom-left.
+        request.setRegionOfInterest_(((x / width, 1 - (y + h) / height), (w / width, h / height)))
     request.setRecognitionLevel_(level)
+    _configure_compute(request)
     request.setUsesLanguageCorrection_(False)
     langs = languages if languages else _SYSTEM_LANGS
     # Best-effort: older Vision builds without setRecognitionLanguages_ keep
     # the framework default rather than failing the whole call.
     try:
-        request.setRecognitionLanguages_(langs)
+        request.setRecognitionLanguages_(NSArray.arrayWithArray_(langs))
     except Exception:
         pass
 
-    success, error = handler.performRequests_error_([request], None)
+    # Vision may read these collections on internal workers. Native arrays avoid
+    # callbacks into Python while the synchronous recognition call is waiting.
+    success, error = handler.performRequests_error_(NSArray.arrayWithObject_(request), None)
     if not success:
-        return []
+        raise RuntimeError(f'Text recognition could not complete: {error or "no native result"}')
 
     results: list[dict] = []
     for obs in (request.results() or []):
@@ -128,11 +154,13 @@ def recognize_all(
         bw = bbox.size.width
         bh = bbox.size.height
 
-        # Convert to top-left-origin pixel coords matching the screenshot.
-        px = bx * width
-        py = (1.0 - by - bh) * height
-        pw = bw * width
-        ph = bh * height
+        # Vision normalizes observations to its region of interest. Restore the
+        # region's offset and scale before reporting full-screenshot coordinates.
+        rx, ry, rw, rh = region if region is not None else (0, 0, width, height)
+        px = rx + bx * rw
+        py = ry + (1.0 - by - bh) * rh
+        pw = bw * rw
+        ph = bh * rh
 
         results.append({
             "text": text,

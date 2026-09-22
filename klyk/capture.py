@@ -1,7 +1,7 @@
 """
 Screen capture and window management.
-Primary path: CoreGraphics in-memory capture (~40ms, no subprocesses).
-Fallback: screencapture + sips CLI pipeline.
+Window captures prefer ScreenCaptureKit, then window-only CoreGraphics.
+Fallbacks retain the exact window; desktop capture requires an explicit request.
 All returned dimensions are in logical points matching the CGEvent coordinate space.
 """
 
@@ -795,11 +795,11 @@ def _resize_cgimage(image: int, target_w: int, target_h: int) -> int:
 def _take_screenshot_cg(
     win_x: int, win_y: int,
     logical_width: int, logical_height: int,
+    window_id: int | None = None,
 ) -> tuple[str, int, int]:
     """
-    Capture a screen region directly via CoreGraphics — no subprocess, no temp files.
-    Uses CGWindowListCreateImage with global coordinates so the window can be on any
-    monitor. Falls back to CGDisplayCreateImageForRect on the main display if needed.
+    Capture one window, or an explicitly requested region, without subprocesses.
+    A failed window capture never falls back to the desktop.
     Returns (base64_png, logical_width, logical_height).
     """
     rect = CGRect(
@@ -808,11 +808,11 @@ def _take_screenshot_cg(
     )
     raw = _cg.CGWindowListCreateImage(
         rect,
-        kCGWindowListOptionOnScreenOnly,
-        kCGNullWindowID,
-        kCGWindowImageDefault,
+        kCGWindowListOptionIncludingWindow if window_id else kCGWindowListOptionOnScreenOnly,
+        int(window_id) if window_id else kCGNullWindowID,
+        kCGWindowImageBoundsIgnoreFraming if window_id else kCGWindowImageDefault,
     )
-    if not raw:
+    if not raw and not window_id:
         # Fallback: main display capture
         display = _cg.CGMainDisplayID()
         raw = _cg.CGDisplayCreateImageForRect(display, rect)
@@ -830,9 +830,12 @@ def _take_screenshot_cg(
             resized = raw
 
         try:
+            if (not resized or _cg.CGImageGetWidth(ctypes.c_void_p(resized)) != logical_width
+                    or _cg.CGImageGetHeight(ctypes.c_void_p(resized)) != logical_height):
+                raise RuntimeError('Window screenshot could not be resized to logical coordinates.')
             png_bytes = _cgimage_to_png_bytes(resized)
         finally:
-            if resized != raw:
+            if resized and resized != raw:
                 _cf.CFRelease(ctypes.c_void_p(resized))
     finally:
         _cf.CFRelease(ctypes.c_void_p(raw))
@@ -1219,18 +1222,24 @@ def take_screenshot(
     """
     Capture a window and return (base64_png, logical_width, logical_height).
 
-    Primary path: CGWindowListCreateImage with global coordinates — works on any
-    monitor seamlessly. If the window moves to a second display mid-session,
-    the next call picks up the new position from _refresh_window and captures correctly.
-    Fallback: screencapture -R region capture (also uses global coords, any monitor).
+    A supplied window ID always captures that window alone, even when covered.
+    Retina output is normalized to the caller's logical coordinates. Region or
+    display capture is available only when no window ID was supplied.
     """
     if settle_ms > 0:
         time.sleep(settle_ms / 1000)
 
-    # Primary: CoreGraphics in-memory (no subprocess, ~40ms)
+    if window_id and logical_width and logical_height and _HAS_IMAGEIO:
+        try:
+            from . import window_capture
+            return window_capture.take(window_id, logical_width, logical_height)
+        except Exception:
+            pass  # Older macOS and unavailable SCK retain window-only fallbacks.
+
+    # In-memory compatibility path, preserving the requested capture scope.
     if _HAS_IMAGEIO and win_x is not None and win_y is not None and logical_width and logical_height:
         try:
-            return _take_screenshot_cg(win_x, win_y, logical_width, logical_height)
+            return _take_screenshot_cg(win_x, win_y, logical_width, logical_height, window_id=window_id)
         except Exception:
             pass  # fall through to screencapture
 
@@ -1241,11 +1250,11 @@ def take_screenshot(
         out_path = out_f.name
 
     try:
-        if win_x is not None and win_y is not None and logical_width and logical_height:
+        if window_id:
+            cmd = ["screencapture", "-x", "-t", "png", "-l", str(window_id), "-o", raw_path]
+        elif win_x is not None and win_y is not None and logical_width and logical_height:
             region = f"{int(win_x)},{int(win_y)},{int(logical_width)},{int(logical_height)}"
             cmd = ["screencapture", "-x", "-t", "png", "-R", region, raw_path]
-        elif window_id:
-            cmd = ["screencapture", "-x", "-t", "png", "-l", str(window_id), "-o", raw_path]
         else:
             cmd = ["screencapture", "-x", "-t", "png", raw_path]
 
@@ -1260,9 +1269,8 @@ def take_screenshot(
             )
 
         if logical_width and logical_height:
-            max_dim = max(logical_width, logical_height)
             subprocess.run(
-                ["sips", "-Z", str(max_dim), raw_path, "--out", out_path],
+                ["sips", "-z", str(logical_height), str(logical_width), raw_path, "--out", out_path],
                 capture_output=True, timeout=10, check=True
             )
             final_path = out_path
@@ -1315,24 +1323,18 @@ def _parse_sips_dimensions(sips_output: str) -> tuple[int, int]:
 
 
 def check_screen_recording() -> None:
-    """Raise RuntimeError if Screen Recording permission is not granted."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
+    """Check Apple's permission state without capturing the desktop or prompting."""
     try:
-        result = subprocess.run(
-            ["screencapture", "-x", "-t", "png", tmp],
-            capture_output=True, timeout=5
+        preflight = _cg.CGPreflightScreenCaptureAccess
+        preflight.argtypes = []
+        preflight.restype = ctypes.c_bool
+    except AttributeError as error:
+        raise RuntimeError('Screen Recording permission preflight is unavailable on this macOS version.') from error
+    if not preflight():
+        raise RuntimeError(
+            "klyk needs Screen Recording permission to capture window contents "
+            "(used by screenshot / inspect / read_grid). Grant it:\n"
+            "  System Settings → Privacy & Security → Screen Recording\n"
+            "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
+            "Then run `klyk doctor` and restart the affected client process."
         )
-        if result.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
-            raise RuntimeError(
-                "klyk needs Screen Recording permission to capture window contents "
-                "(used by screenshot / inspect / read_grid). Grant it:\n"
-                "  System Settings → Privacy & Security → Screen Recording\n"
-                "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
-                "Then `klyk doctor` to verify, and restart your MCP client."
-            )
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass

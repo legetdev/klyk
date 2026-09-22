@@ -43,6 +43,9 @@ class Session:
     # query, so a probe at session-create time often races and misses. The
     # only reliable signal is the AX read the agent is currently performing.
     ax_disabled_warned_on_inspect: bool = False
+    ax_warmup_attempted: bool = False
+    # Only wait for the unelapsed part of this window's last mutation repaint.
+    last_mutation_at: float = 0.0
     # Input-delivery mode. Default is "autonomous" — klyk prefers invisible
     # delivery (no cursor warp, no focus theft) and auto-activates the
     # target app only when the invisible path can't deliver (e.g. Chromium
@@ -297,7 +300,8 @@ async def create_session(
         )
         session._log_proc = log_proc
         session._log_reader = StderrReader(log_proc.stdout, session.log_buffer)
-        await computer.activate_app(pid)
+        if not was_running:
+            await computer.activate_app(pid)
 
     elif target == "electron":
         if not app_path and app_name:
@@ -350,7 +354,8 @@ async def create_session(
         )
         session._log_proc = proc
         session._log_reader = StderrReader(proc.stderr, session.log_buffer)
-        await computer.activate_app(pid)
+        if proc is not None:
+            await computer.activate_app(pid)
 
     else:
         raise ValueError(

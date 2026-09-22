@@ -302,8 +302,10 @@ def _post_stamped_pair(
         _stamp_mouse_event(ev_down, pid, window_id, True,  x, y, modifier_flags, click_state)
         _stamp_mouse_event(ev_up,   pid, window_id, False, x, y, modifier_flags, click_state)
         _post_event(pid, ev_down)
-        time.sleep(0.005)
-        _post_event(pid, ev_up)
+        try:
+            time.sleep(0.005)
+        finally:
+            _post_event(pid, ev_up)
     finally:
         _release(ev_down)
         _release(ev_up)

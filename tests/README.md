@@ -12,6 +12,14 @@ Focused regressions also exercise real subprocess pipes (large requests, noisy s
 
 ## Real Mac verification
 
+For a low-interruption pass, use the background-only suite:
+
+```sh
+python3 -B tests/background_smoke.py --output .verification/background.json
+```
+
+It uses a separate ownership token and two disposable, overlapping AppKit windows. It checks real MCP observations, native input, field readback, OCR regions, grid text, foreground preservation and warm timings against independent fixture state. User app switching is allowed; bringing a test window or server to the foreground fails the check. It does not operate user apps, exercise browser foreground fallbacks, or substitute for the full major-release gate below.
+
 The opt-in native check compiles `Fixture.swift` using `xcrun swiftc`, starts disposable AppKit apps, and drives all 48 tools through the real stdio MCP server:
 
 ```sh

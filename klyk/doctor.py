@@ -32,7 +32,6 @@ import platform
 import shutil
 import subprocess
 import sys
-import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
@@ -301,56 +300,18 @@ def check_accessibility_permission() -> CheckResult:
 
 
 def check_screen_recording_permission() -> CheckResult:
-    """Screen Recording is needed for take_screenshot. Verify by running
-    screencapture on a temp file — if it produces a non-empty PNG, perm
-    is granted. If the file is missing or tiny, the OS denied it
-    silently."""
+    """Read the same native permission state as startup without taking a screenshot."""
     if sys.platform != "darwin":
         return CheckResult("Screen Recording permission", "warn", "skipped (not darwin)")
-    tmp_path = ""
     try:
-        with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-            tmp_path = f.name
-        result = subprocess.run(
-            ["screencapture", "-x", "-t", "png", tmp_path],
-            capture_output=True, timeout=5,
-        )
-        ok = (
-            result.returncode == 0
-            and os.path.exists(tmp_path)
-            and os.path.getsize(tmp_path) >= 100
-        )
-        if ok:
-            return CheckResult(
-                "Screen Recording permission", "ok", "granted to this process",
-            )
-        return CheckResult(
-            "Screen Recording permission", "fail", "NOT granted",
-            "Without Screen Recording, klyk can't capture window contents "
-            "(no screenshots, no inspect images, no read_grid). Grant it:\n"
-            "  1. System Settings → Privacy & Security → Screen Recording\n"
-            "  2. Click + and add your terminal app (same one as Accessibility).\n"
-            "  3. Toggle it ON.\n"
-            "  4. Re-run `klyk doctor` to verify.",
-        )
-    except subprocess.TimeoutExpired:
-        return CheckResult(
-            "Screen Recording permission", "warn",
-            "screencapture timed out — could not verify",
-            "If screenshots fail at runtime, grant Screen Recording: "
-            "System Settings → Privacy & Security → Screen Recording.",
-        )
-    except Exception as e:
-        return CheckResult(
-            "Screen Recording permission", "warn",
-            f"check failed: {type(e).__name__}: {e}",
-        )
-    finally:
-        try:
-            if tmp_path and os.path.exists(tmp_path):
-                os.unlink(tmp_path)
-        except OSError:
-            pass
+        from .capture import check_screen_recording
+        check_screen_recording()
+        return CheckResult("Screen Recording permission", "ok", "granted to this process")
+    except RuntimeError as error:
+        return CheckResult("Screen Recording permission", "fail", str(error))
+    except Exception as error:
+        return CheckResult("Screen Recording permission", "warn",
+                           f"could not check: {type(error).__name__}")
 
 
 def check_klyk_dir_writable() -> CheckResult:

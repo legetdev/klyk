@@ -49,7 +49,7 @@ This is defense-in-depth — agents shouldn't be trusted to filter credentials d
 ## What's deliberately not scrubbed
 
 - Screenshots and OCR text returned to the agent: the agent asked for the pixels, so it gets them. Don't run klyk on screens with content you can't show the agent.
-- A failed window/region capture returns an error rather than retrying the whole desktop. Composited captures can still include overlapping windows inside the requested region.
+- Window screenshots capture only the selected window, including when covered. Compatibility fallbacks retain that window ID; failure never widens to the desktop. Explicit display or region capture includes whatever is visible in that requested area.
 - AX labels and values: same rationale — the agent asked.
 
 ## Out of scope

@@ -61,7 +61,8 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
         NSApp.mainMenu = menu
         for index in 0..<2 {
-            let window = NSWindow(contentRect: NSRect(x: 120 + index * 420, y: 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
+            let step = ProcessInfo.processInfo.environment["KLYK_FIXTURE_OVERLAP"] == "1" ? 0 : 420
+            let window = NSWindow(contentRect: NSRect(x: 120 + index * step, y: 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
             window.title = index == 0 ? "Klyk Fixture A" : "Klyk Fixture B"
             window.isReleasedWhenClosed = false
             let offset = Double(ProcessInfo.processInfo.environment["KLYK_FIXTURE_OFFSET"] ?? "0") ?? 0
@@ -95,9 +96,16 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             source.setAccessibilityLabel("Drag sample"); source.source = true; content.addSubview(source)
             let target = DragBox(frame:NSRect(x:200,y:350,width:150,height:45))
             target.setAccessibilityLabel("Drop target"); target.onDrop = { [weak self] value in self?.drops.append(value); self?.writeState() }; content.addSubview(target)
-            window.makeKeyAndOrderFront(nil); windows.append(window)
+            if ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] == "1" {
+                window.orderBack(nil)
+            } else {
+                window.makeKeyAndOrderFront(nil)
+            }
+            windows.append(window)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        if ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] != "1" {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.writeState() }
         writeState()
     }
@@ -133,5 +141,5 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
 let app = NSApplication.shared
 let delegate = FixtureDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] == "1" ? .accessory : .regular)
 app.run()
