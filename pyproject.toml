@@ -25,7 +25,10 @@ classifiers = [
     "Topic :: Software Development :: Testing :: Acceptance",
 ]
 dependencies = [
-    "mcp>=1.0.0",
+    "mcp>=1.28.1,<3",
+    # Patched floors for dependencies already required by MCP.
+    "anyio>=4.14.2",
+    "cryptography>=50.0.0",
     "python-dotenv>=1.0.0",
     # Transitive of mcp, declared explicitly so run's nested-step validation can't silently vanish.
     "jsonschema>=4.0",

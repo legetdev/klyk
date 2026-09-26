@@ -27,19 +27,36 @@ on:
 
 permissions:
   contents: read
-  id-token: write                # required for OIDC Trusted Publishing
+
+concurrency:
+  group: pypi-${{ inputs.release_tag || github.event.release.tag_name }}
+  cancel-in-progress: false
 
 jobs:
-  publish:
+  build:
     runs-on: ubuntu-latest
-    environment: pypi
     steps:
+      - name: Require an existing stable release tag
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          [[ "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || exit 1
+          gh release view "$RELEASE_TAG" --json isDraft,isPrerelease,tagName > /tmp/release.json
+          python3 -c 'import json, os; r=json.load(open("/tmp/release.json")); assert not r["isDraft"] and not r["isPrerelease"] and r["tagName"] == os.environ["RELEASE_TAG"]'
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          ref: ${{ inputs.release_tag || github.ref }}
+          ref: refs/tags/${{ inputs.release_tag || github.event.release.tag_name }}
+          persist-credentials: false
       - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v6.2.0
         with:
           python-version: "3.12"
+      - name: Match the package version to the release
+        env:
+          RELEASE_TAG: ${{ inputs.release_tag || github.event.release.tag_name }}
+        run: |
+          python -c 'import ast, os; t=ast.parse(open("klyk/__init__.py").read()); v=next(ast.literal_eval(n.value) for n in t.body if isinstance(n, ast.Assign) and any(isinstance(x, ast.Name) and x.id == "__version__" for x in n.targets)); assert "v" + v == os.environ["RELEASE_TAG"]'
       - name: Portable regression and source privacy checks
         run: |
           python -m pip install .
@@ -51,5 +68,25 @@ jobs:
           python -m build
           python -m twine check dist/*
           python tests/release_check.py --archives
+      - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: distributions
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      # No source checkout, package installation, or tests in the credentialed job.
+      - uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: distributions
+          path: dist/
       - name: Publish to PyPI (Trusted Publishing)
         uses: pypa/gh-action-pypi-publish@dc37677b2e1c63e2034f94d8a5b11f265b73ba33 # v1.14.2

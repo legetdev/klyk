@@ -19,13 +19,11 @@ def generate_verdict(session: "Session", test_description: str) -> dict:
     """
     from . import capture
 
-    win = capture.get_window_for_pid(session.pid)
-    if win:
-        session.window_id = win["window_id"]
-        session.win_x = int(win["bounds"]["X"])
-        session.win_y = int(win["bounds"]["Y"])
-        session.width = int(win["bounds"]["Width"])
-        session.height = int(win["bounds"]["Height"])
+    win = capture.get_window_by_id(session.window_id)
+    if not win or win["pid"] != session.pid:
+        raise RuntimeError("The selected window is unavailable; inspect and select a current window before requesting a verdict.")
+    session.win_x, session.win_y = int(win["x"]), int(win["y"])
+    session.width, session.height = int(win["width"]), int(win["height"])
 
     screenshot_b64, w, h = capture.take_screenshot(
         window_id=session.window_id,

@@ -21,6 +21,7 @@ from unittest.mock import MagicMock
 
 import jsonschema
 from mcp import types
+from klyk.private_files import open_private
 
 ROOT = Path(__file__).resolve().parents[1]
 
