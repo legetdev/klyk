@@ -1,5 +1,7 @@
 # Klyk Architecture
 
+Startup checks Screen Recording permission with macOS's `CGPreflightScreenCaptureAccess` API. It does not capture the desktop, create a screenshot file, or prompt for permission; denied or unavailable permission checks stop startup with an actionable error.
+
 Internals reference for working on the klyk codebase. The "why this code is shaped this way." For installation and usage, see [`README.md`](./README.md). For the canonical agent-facing tool reference and behavior contracts, see the tool `description` fields in `klyk/mcp_server.py`.
 
 ---

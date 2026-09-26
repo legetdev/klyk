@@ -1328,24 +1328,18 @@ def _parse_sips_dimensions(sips_output: str) -> tuple[int, int]:
 
 
 def check_screen_recording() -> None:
-    """Raise RuntimeError if Screen Recording permission is not granted."""
-    with tempfile.NamedTemporaryFile(suffix=".png", delete=False) as f:
-        tmp = f.name
+    """Check Apple's permission state without capturing the desktop or prompting."""
     try:
-        result = subprocess.run(
-            ["screencapture", "-x", "-t", "png", tmp],
-            capture_output=True, timeout=5
+        preflight = _cg.CGPreflightScreenCaptureAccess
+        preflight.argtypes = []
+        preflight.restype = ctypes.c_bool
+    except AttributeError as error:
+        raise RuntimeError('Screen Recording permission preflight is unavailable on this macOS version.') from error
+    if not preflight():
+        raise RuntimeError(
+            "klyk needs Screen Recording permission to capture window contents "
+            "(used by screenshot / inspect / read_grid). Grant it:\n"
+            "  System Settings → Privacy & Security → Screen Recording\n"
+            "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
+            "Then run `klyk doctor` and restart the affected client process."
         )
-        if result.returncode != 0 or not os.path.exists(tmp) or os.path.getsize(tmp) < 100:
-            raise RuntimeError(
-                "klyk needs Screen Recording permission to capture window contents "
-                "(used by screenshot / inspect / read_grid). Grant it:\n"
-                "  System Settings → Privacy & Security → Screen Recording\n"
-                "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
-                "Then `klyk doctor` to verify, and restart your MCP client."
-            )
-    finally:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
