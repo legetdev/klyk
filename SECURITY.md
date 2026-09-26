@@ -43,6 +43,9 @@ Stderr from apps launched by klyk is run through credential scrubbers at capture
 - `Authorization: Bearer …` HTTP headers
 - AWS access key IDs (`AKIA*`, `ASIA*`, …)
 - JWTs (`eyJ…`.`…`.`…`)
+- Single-quoted credential values and Basic/Digest Authorization headers
+
+Captured log records are limited to 8 KiB each and 500 records per channel. Oversized records are omitted entirely so a truncated credential's tail is not exposed. Persistent diagnostics use a dedicated Klyk logger; MCP protocol debug messages and tool exception payloads are not written to that log.
 
 This is defense-in-depth — agents shouldn't be trusted to filter credentials downstream, and a misbehaving app that prints secrets to stderr shouldn't infect the rest of the trust chain. It is **best-effort; it cannot catch every credential format — not a guarantee.** Do not rely on it as your only safeguard.
 
@@ -51,6 +54,20 @@ This is defense-in-depth — agents shouldn't be trusted to filter credentials d
 - Screenshots and OCR text returned to the agent: the agent asked for the pixels, so it gets them. Don't run klyk on screens with content you can't show the agent.
 - Window screenshots capture only the selected window, including when covered. Compatibility fallbacks retain that window ID; failure never widens to the desktop. Explicit display or region capture includes whatever is visible in that requested area.
 - AX labels and values: same rationale — the agent asked.
+
+## Local files and resource limits
+
+The shell client stores up to 20 recent screenshots in `~/.klyk/captures`, an owner-only directory. New screenshot files, explicit screenshot exports, the ownership token, and diagnostic logs are created with owner-only permissions. Existing diagnostic rotations are restricted when logging starts. These are filesystem permissions, not encryption; software running as the same user can still read them. Old log contents are not erased automatically and may contain request data recorded by earlier versions.
+
+Klyk refuses symbolic links, hard links, and special files at its private-file write boundaries. An unsafe or unwritable log path disables file logging without preventing the MCP connection. A failed screenshot export keeps the inline image and returns `save_error`. User-selected parent directories remain under the user's control; Klyk is not a filesystem sandbox for an untrusted agent.
+
+Template decoding accepts PNG only, with a 32 MiB encoded-data limit, at most 8192 pixels per side, and at most 16 million pixels. The shell client's response buffer is limited to 64 MiB. These limits reject malformed or excessive payloads; they do not make an untrusted MCP agent safe to run.
+
+Numeric requests reject NaN and infinity before execution. Verdict and grading capture retain the selected window and refuse missing or reassigned windows instead of selecting another document.
+
+## Publication
+
+GitHub Actions builds and tests packages without PyPI identity-token permission. A separate job receives only the built distributions and the publishing permission. Manual retries require an existing stable GitHub release whose tag matches the package version. Official actions are pinned to immutable commits; no persistent PyPI token is stored in the repository.
 
 ## Out of scope
 

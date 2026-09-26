@@ -15,7 +15,7 @@ def fingerprint():
     """Bind a live report to the runtime, public documentation, tests, and release controls."""
     paths = [*ROOT.glob('klyk/*.py'), *ROOT.glob('tests/*.py'), *ROOT.glob('tests/*.swift'), *ROOT.glob('tests/*.html'), *ROOT.glob('tests/*.md'),
              *ROOT.glob('.github/workflows/*.yml')]
-    paths += [ROOT / name for name in ('.gitignore', 'pyproject.toml', 'README.md', 'SECURITY.md', 'ARCHITECTURE.md', 'LICENSE', 'release.sh')]
+    paths += [ROOT / name for name in ('.gitignore', 'pyproject.toml', 'requirements.txt', 'README.md', 'SECURITY.md', 'ARCHITECTURE.md', 'LICENSE', 'release.sh')]
     digest = hashlib.sha256()
     for path in sorted(paths):
         digest.update(str(path.relative_to(ROOT)).encode() + b'\0' + path.read_bytes() + b'\0')
@@ -30,6 +30,8 @@ def check_names(names):
             raise ValueError(f'Private or generated content in publication: {name}')
         if name.endswith(('.pyc', '.log')):
             raise ValueError(f'Generated content in publication: {name}')
+        if any(part.lower().startswith('.env.') and part != '.env.example' for part in parts):
+            raise ValueError(f'Environment secrets in publication: {name}')
 
 
 def main():

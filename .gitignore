@@ -6,6 +6,8 @@ __pycache__/
 
 # Environment / secrets
 .env
+.env.*
+!.env.example
 
 # macOS
 .DS_Store

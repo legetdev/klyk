@@ -34,6 +34,8 @@ import fcntl
 import os
 from pathlib import Path
 
+from .private_files import open_private, private_directory
+
 # Owner file location. Overridable via env so tests can isolate themselves
 # from the real token (and never disturb a live session).
 OWNER_PATH = Path(
@@ -48,7 +50,7 @@ def _read_pid(fh) -> int:
     """Read the owner pid from an open, positioned file handle. 0 if empty
     or unparseable."""
     fh.seek(0)
-    raw = fh.read().strip()
+    raw = fh.read(64).strip()
     try:
         return int(raw)
     except (ValueError, TypeError):
@@ -81,8 +83,13 @@ def _open():
     None if the filesystem won't cooperate. Callers fail closed when control
     ownership cannot be verified."""
     try:
-        OWNER_PATH.parent.mkdir(parents=True, exist_ok=True)
-        return open(OWNER_PATH, "a+")
+        if OWNER_PATH.parent == Path.home() / ".klyk":
+            private_directory(OWNER_PATH.parent)
+        else:
+            # An explicit test/custom path may use a shared parent like /tmp.
+            # Protect our file without changing permissions on that directory.
+            OWNER_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+        return open_private(OWNER_PATH, "a+")
     except OSError:
         return None
 

@@ -18,13 +18,50 @@ defensive, and avoids exfiltration of secrets that aren't klyk's to
 hold.
 """
 
+import logging
+from logging.handlers import RotatingFileHandler
+from pathlib import Path
 import re
 import threading
 from collections import deque
 from dataclasses import dataclass, field
 from typing import Callable, Deque
 
+from .private_files import open_private
+
 _LOG_CHANNEL_CAP = 500
+_LOG_LINE_CAP = 8192
+
+
+class PrivateLogHandler(RotatingFileHandler):
+    """Keep every newly opened or rotated diagnostic log owner-only."""
+
+    def _open(self):
+        """Secure the descriptor before the first byte, including after rotation."""
+        return open_private(self.baseFilename, "a", encoding=self.encoding or "utf-8")
+
+
+def configure_logging(path: str) -> logging.Logger:
+    """Persist Klyk diagnostics only; SDK protocol payloads never enter this file."""
+    logger = logging.getLogger("klyk")
+    logger.setLevel(logging.INFO)
+    logger.propagate = False
+    try:
+        # Existing rotations may predate owner-only creation. Never follow links.
+        for backup in range(1, 6):
+            candidate = Path(f"{path}.{backup}")
+            if candidate.exists():
+                with open_private(candidate):
+                    pass
+        handler = PrivateLogHandler(path, maxBytes=10 * 1024 * 1024,
+                                    backupCount=5, encoding="utf-8")
+        handler.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    except OSError:
+        # Diagnostics must neither prevent connection nor fall back to leaking
+        # private exception contents through the caller's stderr/root logger.
+        handler = logging.NullHandler()
+    logger.addHandler(handler)
+    return logger
 
 # Sensitive-value scrubbers. Each pattern's match is replaced with the
 # leading key/label (group 1) plus `=***`. Patterns deliberately leave the
@@ -47,6 +84,17 @@ _SCRUBBERS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
     (
         re.compile(r'(?i)\b(Bearer)\s+(\S+)'),
         lambda m: f"{m.group(1)} ***",
+    ),
+    # Quoted plaintext/Python-repr credentials and multi-word HTTP auth values.
+    (
+        re.compile(
+            r'''(?i)(["']?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth(?:orization)?)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+        ),
+        lambda m: f"{m.group(1)}{m.group(2)[0]}***{m.group(2)[0]}",
+    ),
+    (
+        re.compile(r'(?i)\b(Authorization\s*:\s*)(?:Basic|Digest)\s+[^\r\n]+'),
+        lambda m: f"{m.group(1)}***",
     ),
     # key=value / key: value (password, secret, token, api[_-]key, etc.)
     (
@@ -132,7 +180,11 @@ class NativeLogCapture:
         return self._buffer
 
     def append_stderr(self, line: str) -> None:
-        self._buffer.app_errors.append(_scrub(line.rstrip()))
+        # Drop oversize records in full: keeping their tail can leak a credential
+        # whose identifying key was discarded at the truncation boundary.
+        self._buffer.app_errors.append(
+            "[oversized log line omitted]" if len(line) > _LOG_LINE_CAP else _scrub(line.rstrip())
+        )
 
 
 class StderrReader:
@@ -151,10 +203,21 @@ class StderrReader:
         self._thread.start()
 
     def _run(self) -> None:
+        """Read bounded records and discard all fragments of an oversized line."""
         try:
-            for raw in self._pipe:
+            discarding = False
+            while True:
+                raw = self._pipe.readline(_LOG_LINE_CAP + 1)
+                if not raw:
+                    break
                 if self._stop.is_set():
                     break
+                newline = raw.endswith(b"\n" if isinstance(raw, bytes) else "\n")
+                if discarding or len(raw) > _LOG_LINE_CAP:
+                    if not discarding:
+                        self._buffer.app_errors.append("[oversized log line omitted]")
+                    discarding = not newline
+                    continue
                 if isinstance(raw, bytes):
                     raw = raw.decode("utf-8", errors="replace")
                 line = raw.rstrip()

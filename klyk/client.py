@@ -23,8 +23,11 @@ import os
 import select
 import subprocess
 import sys
+import tempfile
 import time
 from pathlib import Path
+
+from .private_files import private_directory
 
 # This module lives inside the `klyk` package; the repo root is its grandparent.
 # Putting the repo root on PYTHONPATH lets `-m klyk.mcp_server` resolve when
@@ -32,6 +35,7 @@ from pathlib import Path
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 _PROTOCOL_VERSION = "2024-11-05"
+_MAX_RESPONSE_BYTES = 64 * 1024 * 1024
 
 
 class KlykError(RuntimeError):
@@ -232,6 +236,9 @@ class KlykClient:
                     "klyk server closed the connection unexpectedly"
                 )
             self._stdout_buffer.extend(chunk)
+            if len(self._stdout_buffer) > _MAX_RESPONSE_BYTES:
+                self._stdout_buffer.clear()
+                raise KlykError("klyk response exceeds the 64 MiB limit; request a smaller observation")
 
     def _connection_error(self, message):
         """Attach a bounded recent diagnostic tail to transport failures."""
@@ -254,7 +261,6 @@ def _emit(obj):
 # klyk-call the same observe→verify loop the native MCP transport has.
 _CAPTURE_DIR = Path.home() / ".klyk" / "captures"
 _CAPTURE_KEEP = 20          # bounded cache: keep the most recent N, evict older
-_img_seq = 0                # process-local counter for unique capture filenames
 
 
 def _prune_captures(keep: int = _CAPTURE_KEEP):
@@ -287,7 +293,6 @@ def materialize_images(result, tool="image"):
     if not isinstance(content, list):
         return result
 
-    global _img_seq
     saved = []
     for item in content:
         if not (isinstance(item, dict) and item.get("type") == "image" and item.get("data")):
@@ -297,11 +302,14 @@ def materialize_images(result, tool="image"):
         except Exception:
             continue  # leave a malformed block untouched rather than crash
         try:
-            _CAPTURE_DIR.mkdir(parents=True, exist_ok=True)
-            _img_seq += 1
+            private_directory(_CAPTURE_DIR)
             safe = "".join(c if c.isalnum() else "-" for c in str(tool))[:24] or "image"
-            path = _CAPTURE_DIR / f"{safe}-{os.getpid()}-{_img_seq}.png"
-            path.write_bytes(raw)
+            # Exclusive, random, owner-only creation avoids predictable-name
+            # symlink overwrites and protects pixels even under a permissive umask.
+            with tempfile.NamedTemporaryFile(dir=_CAPTURE_DIR, prefix=f"{safe}-",
+                                             suffix=".png", delete=False) as handle:
+                path = Path(handle.name)
+                handle.write(raw)
         except OSError as e:
             item["save_error"] = str(e)  # surface, but don't lose the call
             continue

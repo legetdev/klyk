@@ -32,8 +32,11 @@ import platform
 import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
+
+from .private_files import open_private, private_directory
 
 
 # Minimum macOS major version klyk is verified against. SkyLight has been
@@ -320,10 +323,9 @@ def check_klyk_dir_writable() -> CheckResult:
     writable, things degrade silently."""
     klyk_dir = Path.home() / ".klyk"
     try:
-        klyk_dir.mkdir(parents=True, exist_ok=True)
-        probe = klyk_dir / ".doctor_probe"
-        probe.write_text("ok\n")
-        probe.unlink()
+        private_directory(klyk_dir)
+        with tempfile.TemporaryFile(dir=klyk_dir) as probe:
+            probe.write(b"ok\n")
         return CheckResult("~/.klyk/ writable", "ok", str(klyk_dir))
     except Exception as e:
         return CheckResult(
@@ -340,7 +342,7 @@ def check_klyk_log_writable() -> CheckResult:
     the parent isn't writable, logging silently degrades."""
     log_path = Path.home() / "klyk.log"
     try:
-        with open(log_path, "a") as f:
+        with open_private(log_path) as f:
             f.write("")  # touch
         return CheckResult("~/klyk.log writable", "ok", str(log_path))
     except Exception as e:

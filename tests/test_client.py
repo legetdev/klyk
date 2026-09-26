@@ -135,6 +135,19 @@ sys.stdin.read()
             with self.subTest(timeout=timeout), self.assertRaises(KlykError):
                 self.client("", timeout=timeout)
 
+    def test_unterminated_response_has_a_memory_limit(self):
+        """A child flooding stdout cannot grow the response buffer indefinitely."""
+        source = '''
+import sys, time
+sys.stdin.readline()
+sys.stdout.write('x' * 200000)
+sys.stdout.flush()
+time.sleep(30)
+'''
+        with mock.patch("klyk.client._MAX_RESPONSE_BYTES", 1024):
+            with self.assertRaisesRegex(KlykError, "response exceeds"):
+                self.client(source).start()
+
 
 if __name__ == "__main__":
     unittest.main()

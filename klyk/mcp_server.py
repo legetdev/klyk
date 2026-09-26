@@ -18,7 +18,6 @@ import uuid
 from collections import deque
 from contextvars import ContextVar
 import jsonschema as _jsonschema
-from logging.handlers import RotatingFileHandler
 
 from dotenv import load_dotenv
 
@@ -29,18 +28,10 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 LOG_PATH = os.path.expanduser("~/klyk.log")
-logging.basicConfig(
-    level=logging.DEBUG,
-    format="%(asctime)s [%(levelname)s] %(message)s",
-    handlers=[RotatingFileHandler(LOG_PATH, maxBytes=10 * 1024 * 1024, backupCount=5, encoding="utf-8")],
-)
-# Defense-in-depth: the log can contain captured stderr — lock it to owner-only.
-# Never let a chmod failure block startup (e.g. unusual filesystem perms).
-try:
-    os.chmod(LOG_PATH, 0o600)
-except OSError:
-    pass
-log = logging.getLogger("klyk")
+from .logs import configure_logging
+from .private_files import open_private
+
+log = configure_logging(LOG_PATH)
 log.info("=" * 60)
 log.info("Klyk MCP server starting")
 
@@ -483,7 +474,7 @@ TOOLS = [
                         "Absolute path (or ~-relative) to write the PNG to. When set, the inline "
                         "image is omitted from the response and the path is returned as saved_path. "
                         "Parent directory must already exist — write failure falls back to inline "
-                        "image and reports save_error. Ignored when detail='slim'."
+                        "image and reports save_error. Owner-only file; links and special files are refused. Ignored when detail='slim'."
                     ),
                 },
             },
@@ -515,7 +506,8 @@ TOOLS = [
                     "type": "string",
                     "description": (
                         "Absolute path (or ~-relative) to write the PNG to. When set, the inline "
-                        "image is omitted from the response and the path is returned as saved_path."
+                        "image is omitted from the response and the path is returned as saved_path. "
+                        "Owner-only file; links and special files are refused with save_error and inline image fallback."
                     ),
                 },
             },
@@ -1721,7 +1713,7 @@ TOOLS = [
                 },
                 "template_b64": {
                     "type": "string",
-                    "description": "Base64 PNG template from get_template (use when template_id is unavailable).",
+                    "description": "Base64 PNG template from get_template (use when template_id is unavailable). Limit: 32 MiB encoded, 8192 pixels per side, 16 megapixels.",
                 },
                 "threshold": {
                     "type": "number",
@@ -1769,7 +1761,7 @@ TOOLS = [
                 },
                 "template_b64": {
                     "type": "string",
-                    "description": "Base64 PNG template from get_template (use when template_id is unavailable).",
+                    "description": "Base64 PNG template from get_template (use when template_id is unavailable). Limit: 32 MiB encoded, 8192 pixels per side, 16 megapixels.",
                 },
                 "present": {
                     "type": "boolean",
@@ -2567,6 +2559,20 @@ async def _resolve_label_in_window(
 # step with a missing/out-of-range arg would otherwise surface as an opaque
 # KeyError/ValueError. No tool schema uses additionalProperties:false, so the
 # keys `run` injects (app, window_id) never trip validation.
+def _validate_finite_arguments(arguments) -> None:
+    """Reject JSON's nonstandard NaN/Infinity values before waits or native calls."""
+    import math
+    pending = [arguments]
+    while pending:
+        value = pending.pop()
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ValueError("Numeric tool arguments must be finite; NaN and Infinity are not accepted.")
+        if isinstance(value, dict):
+            pending.extend(value.values())
+        elif isinstance(value, list):
+            pending.extend(value)
+
+
 def _tool_input_schema(tool: types.Tool) -> dict:
     """Return a tool schema across the MCP SDK 1.x and 2.x field names."""
     schema = getattr(tool, "inputSchema", None)
@@ -2783,6 +2789,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
         validator = _TOOL_VALIDATORS.get(name)
         if validator is None:
             raise ValueError(f"Unknown tool: {name}")
+        _validate_finite_arguments(args)
         validator.validate(args)
         # AX actions and clipboard/window operations also bypass synthesized-event guards.
         if name not in _OWNERSHIP_EXEMPT:
@@ -2875,7 +2882,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 if save_path:
                     resolved = os.path.abspath(os.path.expanduser(save_path))
                     try:
-                        with open(resolved, "wb") as f:
+                        with open_private(resolved, "wb") as f:
                             f.write(base64.b64decode(img_b64))
                         meta["saved_path"] = resolved
                         include_image = False
@@ -3065,7 +3072,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             if save_path and not slim:
                 resolved = os.path.abspath(os.path.expanduser(save_path))
                 try:
-                    with open(resolved, "wb") as f:
+                    with open_private(resolved, "wb") as f:
                         f.write(base64.b64decode(img_b64))
                     meta["saved_path"] = resolved
                     include_image = False
@@ -5519,10 +5526,11 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
     try:
         response = await _dispatch()
     except Exception as e:
-        log.error(f"tool {name}: {type(e).__name__}: {e}\n{traceback.format_exc()}")
-        # Agent-facing payload carries the message only — the Python exception
-        # type and traceback are a technical identifier the agent can't act on
-        # and are already in log.error above.
+        # Validation exceptions include the original input; native exceptions
+        # can also include typed values. Keep only the class in persistent logs.
+        log.error("tool %s failed (%s)", name, type(e).__name__)
+        # The requesting agent receives the actionable error; only its class
+        # belongs in persistent diagnostics, not the original request value.
         response = [types.TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}))]
     finally:
         duration_ms = round((time.monotonic() - start) * 1000)

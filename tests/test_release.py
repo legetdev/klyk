@@ -55,6 +55,8 @@ class ReleaseNameTests(unittest.TestCase):
             "ROADMAP.md",
             "archive/POLARSTAR.md",
             ".env",
+            "klyk/.env.production",
+            ".env.local",
             ".verification/live.json",
         )
         for name in rejected:
@@ -66,6 +68,7 @@ class ReleaseNameTests(unittest.TestCase):
         check_names(
             [
                 "README.md",
+                ".env.example",
                 "SECURITY.md",
                 "klyk/clients.py",
                 "tests/test_release.py",

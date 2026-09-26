@@ -46,7 +46,8 @@ klyk/                   # Runtime package
 ├── updates.py           # Cached update checks and upgrade-command selection
 ├── grader.py            # UI evaluation criteria
 ├── reporter.py          # Verdict evidence aggregation
-├── logs.py              # Bounded, scrubbed application stderr
+├── logs.py              # Bounded, scrubbed stderr and private diagnostic rotation
+├── private_files.py     # Owner-only regular-file writes; reject links and special files
 ├── keycodes.py          # Virtual key code table
 ├── ax_roles.py          # Shared accessibility role catalogs
 └── __init__.py          # Package version
@@ -239,6 +240,8 @@ Historical layering — modules at the top have no dependencies on those below, 
 ---
 
 ## Known Limitations & Risks
+
+Local persistence uses `private_files.py`: screenshots, the ownership token, and every diagnostic log rotation are restricted before writing, and linked or special-file destinations are refused. `klyk-call` uses exclusive random cache filenames under an owner-only capture directory. Persistent logging is attached only to the Klyk logger; MCP protocol debug records and tool exception contents are excluded. App stderr is bounded per record as well as per channel. PNG decoding checks encoded size and dimensions before native allocation; the shell transport caps its response buffer. See `SECURITY.md` for exact limits and the same-user trust boundary.
 
 The single authoritative register of every known limitation and operational risk in klyk. Other docs link here rather than restating it. Ordered by severity: operational risks (things that can fail in production) first, then dependency and maturity caveats, then a pointer to the API-level hard limits tabled below.
 
