@@ -631,6 +631,21 @@ def _cgimage_to_png_bytes(image: int) -> bytes:
     return result
 
 
+def _validated_png_bytes(b64_png: str) -> bytes:
+    """Reject oversized or non-PNG templates before invoking the native decoder."""
+    import struct
+    if len(b64_png) > 32 * 1024 * 1024:
+        raise ValueError("PNG data exceeds the 32 MiB encoded limit; use a smaller template")
+    raw = base64.b64decode(b64_png, validate=True)
+    if (len(raw) < 33 or raw[:8] != b"\x89PNG\r\n\x1a\n"
+            or raw[8:16] != b"\x00\x00\x00\x0dIHDR"):
+        raise ValueError("Template must be a PNG image with a valid header")
+    width, height = struct.unpack(">II", raw[16:24])
+    if not (0 < width <= 8192 and 0 < height <= 8192 and width * height <= 16_000_000):
+        raise ValueError("PNG dimensions exceed the 8192-per-side / 16-megapixel limit")
+    return raw
+
+
 def decode_png_to_rgb_array(b64_png: str):
     """
     Decode a base64 PNG into an (H, W, 3) float64 RGB ndarray.
@@ -646,9 +661,7 @@ def decode_png_to_rgb_array(b64_png: str):
     import numpy as np
     if not _HAS_IMAGEIO:
         raise RuntimeError("ImageIO not available — cannot decode template image")
-    raw = base64.b64decode(b64_png)
-    if not raw:
-        raise ValueError("empty image data")
+    raw = _validated_png_bytes(b64_png)
     src_buf = (ctypes.c_ubyte * len(raw)).from_buffer_copy(raw)
     cfdata = _cf.CFDataCreate(None, src_buf, len(raw))
     if not cfdata:
@@ -663,7 +676,7 @@ def decode_png_to_rgb_array(b64_png: str):
             raise ValueError("image has no decodable frame at index 0")
         w = int(_cg.CGImageGetWidth(ctypes.c_void_p(img)))
         h = int(_cg.CGImageGetHeight(ctypes.c_void_p(img)))
-        if w <= 0 or h <= 0:
+        if w <= 0 or h <= 0 or w > 8192 or h > 8192 or w * h > 16_000_000:
             raise ValueError(f"decoded image has invalid size {w}x{h}")
         cs = _cg.CGColorSpaceCreateDeviceRGB()
         # bytesPerRow=0 → let CG choose (it may pad the stride for alignment);
