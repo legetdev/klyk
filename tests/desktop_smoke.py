@@ -4,10 +4,12 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import json
 import os
 import plistlib
+import re
 from importlib.metadata import version
 from pathlib import Path
 import subprocess
 import sys
+import tempfile
 import threading
 import time
 
@@ -22,7 +24,8 @@ def main():
     """Open one temporary Chrome window and an isolated VS Code profile, then clean up both."""
     parser=argparse.ArgumentParser();parser.add_argument('--output',default='.verification/desktop.json');args=parser.parse_args()
     work=ROOT/'.verification';work.mkdir(exist_ok=True)
-    state={};report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome_window=None;editor=None
+    state={};report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome=None;editor=None
+    chrome_profile=tempfile.TemporaryDirectory(prefix='chrome-profile-',dir=work)
     def check(name, predicate, timeout=4):
         """Wait for an independent outcome without retrying an input action."""
         deadline=time.monotonic()+timeout
@@ -54,14 +57,26 @@ def main():
     try:
         with KlykClient(timeout=45) as c:
             call(c,'take_control')
-            initial=call(c,'list_windows');before={w['window_id'] for w in initial['windows']}
             url=f'http://127.0.0.1:{server.server_port}/'
-            script=f'tell application "Google Chrome"\nset w to make new window\nset bounds of w to {{100, 100, 1000, 800}}\nset URL of active tab of w to "{url}"\nreturn id of w\nend tell'
-            chrome_window=int(subprocess.check_output(['osascript','-e',script],text=True).strip())
+            # The fixture owns this process/profile and needs no additional AppleEvents grant.
+            chrome_app=Path('/Applications/Google Chrome.app')
+            chrome_info=plistlib.loads((chrome_app/'Contents/Info.plist').read_bytes())
+            chrome_executable=chrome_app/'Contents/MacOS'/chrome_info['CFBundleExecutable']
+            existing=subprocess.run(['pgrep','-f','^'+re.escape(str(chrome_executable))+'( |$)'],capture_output=True,text=True)
+            if existing.returncode not in (0,1):raise RuntimeError('Chrome process isolation could not be checked')
+            if existing.stdout.strip():raise RuntimeError('An existing Chrome process prevents isolated app-name targeting')
+            chrome=subprocess.Popen([str(chrome_executable),'--user-data-dir='+chrome_profile.name,
+                                     '--no-first-run','--no-default-browser-check','--new-window',
+                                     '--window-position=100,100','--window-size=900,700',url],
+                                    stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            report['browser_pid']=chrome.pid
+            ready=capture.wait_for_window(chrome.pid,timeout=20)
+            if ready is None:raise RuntimeError('The isolated Chrome fixture window did not appear')
             check('browser fixture loaded',lambda:'count' in state)
-            windows=call(c,'list_windows')['windows'];new=[w for w in windows if w['window_id'] not in before]
-            check('one isolated browser window identified',lambda:len(new)==1)
-            wid=new[0]['window_id']
+            identity=call(c,'list_windows')
+            windows=identity['windows']
+            check('one isolated browser window identified',lambda:identity.get('pid')==chrome.pid and len(windows)==1)
+            wid=windows[0]['window_id']
             observation=call(c,'inspect',window_id=wid)
             check('browser fixture observed',lambda:'Klyk Browser Fixture' in json.dumps(observation))
             call(c,'set_mode',mode='background')
@@ -80,9 +95,12 @@ def main():
             # VS Code is an installed Electron host; separate user/extension data
             # isolates settings and workspace state from any normal editor window.
             document=work/'electron-fixture.txt';document.write_text('Electron baseline')
-            executable=Path('/Applications/Visual Studio Code.app/Contents/MacOS/Code')
+            editor_app=Path('/Applications/Visual Studio Code.app')
+            editor_info=plistlib.loads((editor_app/'Contents/Info.plist').read_bytes())
+            executable=editor_app/'Contents/MacOS'/editor_info['CFBundleExecutable']
             if not executable.is_file():raise RuntimeError('VS Code fixture host is not installed')
-            existing=subprocess.run(['pgrep','-f','^/Applications/Visual Studio Code.app/Contents/MacOS/Code'],capture_output=True,text=True)
+            existing=subprocess.run(['pgrep','-f','^'+re.escape(str(executable))+'( |$)'],capture_output=True,text=True)
+            if existing.returncode not in (0,1):raise RuntimeError('VS Code process isolation could not be checked')
             if existing.stdout.strip():raise RuntimeError('An existing VS Code process prevents isolated app-name targeting')
             editor=subprocess.Popen([str(executable),'--user-data-dir',str(work/'vscode-profile'),'--extensions-dir',str(work/'vscode-extensions'),'--disable-extensions','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--new-window',str(document)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['editor_pid']=editor.pid
@@ -103,13 +121,16 @@ def main():
         report['error']=f'{type(exc).__name__}: {exc}';raise
     finally:
         (ROOT/args.output).write_text(json.dumps(report,indent=2))
-        if chrome_window is not None:
-            subprocess.run(['osascript','-e',f'tell application "Google Chrome" to close window id {chrome_window}'],capture_output=True)
+        if chrome is not None and chrome.poll() is None:
+            chrome.terminate()
+            try:chrome.wait(timeout=5)
+            except subprocess.TimeoutExpired:chrome.kill();chrome.wait()
         if editor is not None and editor.poll() is None:
             editor.terminate()
             try:editor.wait(timeout=5)
             except subprocess.TimeoutExpired:editor.kill();editor.wait()
         server.shutdown();server.server_close()
+        chrome_profile.cleanup()
         computer._restore_pasteboard(clipboard)
         if previous is not None:previous.activateWithOptions_(0)
         (ROOT/args.output).write_text(json.dumps(report,indent=2))
