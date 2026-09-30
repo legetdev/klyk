@@ -1698,7 +1698,7 @@ def ax_focus_save_field(pid: int) -> bool:
         return False
 
 
-def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int] | None = None) -> tuple[int, int, int, int] | None:
+def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int, int] | None = None) -> tuple[int, int, int, int, int] | None:
     """Prove initial chooser scope, or revalidate an already retained field and its exact ancestry."""
     _check_stop()
     app = _appserv.AXUIElementCreateApplication(pid)
@@ -1731,21 +1731,21 @@ def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int] | None =
             owned.append(current)
             if _ax_str(current, b"AXRole") != role or not _ax_matches_pid(current, pid):
                 return None
-        chooser, panel = owned[1:3]
+        chooser, panel, window = owned[1:4]
         if (not _cf.CFEqual(ctypes.c_void_p(current), ctypes.c_void_p(app))
                 or (_ax_str(panel, b"AXDescription") or _ax_str(panel, b"AXTitle")).strip().casefold() not in ("open", "choose")):
             return None
 
         if expected:
             if not all(_cf.CFEqual(ctypes.c_void_p(old), ctypes.c_void_p(new))
-                       for old, new in zip(expected[:3], (field, chooser, panel))):
+                       for old, new in zip((expected[0], expected[1], expected[2], expected[4]), (field, chooser, panel, window))):
                 return None
             # The observed Go to Folder prompt disappears or echoes the path
             # after writing. Re-prove retained focus and ancestry,
             # never infer a replacement field from mutable suggestion content.
             if not expected[3]:
-                result = tuple(_cf.CFRetain(ctypes.c_void_p(pointer)) for pointer in (field, chooser, panel))
-                return (*result, 0)
+                result = tuple(_cf.CFRetain(ctypes.c_void_p(pointer)) for pointer in (field, chooser, panel, window))
+                return (*result[:3], 0, result[3])
 
         state = {"complete": True, "marker": 0}
         seen = set()
@@ -1761,6 +1761,9 @@ def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int] | None =
                 state["complete"] = False
                 return
             seen.add(element)
+            # Completed sibling subtrees release their child arrays. Keep each
+            # seen reference alive so a later element cannot reuse its address.
+            owned.append(_cf.CFRetain(ctypes.c_void_p(element)))
             raw = _ax_read_multi(element, _AX_WALK_ATTRS)
             if raw is None or len(raw) != 5:
                 for pointer in raw or ():
@@ -1826,8 +1829,8 @@ def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int] | None =
         elif (state["marker"] != 1 or len(fields) != 1
                 or not _cf.CFEqual(ctypes.c_void_p(fields[0]), ctypes.c_void_p(field))):
             return None
-        result = tuple(_cf.CFRetain(ctypes.c_void_p(pointer)) for pointer in (field, chooser, panel))
-        return (*result, _cf.CFRetain(ctypes.c_void_p(buttons[0])) if buttons else 0)
+        result = tuple(_cf.CFRetain(ctypes.c_void_p(pointer)) for pointer in (field, chooser, panel, window))
+        return (*result[:3], _cf.CFRetain(ctypes.c_void_p(buttons[0])) if buttons else 0, result[3])
     except RuntimeError:
         raise
     except Exception:
@@ -1862,7 +1865,7 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
     context = _ax_open_path_context(pid)
     if not context:
         return None
-    field, chooser, panel, button = context
+    field, chooser, panel, button, window = context
     attempted = False
     try:
         target, action = 0, b""
@@ -1878,9 +1881,9 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
         _check_stop()
         # Retained identity does not prove current ownership after intervening
         # native reads; check every selected control before the first mutation.
-        if not all(_ax_matches_pid(element, pid) for element in (chooser, panel, button, field) if element):
+        if not all(_ax_matches_pid(element, pid) for element in (chooser, panel, window, button, field) if element):
             return None
-        expected = (field, chooser, panel, button if action == b"AXPress" else 0)
+        expected = (field, chooser, panel, button if action == b"AXPress" else 0, window)
         before_write = _ax_open_path_context(pid, expected)
         try:
             if not before_write:
@@ -1890,7 +1893,7 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
                 if pointer:
                     _cf.CFRelease(ctypes.c_void_p(pointer))
         _check_stop()
-        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, button, target) if element):
+        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, window, button, target) if element):
             return None
         attempted = True
         if not _ax_set_value(field, path) or _ax_str(field, b"AXValue") != path:
@@ -1898,12 +1901,12 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
         if action.decode() not in (_ax_panel_actions(target) or ()):
             raise RuntimeError("The Go to Folder target changed after the path write; inspect the dialog before continuing.")
         _check_stop()
-        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, button, target) if element):
+        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, window, button, target) if element):
             raise RuntimeError("The Go to Folder target changed owner after the path write; inspect the dialog before continuing.")
         refreshed = _ax_open_path_context(pid, expected)
         try:
-            if (not refreshed or not all(_cf.CFEqual(ctypes.c_void_p(old), ctypes.c_void_p(new))
-                                        for old, new in zip(context[:3], refreshed[:3]))
+            if (not refreshed or not all(_cf.CFEqual(ctypes.c_void_p(context[index]), ctypes.c_void_p(refreshed[index]))
+                                        for index in (0, 1, 2, 4))
                     or (action == b"AXPress" and (not refreshed[3]
                         or not _cf.CFEqual(ctypes.c_void_p(button), ctypes.c_void_p(refreshed[3]))
                         or _ax_str(button, b"AXRole") != "AXButton"
@@ -1915,7 +1918,7 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
                 if pointer:
                     _cf.CFRelease(ctypes.c_void_p(pointer))
         _check_stop()
-        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, button, target) if element):
+        if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, window, button, target) if element):
             raise RuntimeError("The Go to Folder target changed owner after the path write; inspect the dialog before continuing.")
         if not _ax_perform_action(target, action):
             raise RuntimeError("The Go to Folder confirmation could not be verified; inspect the dialog before continuing.")

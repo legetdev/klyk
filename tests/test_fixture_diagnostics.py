@@ -33,7 +33,7 @@ class FakeAX:
             _appserv=SimpleNamespace(AXUIElementCreateApplication=self.application,
                 AXUIElementSetMessagingTimeout=self.messaging_timeout,AXUIElementGetPid=self.element_pid,
                 AXUIElementCopyActionNames=self.copy_actions),
-            _cf=SimpleNamespace(CFRelease=self.release,CFArrayGetCount=self.array_count,
+            _cf=SimpleNamespace(CFRetain=self.retain,CFRelease=self.release,CFArrayGetCount=self.array_count,
                 CFArrayGetValueAtIndex=self.array_item),_ax_read_attr_ptr=self.attribute,
             _ax_read_multi=self.attributes,_cftype_to_str=self.text,_decode_pos_size=self.geometry,
             _ax_attr_is_settable=self.settable)
@@ -46,6 +46,10 @@ class FakeAX:
         """Record an owned reference exactly as a Core Foundation copy API would."""
         self.references[pointer]+=1
         return pointer
+
+    def retain(self, pointer):
+        """Keep one native object identity alive until the probe releases its explicit hold."""
+        return self.own(pointer.value)
 
     def value(self, data):
         """Give nonempty and empty scalar values distinct retained Python handles."""
@@ -138,8 +142,69 @@ class FakeAX:
             return fixture_panel_diagnostic(self.computer,123)
 
 
+class RecycledChildAX(FakeAX):
+    """Reuse a completed sibling leaf address only when no owned reference keeps it alive."""
+
+    def __init__(self):
+        """Place the selected row after a short subtree whose borrowed leaf can be recycled."""
+        super().__init__()
+        self.reused=False
+        self.nodes[3]['AXChildren']=[20,8]
+        self.nodes[20]={'AXRole':'AXGroup','AXChildren':[90],'AXParent':3}
+        self.nodes[90]={'AXRole':'AXStaticText','AXValue':'earlier generated label','AXParent':20}
+        self.nodes[8]['AXChildren']=[]
+
+    def value(self, data):
+        """A copied child array owns its borrowed node references until the array is released."""
+        pointer=super().value(data)
+        if isinstance(data,list) and all(child in self.nodes for child in data):
+            self.array_children[pointer]=[self.own(child) for child in data]
+        return pointer
+
+    def attributes(self, element, names):
+        """Allocate a later Cell/List/path subtree at the old leaf address if it has been freed."""
+        if element==8 and b'AXChildren' in names:
+            pointer=90 if self.references[90]==0 else 91
+            self.reused=pointer==90
+            self.nodes[8]['AXChildren']=[pointer]
+            self.nodes[pointer]={'AXRole':'AXCell','AXSelected':'true','AXChildren':[92],'AXParent':8}
+            self.nodes[92]={'AXRole':'AXList','AXChildren':[93],'AXParent':pointer}
+            self.nodes[93]={'AXRole':'AXStaticText','AXValue':'/tmp/generated.txt','AXParent':92}
+        return super().attributes(element,names)
+
+
 class FixtureDiagnosticTests(unittest.TestCase):
     """Reject unbounded, mutating, lossy, and leaking failure evidence without local desktop effects."""
+
+    def test_completed_sibling_cannot_hide_selected_cell_at_a_recycled_address(self):
+        """Selected child evidence survives valid native allocator reuse with no cap or timeout."""
+        fake=RecycledChildAX();report=fake.run();elements=report['raw_panel_elements']
+        row=next(item for item in elements if item['AXRole']=='AXRow')
+        self.assertEqual(row['children_count'],1)
+        self.assertFalse(row['children_truncated'])
+        self.assertTrue(any(item['AXRole']=='AXCell' for item in elements))
+        self.assertTrue(any(item['AXRole']=='AXList' for item in elements))
+        self.assertTrue(any(item.get('AXValue')=='/tmp/generated.txt' for item in elements))
+        self.assertFalse(report['raw_node_limit_reached'])
+        self.assertFalse(report['deadline_reached'])
+        self.assertNotIn('raw_probe_error',report)
+        self.assertFalse(any(fake.references.values()))
+
+    def test_late_decode_failure_releases_every_visited_element(self):
+        """A failure after several sibling visits releases holds and redacts its private message."""
+        fake=RecycledChildAX();original=fake.computer._cftype_to_str
+
+        def decode(pointer):
+            """Fail only while describing the later selected child, after visiting the earlier subtree."""
+            if fake.values[pointer]=='AXCell':
+                raise ValueError('private-late-diagnostic-sentinel')
+            return original(pointer)
+
+        fake.computer._cftype_to_str=decode
+        report=fake.run()
+        self.assertEqual(report['raw_probe_error'],'ValueError')
+        self.assertNotIn('private-late-diagnostic-sentinel',str(report))
+        self.assertFalse(any(fake.references.values()))
 
     def test_raw_empty_focus_service_pid_and_parent_scope_are_preserved(self):
         """An empty service-owned field still retains raw focus, safe writability, and real parent scope."""

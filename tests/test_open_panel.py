@@ -157,9 +157,9 @@ class OpenPanelTests(unittest.TestCase):
                 self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"),
                                           ("AXPress" if confirmation == "button" else "AXConfirm", target)])
 
-    def test_replacement_field_or_sheet_after_write_is_never_confirmed(self):
-        """Matching roles, values and geometry cannot authorize a different retained field or sheet."""
-        for replaced in (5, 4, 3):
+    def test_replacement_field_sheet_or_window_after_write_is_never_confirmed(self):
+        """Matching roles, values and geometry cannot authorize a different retained field, sheet or window."""
+        for replaced in (5, 4, 3, 2):
             with self.subTest(replaced=replaced):
                 ns, nodes, writes, references = open_namespace()
                 setter = ns["_ax_set_value"]
@@ -172,8 +172,8 @@ class OpenPanelTests(unittest.TestCase):
                         nodes[1]["focused"] = 12
                         nodes[4]["children"] = [12 if child == 5 else child for child in nodes[4]["children"]]
                     else:
-                        nodes[5 if replaced == 4 else 4]["parent"] = 12
-                        parent = 3 if replaced == 4 else 2
+                        nodes[{4: 5, 3: 4, 2: 3}[replaced]]["parent"] = 12
+                        parent = {4: 3, 3: 2, 2: 1}[replaced]
                         nodes[parent]["children"] = [12 if child == replaced else child for child in nodes[parent]["children"]]
                     return True
 
@@ -219,7 +219,7 @@ class OpenPanelTests(unittest.TestCase):
 
     def test_selected_owner_changes_during_action_read_block_first_write(self):
         """Earlier scope identity cannot authorize a field write after native action metadata changes ownership."""
-        for element in (4, 5, 9):
+        for element in (2, 3, 4, 5, 9):
             with self.subTest(element=element):
                 ns, nodes, writes, references = open_namespace()
                 if element == 9:
@@ -239,7 +239,7 @@ class OpenPanelTests(unittest.TestCase):
 
     def test_foreign_owner_after_path_write_prevents_confirmation(self):
         """A changed retained field, chooser, outer panel or Go-button owner blocks confirmation."""
-        for element in (3, 4, 5, 9):
+        for element in (2, 3, 4, 5, 9):
             with self.subTest(element=element):
                 ns, nodes, writes, references = open_namespace()
                 if element == 9:
@@ -260,7 +260,7 @@ class OpenPanelTests(unittest.TestCase):
 
     def test_confirmation_owner_is_rechecked_after_refreshed_action_read(self):
         """A last action-name read cannot transfer the selected native confirmation target unnoticed."""
-        for element in (4, 5, 9):
+        for element in (2, 3, 4, 5, 9):
             with self.subTest(element=element):
                 ns, nodes, writes, references = open_namespace()
                 if element != 5:
@@ -364,6 +364,48 @@ class OpenPanelTests(unittest.TestCase):
         ns, nodes, writes, references = open_namespace()
         nodes[8]["children"] = [11] * 10_000
         self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
+
+    def test_seen_reference_lifetime_prevents_recycled_address_skipping(self):
+        """Released sibling arrays cannot recycle a seen label address into an unseen writable field or foreign node."""
+        for foreign in (False, True):
+            with self.subTest(foreign=foreign):
+                ns, nodes, writes, references = open_namespace()
+                nodes[4]['children'] = [6, 20, 21, 5]
+                nodes[20] = {'role': 'AXGroup', 'parent': 4, 'children': [7]}
+                nodes[21] = {'role': 'AXGroup', 'parent': 4, 'children': []}
+                nodes[7] = {'role': 'AXStaticText', 'parent': 20, 'AXValue': 'Ordinary layout text'}
+                arrays = {}
+                allocated = []
+                read = ns['_ax_read_multi']
+                release = ns['_cf'].CFRelease.side_effect
+
+                def multiple(element, attributes):
+                    """A copied child array owns its borrowed elements; a later array can reuse only a dead address."""
+                    if element == 21:
+                        pointer = 7 if not references[7] else 12
+                        allocated.append(pointer)
+                        nodes[pointer] = {'role': 'AXTextField', 'parent': 21, 'writable': True,
+                                          'AXValue': '', 'pid': 456 if foreign else 123}
+                        nodes[21]['children'] = [pointer]
+                    raw = read(element, attributes)
+                    children = raw[4]
+                    if children:
+                        arrays[children] = list(nodes[element]['children'])
+                        references.update(arrays[children])
+                    return raw
+
+                def release_array(pointer):
+                    """Drop borrowed node lifetimes when the last copied array releases, preserving explicit retains."""
+                    release(pointer)
+                    if not references[pointer.value]:
+                        for child in arrays.pop(pointer.value, []):
+                            references.subtract([child])
+
+                ns['_ax_read_multi'] = multiple
+                ns['_cf'].CFRelease.side_effect = release_array
+                self.assertIsNone(self.run_helper(ns, references))
+                self.assertEqual(allocated, [12])
+                self.assertEqual(writes, [])
 
     def test_unsupported_confirm_refuses_before_path_write(self):
         """No advertised action means no speculative path edit or global Return fallback."""

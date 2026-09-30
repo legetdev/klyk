@@ -209,7 +209,9 @@ def fixture_panel_diagnostic(computer, pid):
                 return {'element_pid':owner,'scope_rejected':'foreign_or_unverified_owner'}
             if time.monotonic()>=deadline:
                 return None
-            seen.add(button)
+            if button not in seen:
+                computer._cf.CFRetain(ctypes.c_void_p(button))
+                seen.add(button)
             raw=computer._ax_read_multi(button,attributes)
             try:
                 if not raw:
@@ -226,6 +228,9 @@ def fixture_panel_diagnostic(computer, pid):
         """Stay within the owned app tree, 400 nodes, depth 30, and the shared read deadline."""
         if element in seen or len(seen)>=400 or depth>30 or time.monotonic()>=deadline:
             return
+        # Borrowed descendants can be freed after a completed sibling branch;
+        # keep visited objects alive so a recycled address cannot hide a later node.
+        computer._cf.CFRetain(ctypes.c_void_p(element))
         seen.add(element)
         if element_pid(element)!=pid or time.monotonic()>=deadline:
             return
@@ -293,7 +298,7 @@ def fixture_panel_diagnostic(computer, pid):
     except Exception as error:
         result['raw_probe_error']=type(error).__name__
     finally:
-        release((focused,app))
+        release((*seen,focused,app))
     try:
         remaining=deadline-time.monotonic()
         if remaining>0:
