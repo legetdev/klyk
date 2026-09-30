@@ -13,6 +13,12 @@ import subprocess
 import tempfile
 import time
 
+from .image_bounds import (
+    png_dimensions,
+    validate_image_dimensions as _validate_image_dimensions,
+    validated_png_bytes as _validated_png_bytes,
+)
+
 # ---------------------------------------------------------------------------
 # Framework loading
 # ---------------------------------------------------------------------------
@@ -141,6 +147,10 @@ _cg.CGImageGetBitmapInfo.restype = ctypes.c_uint32
 _cg.CGImageGetBitmapInfo.argtypes = [ctypes.c_void_p]
 _cg.CGImageGetAlphaInfo.restype = ctypes.c_uint32
 _cg.CGImageGetAlphaInfo.argtypes = [ctypes.c_void_p]
+_cg.CGImageGetBitsPerPixel.restype = ctypes.c_ulong
+_cg.CGImageGetBitsPerPixel.argtypes = [ctypes.c_void_p]
+_cg.CGImageGetBitsPerComponent.restype = ctypes.c_ulong
+_cg.CGImageGetBitsPerComponent.argtypes = [ctypes.c_void_p]
 
 if _HAS_IMAGEIO:
     _imageio.CGImageDestinationCreateWithData.restype = ctypes.c_void_p
@@ -571,7 +581,7 @@ def get_scale_factor() -> float:
             pass
     try:
         result = subprocess.run(
-            ["system_profiler", "SPDisplaysDataType"],
+            ["/usr/sbin/system_profiler", "SPDisplaysDataType"],
             capture_output=True, text=True, timeout=10
         )
         output = result.stdout.lower()
@@ -612,26 +622,16 @@ def _cgimage_to_png_bytes(image: int) -> bytes:
         _cf.CFRelease(ctypes.c_void_p(data))
         raise RuntimeError("CGImageDestinationFinalize failed")
 
-    length   = _cf.CFDataGetLength(ctypes.c_void_p(data))
-    byte_ptr = _cf.CFDataGetBytePtr(ctypes.c_void_p(data))
-    result   = bytes(ctypes.string_at(byte_ptr, length))
-    _cf.CFRelease(ctypes.c_void_p(data))
-    return result
-
-
-def _validated_png_bytes(b64_png: str) -> bytes:
-    """Reject oversized or non-PNG templates before invoking the native decoder."""
-    import struct
-    if len(b64_png) > 32 * 1024 * 1024:
-        raise ValueError("PNG data exceeds the 32 MiB encoded limit; use a smaller template")
-    raw = base64.b64decode(b64_png, validate=True)
-    if (len(raw) < 33 or raw[:8] != b"\x89PNG\r\n\x1a\n"
-            or raw[8:16] != b"\x00\x00\x00\x0dIHDR"):
-        raise ValueError("Template must be a PNG image with a valid header")
-    width, height = struct.unpack(">II", raw[16:24])
-    if not (0 < width <= 8192 and 0 < height <= 8192 and width * height <= 16_000_000):
-        raise ValueError("PNG dimensions exceed the 8192-per-side / 16-megapixel limit")
-    return raw
+    try:
+        length = _cf.CFDataGetLength(ctypes.c_void_p(data))
+        if length > 24 * 1024 * 1024:
+            raise ValueError("PNG output exceeds the supported size; use a smaller window or crop.")
+        byte_ptr = _cf.CFDataGetBytePtr(ctypes.c_void_p(data))
+        if length < 33 or not byte_ptr:
+            raise RuntimeError("PNG encoding produced no valid image data.")
+        return bytes(ctypes.string_at(byte_ptr, length))
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(data))
 
 
 def decode_png_to_rgb_array(b64_png: str):
@@ -664,8 +664,7 @@ def decode_png_to_rgb_array(b64_png: str):
             raise ValueError("image has no decodable frame at index 0")
         w = int(_cg.CGImageGetWidth(ctypes.c_void_p(img)))
         h = int(_cg.CGImageGetHeight(ctypes.c_void_p(img)))
-        if w <= 0 or h <= 0 or w > 8192 or h > 8192 or w * h > 16_000_000:
-            raise ValueError(f"decoded image has invalid size {w}x{h}")
+        _validate_image_dimensions(w, h)
         cs = _cg.CGColorSpaceCreateDeviceRGB()
         # bytesPerRow=0 → let CG choose (it may pad the stride for alignment);
         # we read the real stride back via CGBitmapContextGetBytesPerRow.
@@ -714,12 +713,14 @@ def encode_rgb_array_to_png_b64(rgb_uint8) -> str:
     import numpy as np
     if not _HAS_IMAGEIO:
         raise RuntimeError("ImageIO not available — cannot encode template image")
-    arr = np.ascontiguousarray(rgb_uint8, dtype=np.uint8)
+    arr = np.asarray(rgb_uint8)
     if arr.ndim != 3 or arr.shape[2] != 3:
         raise ValueError(f"expected an (H, W, 3) RGB array, got shape {arr.shape}")
     h, w = arr.shape[:2]
-    if w <= 0 or h <= 0:
-        raise ValueError(f"cannot encode empty image {w}x{h}")
+    _validate_image_dimensions(w, h)
+    if arr.dtype != np.uint8:
+        raise ValueError("RGB pixels must use uint8 values")
+    arr = np.ascontiguousarray(arr)
     bgrx = np.empty((h, w, 4), dtype=np.uint8)
     bgrx[:, :, 0] = arr[:, :, 2]  # B
     bgrx[:, :, 1] = arr[:, :, 1]  # G
@@ -772,6 +773,7 @@ def _resize_cgimage(image: int, target_w: int, target_h: int) -> int:
     Returns the resized CGImageRef (caller must CFRelease), or the
     original on failure.
     """
+    _validate_image_dimensions(target_w, target_h)
     cs = _cg.CGColorSpaceCreateDeviceRGB()
     if not cs:
         return image
@@ -803,6 +805,7 @@ def _take_screenshot_cg(
     A failed window capture never falls back to the desktop.
     Returns (base64_png, logical_width, logical_height).
     """
+    _validate_image_dimensions(logical_width, logical_height)
     rect = CGRect(
         x=float(win_x), y=float(win_y),
         width=float(logical_width), height=float(logical_height),
@@ -857,6 +860,10 @@ def _capture_window_image(window_id: int, win_x: int, win_y: int, win_w: int, wi
     window's content is captured. Returns a CGImage ref (caller CFReleases)
     or 0 on failure.
     """
+    if (isinstance(window_id, bool) or not isinstance(window_id, int)
+            or not 1 <= window_id <= 0xffffffff):
+        raise ValueError('Window capture requires a valid positive window ID.')
+    _validate_image_dimensions(win_w, win_h)
     rect = CGRect(
         x=float(win_x), y=float(win_y),
         width=float(win_w), height=float(win_h),
@@ -867,6 +874,48 @@ def _capture_window_image(window_id: int, win_x: int, win_y: int, win_w: int, wi
         int(window_id),
         kCGWindowImageBoundsIgnoreFraming,
     )
+
+
+def _pixel_layout(raw_image: int) -> tuple[int, int, int, int, int, int]:
+    """Reject unknown pixel formats instead of guessing strides and channel positions."""
+    width = int(_cg.CGImageGetWidth(ctypes.c_void_p(raw_image)))
+    height = int(_cg.CGImageGetHeight(ctypes.c_void_p(raw_image)))
+    bpr = int(_cg.CGImageGetBytesPerRow(ctypes.c_void_p(raw_image)))
+    info = int(_cg.CGImageGetBitmapInfo(ctypes.c_void_p(raw_image)))
+    alpha = info & 0x1f
+    byte_order = info & 0x7000
+    if (width <= 0 or height <= 0 or bpr < width * 4
+            or int(_cg.CGImageGetBitsPerPixel(ctypes.c_void_p(raw_image))) != 32
+            or int(_cg.CGImageGetBitsPerComponent(ctypes.c_void_p(raw_image))) != 8
+            or info & 0x100 or alpha not in (1, 2, 3, 4, 5, 6)
+            or byte_order not in (0, 0x2000, 0x4000)):
+        raise RuntimeError("Window pixel format is unsupported; use screenshot for visual inspection.")
+    alpha_first = alpha in (2, 4, 6)
+    little_endian = byte_order == 0x2000
+    if alpha_first:
+        offsets = (2, 1, 0) if little_endian else (1, 2, 3)
+    else:
+        offsets = (3, 2, 1) if little_endian else (0, 1, 2)
+    return width, height, bpr, *offsets
+
+
+def _pixel_buffer(raw_image: int, width: int, height: int, bpr: int):
+    """Keep provider ownership and validate its length before constructing a ctypes view."""
+    provider = _cg.CGImageGetDataProvider(ctypes.c_void_p(raw_image))
+    if not provider:
+        raise RuntimeError("Window pixel data is unavailable; capture the window again.")
+    data = _cg.CGDataProviderCopyData(ctypes.c_void_p(provider))
+    if not data:
+        raise RuntimeError("Window pixel data is unavailable; capture the window again.")
+    try:
+        length = int(_cf.CFDataGetLength(ctypes.c_void_p(data)))
+        ptr = _cf.CFDataGetBytePtr(ctypes.c_void_p(data))
+        if not ptr or length < (height - 1) * bpr + width * 4:
+            raise RuntimeError("Window pixel data is incomplete; capture the window again.")
+        return data, (ctypes.c_uint8 * length).from_address(int(ptr))
+    except BaseException:
+        _cf.CFRelease(ctypes.c_void_p(data))
+        raise
 
 
 def _read_pixels_from_cgimage(raw_image: int, points_xy: list[tuple[int, int]]) -> list[tuple[int, int, int]]:
@@ -887,11 +936,7 @@ def _read_pixels_from_cgimage(raw_image: int, points_xy: list[tuple[int, int]]) 
     Returns: list of (r, g, b) tuples (0-255 each), one per input point, in
              the same order. Off-image points raise RuntimeError up-front.
     """
-    width  = int(_cg.CGImageGetWidth(ctypes.c_void_p(raw_image)))
-    height = int(_cg.CGImageGetHeight(ctypes.c_void_p(raw_image)))
-    bpr    = int(_cg.CGImageGetBytesPerRow(ctypes.c_void_p(raw_image)))
-    info   = int(_cg.CGImageGetBitmapInfo(ctypes.c_void_p(raw_image)))
-    alpha  = info & 0x1f  # kCGImageAlphaInfoMask = 0x1f
+    width, height, bpr, r_off, g_off, b_off = _pixel_layout(raw_image)
 
     # Validate all coords up-front so partial work isn't done on a bad request.
     for (x, y) in points_xy:
@@ -901,42 +946,8 @@ def _read_pixels_from_cgimage(raw_image: int, points_xy: list[tuple[int, int]]) 
                 f"bounds ({width}×{height})."
             )
 
-    # Decide where R, G, B live in each 4-byte pixel. We support the two
-    # formats the macOS window-content path actually produces:
-    # (a) Premultiplied-First or NoneSkip-First + 32Little → memory order BGRA
-    # (b) Premultiplied-First or NoneSkip-First + 32Big    → memory order ARGB
-    # Anything else is rare for window captures; we still pick the best guess
-    # and label the path so a future bug is easier to spot.
-    byte_order = info & 0x7000  # kCGBitmapByteOrderMask = 0x7000
-    # 0x2000 = 32Little, 0x4000 = 32Big
-    little_endian = (byte_order == 0x2000)
-    # alpha "first" in pixel-value order (PremultipliedFirst=2, AlphaFirst=4, NoneSkipFirst=6)
-    alpha_first = alpha in (2, 4, 6)
-
-    if alpha_first and little_endian:
-        # Pixel value 0xAARRGGBB stored little-endian → memory bytes [BB, GG, RR, AA]
-        r_off, g_off, b_off = 2, 1, 0
-    elif alpha_first and not little_endian:
-        # Big-endian ARGB → memory bytes [AA, RR, GG, BB]
-        r_off, g_off, b_off = 1, 2, 3
-    elif not alpha_first and little_endian:
-        # Pixel value 0xBBGGRRAA stored little-endian → [AA, RR, GG, BB]
-        # (PremultipliedLast/AlphaLast/NoneSkipLast = RGBA in pixel-component order)
-        r_off, g_off, b_off = 1, 2, 3
-    else:
-        # Big-endian RGBA → memory bytes [RR, GG, BB, AA]
-        r_off, g_off, b_off = 0, 1, 2
-
-    prov = _cg.CGImageGetDataProvider(ctypes.c_void_p(raw_image))
-    if not prov:
-        raise RuntimeError("CGImageGetDataProvider returned NULL")
-    data = _cg.CGDataProviderCopyData(ctypes.c_void_p(prov))
-    if not data:
-        raise RuntimeError("CGDataProviderCopyData returned NULL")
+    data, buf = _pixel_buffer(raw_image, width, height, bpr)
     try:
-        length = int(_cf.CFDataGetLength(ctypes.c_void_p(data)))
-        ptr    = _cf.CFDataGetBytePtr(ctypes.c_void_p(data))
-        buf    = (ctypes.c_uint8 * length).from_address(int(ptr))
         out: list[tuple[int, int, int]] = []
         for (x, y) in points_xy:
             off = y * bpr + x * 4
@@ -953,9 +964,12 @@ def _image_pixel_scale(raw_image: int, win_w: int, win_h: int) -> float:
     multiplier from logical→pixel coords. Always 1.0 or 2.0 on current Macs.
     """
     iw = int(_cg.CGImageGetWidth(ctypes.c_void_p(raw_image)))
-    if iw == win_w * 2:
+    ih = int(_cg.CGImageGetHeight(ctypes.c_void_p(raw_image)))
+    if iw == win_w * 2 and ih == win_h * 2:
         return 2.0
-    return 1.0
+    if iw == win_w and ih == win_h:
+        return 1.0
+    raise RuntimeError("Window pixel dimensions changed during capture; inspect the window again.")
 
 
 def get_pixel(
@@ -1085,11 +1099,7 @@ def _read_rect_medians_from_cgimage(
     raw_image: int,
     rects_xywh: list[tuple[int, int, int, int]],
 ) -> list[tuple[int, int, int]]:
-    width  = int(_cg.CGImageGetWidth(ctypes.c_void_p(raw_image)))
-    height = int(_cg.CGImageGetHeight(ctypes.c_void_p(raw_image)))
-    bpr    = int(_cg.CGImageGetBytesPerRow(ctypes.c_void_p(raw_image)))
-    info   = int(_cg.CGImageGetBitmapInfo(ctypes.c_void_p(raw_image)))
-    alpha  = info & 0x1f
+    width, height, bpr, r_off, g_off, b_off = _pixel_layout(raw_image)
 
     # Validate every rect first so partial work isn't done on a bad request.
     for (x, y, w, h) in rects_xywh:
@@ -1103,29 +1113,8 @@ def _read_rect_medians_from_cgimage(
                 f"bounds ({width}×{height})."
             )
 
-    # Channel offsets — same byte-order resolution as _read_pixels_from_cgimage.
-    byte_order = info & 0x7000
-    little_endian = (byte_order == 0x2000)
-    alpha_first = alpha in (2, 4, 6)
-    if alpha_first and little_endian:
-        r_off, g_off, b_off = 2, 1, 0
-    elif alpha_first and not little_endian:
-        r_off, g_off, b_off = 1, 2, 3
-    elif not alpha_first and little_endian:
-        r_off, g_off, b_off = 1, 2, 3
-    else:
-        r_off, g_off, b_off = 0, 1, 2
-
-    prov = _cg.CGImageGetDataProvider(ctypes.c_void_p(raw_image))
-    if not prov:
-        raise RuntimeError("CGImageGetDataProvider returned NULL")
-    data = _cg.CGDataProviderCopyData(ctypes.c_void_p(prov))
-    if not data:
-        raise RuntimeError("CGDataProviderCopyData returned NULL")
+    data, buf = _pixel_buffer(raw_image, width, height, bpr)
     try:
-        length = int(_cf.CFDataGetLength(ctypes.c_void_p(data)))
-        ptr    = _cf.CFDataGetBytePtr(ctypes.c_void_p(data))
-        buf    = (ctypes.c_uint8 * length).from_address(int(ptr))
         out: list[tuple[int, int, int]] = []
         target_per_axis = 16
         for (x, y, w, h) in rects_xywh:
@@ -1227,6 +1216,14 @@ def take_screenshot(
     Retina output is normalized to the caller's logical coordinates. Region or
     display capture is available only when no window ID was supplied.
     """
+    if window_id is not None and (
+        isinstance(window_id, bool) or not isinstance(window_id, int) or not 1 <= window_id <= 0xffffffff
+    ):
+        raise ValueError("Window capture requires a valid positive window ID.")
+    if logical_width is not None or logical_height is not None:
+        if logical_width is None or logical_height is None:
+            raise ValueError("Window capture requires both width and height.")
+        _validate_image_dimensions(logical_width, logical_height)
     if settle_ms > 0:
         time.sleep(settle_ms / 1000)
 
@@ -1252,16 +1249,16 @@ def take_screenshot(
 
     try:
         if window_id:
-            cmd = ["screencapture", "-x", "-t", "png", "-l", str(window_id), "-o", raw_path]
+            cmd = ["/usr/sbin/screencapture", "-x", "-t", "png", "-l", str(window_id), "-o", raw_path]
         elif win_x is not None and win_y is not None and logical_width and logical_height:
             region = f"{int(win_x)},{int(win_y)},{int(logical_width)},{int(logical_height)}"
-            cmd = ["screencapture", "-x", "-t", "png", "-R", region, raw_path]
+            cmd = ["/usr/sbin/screencapture", "-x", "-t", "png", "-R", region, raw_path]
         else:
-            cmd = ["screencapture", "-x", "-t", "png", raw_path]
+            cmd = ["/usr/sbin/screencapture", "-x", "-t", "png", raw_path]
 
         result = subprocess.run(cmd, capture_output=True, timeout=10)
 
-        if result.returncode != 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) < 100:
+        if result.returncode != 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) < 33:
             # Never widen a failed window/region request to the whole desktop:
             # that exposes unrelated content and invalidates window coordinates.
             raise RuntimeError(
@@ -1271,7 +1268,7 @@ def take_screenshot(
 
         if logical_width and logical_height:
             subprocess.run(
-                ["sips", "-z", str(logical_height), str(logical_width), raw_path, "--out", out_path],
+                ["/usr/bin/sips", "-z", str(logical_height), str(logical_width), raw_path, "--out", out_path],
                 capture_output=True, timeout=10, check=True
             )
             final_path = out_path
@@ -1279,7 +1276,7 @@ def take_screenshot(
         else:
             scale = get_scale_factor()
             info = subprocess.run(
-                ["sips", "-g", "pixelWidth", "-g", "pixelHeight", raw_path],
+                ["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", raw_path],
                 capture_output=True, text=True, timeout=10, check=True
             )
             pw, ph = _parse_sips_dimensions(info.stdout)
@@ -1287,7 +1284,7 @@ def take_screenshot(
             final_h = int(ph / scale)
             if scale > 1.0:
                 subprocess.run(
-                    ["sips", "-Z", str(max(final_w, final_h)), raw_path, "--out", out_path],
+                    ["/usr/bin/sips", "-Z", str(max(final_w, final_h)), raw_path, "--out", out_path],
                     capture_output=True, timeout=10, check=True
                 )
                 final_path = out_path
@@ -1295,11 +1292,13 @@ def take_screenshot(
                 final_path = raw_path
 
         with open(final_path, "rb") as f:
-            data = f.read()
-        if not data.startswith(b"\x89PNG\r\n\x1a\n"):
-            raise RuntimeError("Screenshot conversion produced no valid PNG image.")
-
-        return base64.b64encode(data).decode("utf-8"), final_w, final_h
+            data = f.read(24 * 1024 * 1024 + 1)
+        if len(data) > 24 * 1024 * 1024:
+            raise ValueError("PNG output exceeds the supported size; use a smaller window or crop.")
+        encoded = base64.b64encode(data).decode("ascii")
+        if png_dimensions(encoded) != (final_w, final_h):
+            raise RuntimeError("Screenshot conversion changed its dimensions; inspect the window again.")
+        return encoded, final_w, final_h
 
     finally:
         for p in (raw_path, out_path):

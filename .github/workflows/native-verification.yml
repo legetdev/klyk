@@ -36,6 +36,7 @@ jobs:
     env:
       KLYK_UPDATE_CHECK: '0'
       KLYK_RUNNER_LABEL: ${{ matrix.os }}
+      KLYK_FIXTURE_COMPACT: ${{ (github.event_name == 'pull_request' || inputs.full_suite) && '1' || '0' }}
       MCP_MAJOR: ${{ matrix.mcp }}
       MCP_SPEC: ${{ matrix.mcp == 1 && 'mcp>=1.28.1,<2' || 'mcp>=2,<3' }}
       FULL_SUITE: ${{ github.event_name == 'pull_request' || inputs.full_suite }}
@@ -49,9 +50,7 @@ jobs:
       - name: Read existing runner permissions and desktop dimensions
         shell: bash
         run: |
-          probe_args=()
-          if [[ "$FULL_SUITE" == true ]]; then probe_args+=(--full-layout); fi
-          python -P -B tests/native_runner_probe.py "${probe_args[@]}"
+          python -P -B tests/native_runner_probe.py
       - name: Fresh install of the candidate and selected supported MCP SDK
         if: env.FULL_SUITE == 'true'
         shell: bash
@@ -61,7 +60,14 @@ jobs:
           printf '%s\n' "$RUNNER_TEMP/klyk-native-venv/bin" >> "$GITHUB_PATH"
       - name: Recheck permissions with the fresh-installed interpreter before any UI
         if: env.FULL_SUITE == 'true'
-        run: python -P -B tests/native_runner_probe.py --full-layout --output .verification/installed-runner-probe.json
+        run: python -P -B tests/native_runner_probe.py --output .verification/installed-runner-probe.json
+      - name: Generated native image coordinate diagnostic
+        if: env.FULL_SUITE == 'true'
+        continue-on-error: true
+        run: python -B tests/native_image_smoke.py --output .verification/native-image.json
+      - name: Require the existing native fixture layout before any desktop suite
+        if: env.FULL_SUITE == 'true'
+        run: python -P -B tests/native_runner_probe.py --full-layout --output .verification/layout-probe.json
       - name: Fresh-installed doctor and real stdio connection
         if: env.FULL_SUITE == 'true'
         shell: bash
@@ -73,7 +79,7 @@ jobs:
           sys.path.insert(0, str(root / 'tests'))
           from release_check import fingerprint
           import klyk
-          if not pathlib.Path(klyk.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix)):
+          if not pathlib.Path(klyk.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()):
               raise SystemExit('The smoke check must use the fresh-installed candidate distribution.')
           environment = {'mcp': importlib.metadata.version('mcp'), 'python': sys.version,
                          'macos': platform.mac_ver()[0], 'architecture': platform.machine(),
@@ -164,6 +170,13 @@ jobs:
       - name: Existing Chrome and Electron suite with disposable profiles
         if: env.FULL_SUITE == 'true'
         run: python -B tests/desktop_smoke.py --output .verification/desktop.json
+      - name: Existing overlapping-window background safety suite
+        if: env.FULL_SUITE == 'true'
+        shell: bash
+        run: |
+          # Fetch only the immutable in-repository benchmark baseline needed by this suite.
+          git fetch --no-tags --depth=1 origin 355b32fea8a847680e4e65540cd4bb598a9f1411
+          python -B tests/background_smoke.py --output .verification/background.json
       - name: Validate exact source, real assertions, SDK, and full tool coverage
         if: env.FULL_SUITE == 'true'
         shell: bash
@@ -178,6 +191,9 @@ jobs:
               report = json.loads(path.read_text())
               checks = validate_report(report, str(path), fingerprint())
               validate_full_report(report, str(path), checks, native=native)
+          path = pathlib.Path('.verification/background.json')
+          # Background-only outcomes supplement full acceptance without replacing native or desktop coverage.
+          validate_report(json.loads(path.read_text()), str(path), fingerprint())
           PY
       - name: Preserve bounded fixture evidence in ordinary logs without paid artifact storage
         if: always()
@@ -193,7 +209,7 @@ jobs:
           identity = {'fingerprint': fingerprint(), 'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                       'mcp': sdk, 'requested_mcp_major': os.environ['MCP_MAJOR'], 'macos': platform.mac_ver()[0],
                       'architecture': platform.machine(), 'runner_label': os.environ['KLYK_RUNNER_LABEL']}
-          for stem in ('runner-probe', 'installed-runner-probe', 'doctor', 'stdio', 'vscode-fixture', 'native', 'desktop'):
+          for stem in ('runner-probe', 'installed-runner-probe', 'layout-probe', 'doctor', 'stdio', 'native-image', 'vscode-fixture', 'native', 'desktop', 'background'):
               path = pathlib.Path('.verification') / (stem + '.json')
               if not path.is_file(): continue
               raw = path.read_bytes()

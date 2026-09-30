@@ -118,7 +118,7 @@ Klyk writes OpenCode's global local-MCP entry, so it is available in every works
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 
 ```json
-{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-m", "klyk.mcp_server"] } } }
+{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "" } } } }
 ```
 
 Permissions, control ownership, and `klyk doctor` work identically regardless of which client launches klyk.
@@ -147,7 +147,7 @@ echo '{"tool":"screen_info","args":{}}' | klyk-call --batch   # many calls, one 
 
 **Control ownership:** a dead driver is reclaimed automatically. Taking over from a live driver requires user authorization. A standalone `klyk-call --tool take_control` ends with that invocation, so it cannot grant control to later shell commands. Use a persistent native MCP connection for interactive workflows.
 
-**Vision over the shell.** When a tool returns a screenshot (`screenshot`, `inspect`, `verdict`, image-producing `run` steps), `klyk-call` writes the PNG to `~/.klyk/captures/` and returns its `saved_path` instead of dumping base64 — so the agent *views* the capture with its own image reader (Claude Code's file read, Gemini's `@path`, etc.) and keeps the same observe→act→verify loop the native MCP transport has, with no context-flooding payload. The cache keeps the most recent 20 captures.
+**Vision over the shell.** When a tool returns a screenshot (`screenshot`, `inspect`, `verdict`, image-producing `run` steps), `klyk-call` writes the PNG to `~/.klyk/captures/` and returns its `saved_path` instead of dumping base64 — so the agent *views* the capture with its own image reader (Claude Code's file read, Gemini's `@path`, etc.) and keeps the same observe→act→verify loop the native MCP transport has, with no context-flooding payload. The cache keeps up to 20 captures and protects files returned by the current call. A response containing more than 20 images, or an image that cannot be saved, retains those images inline with `save_error` instead of returning missing file paths.
 
 ## Quick example
 

@@ -4,6 +4,7 @@ import asyncio
 import ctypes
 from pathlib import Path
 import sys
+import threading
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -12,7 +13,26 @@ from unittest.mock import MagicMock, patch
 def load_functions(filename,names,namespace):
     """Compile unchanged functions with event bindings supplied by each test."""
     path=Path(__file__).resolve().parents[1]/'klyk'/filename
-    tree=ast.parse(path.read_text());nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in names]
+    tree=ast.parse(path.read_text())
+    functions={n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    namespace.setdefault('_held_lock',threading.RLock())
+    namespace.setdefault('_held_inputs',{})
+    namespace.setdefault('_check_stop',lambda:None)
+    namespace.setdefault('is_frontmost_app',lambda pid:False)
+    namespace.setdefault('kCGMouseEventClickState',1)
+    namespace.setdefault('ctypes',ctypes)
+    namespace.setdefault('_cf',MagicMock())
+    if filename=='skylight.py':
+        # Resolve the shared registry from source; never import computer's live event tap.
+        load_functions('computer.py',{'_begin_input','_finish_input'},namespace)
+    selected=set(names)
+    pending=list(names)
+    while pending:
+        name=pending.pop()
+        for item in ast.walk(functions[name]):
+            if isinstance(item,ast.Name) and item.id in functions and item.id not in namespace and item.id not in selected:
+                selected.add(item.id);pending.append(item.id)
+    nodes=[n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef)) and n.name in selected]
     tree=ast.Module(body=[ast.ImportFrom(module='__future__',names=[ast.alias(name='annotations')],level=0),*nodes],type_ignores=[])
     exec(compile(ast.fix_missing_locations(tree),str(path),'exec'),namespace)
     return namespace
@@ -34,7 +54,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
         for name,args in [('long_press',(10,20,.2)),('drag',(10,20,30,40))]:
             with self.subTest(name=name):
                 sent=[];cg=MagicMock();cg.CGEventCreateMouseEvent.side_effect=lambda source,kind,point,button:kind
-                check=MagicMock(side_effect=[None,RuntimeError('stopped')])
+                check=MagicMock(side_effect=[None,None,RuntimeError('stopped')])
                 ns={'asyncio':asyncio,'time':__import__('time'),'_input_lock':asyncio.Lock(),'_check_stop':check,'_cg':cg,'_post':sent.append,
                     'CGPoint':lambda *a,**kw:SimpleNamespace(**kw),'kCGEventLeftMouseDown':1,'kCGEventLeftMouseUp':2,'kCGEventLeftMouseDragged':6,
                     'kCGEventRightMouseDown':3,'kCGEventRightMouseUp':4,'kCGMouseButtonLeft':0,'kCGMouseButtonRight':1}
@@ -137,7 +157,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
     async def test_hold_key_releases_after_stop(self):
         """Release a held key when the emergency stop interrupts its hold loop."""
         events=[]
-        check=MagicMock(side_effect=[None,RuntimeError('stopped')])
+        check=MagicMock(side_effect=[None,None,RuntimeError('stopped')])
         ns={
             'asyncio':asyncio,
             '_input_lock':asyncio.Lock(),
@@ -179,7 +199,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
             'asyncio':SimpleNamespace(sleep=block_sleep),
             '_input_lock':asyncio.Lock(),
             '_check_stop':lambda:None,
-            '_snapshot_pasteboard':lambda:snapshot,
+            '_snapshot_pasteboard':lambda:(snapshot,7),
             '_restore_pasteboard':lambda value:restored.append(value),
             '_paste_sync':lambda pid:None,
             'subprocess':SimpleNamespace(run=MagicMock()),
@@ -219,7 +239,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
             'asyncio':SimpleNamespace(sleep=no_sleep),
             '_input_lock':asyncio.Lock(),
             '_check_stop':lambda:None,
-            '_snapshot_pasteboard':lambda:snapshot,
+            '_snapshot_pasteboard':lambda:(snapshot,7),
             '_restore_pasteboard':lambda value:restored.append(value),
             '_paste_sync':MagicMock(side_effect=RuntimeError('paste failed')),
             'subprocess':SimpleNamespace(run=MagicMock()),
@@ -256,7 +276,7 @@ class CleanupTests(unittest.IsolatedAsyncioTestCase):
             'asyncio':SimpleNamespace(sleep=no_sleep),
             '_input_lock':asyncio.Lock(),
             '_check_stop':lambda:None,
-            '_snapshot_pasteboard':lambda:snapshot,
+            '_snapshot_pasteboard':lambda:(snapshot,7),
             '_restore_pasteboard':lambda value:restored.append(value),
             '_paste_sync':lambda pid:None,
             'subprocess':SimpleNamespace(run=MagicMock()),

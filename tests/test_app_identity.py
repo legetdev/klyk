@@ -157,7 +157,7 @@ class AppIdentityTests(unittest.TestCase):
         load_functions("launcher.py", {"launch_native_app", "_find_pid_for_app"}, ns)
 
         self.assertEqual(ns["launch_native_app"](app_name="Chromium"), (321, False))
-        popen.assert_called_once_with(["open", "-a", "Chromium", "--args", "--force-renderer-accessibility"])
+        popen.assert_called_once_with(["/usr/bin/open", "-a", "Chromium", "--args", "--force-renderer-accessibility"])
         clock.sleep.assert_not_called()
 
     def test_registration_timeout_does_not_oversleep_its_budget(self):

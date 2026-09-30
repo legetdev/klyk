@@ -83,10 +83,14 @@ def main():
         check('installed Chrome fixture target', chrome.is_file())
         report['chrome_version'] = plistlib.loads(chrome.read_bytes()).get('CFBundleShortVersionString')
         if args.full_layout:
-            # Existing two-window fixtures plus receiver offset reach x=1820;
-            # refuse an undersized desktop rather than weakening those tests.
+            # Compact fixtures preserve all controls and both apps in 1024x700;
+            # the default receiver offset still requires the original layout.
+            compact = os.environ.get('KLYK_FIXTURE_COMPACT') == '1'
+            width, height = (1024, 700) if compact else (1820, 800)
+            report['fixture_layout_requirement'] = {'mode': 'compact' if compact else 'default',
+                                                     'width': width, 'height': height}
             check('desktop fits the existing native fixture layout',
-                  bounds.size.width >= 1820 and bounds.size.height >= 800)
+                  bounds.size.width >= width and bounds.size.height >= height)
         report['completed'] = True
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'

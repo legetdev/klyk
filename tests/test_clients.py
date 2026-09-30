@@ -122,6 +122,13 @@ class JsoncEditorTests(unittest.TestCase):
 class ClientAdapterTests(unittest.TestCase):
     """Verify client adapters against disposable config paths."""
 
+    def setUp(self) -> None:
+        """Keep version detection entirely fake even when OpenCode is installed."""
+        self._version_function = clients.opencode_major_version
+        version = mock.patch.object(clients, "opencode_major_version", return_value=1)
+        version.start()
+        self.addCleanup(version.stop)
+
     def test_antigravity_migration_preserves_legacy_and_custom_settings(self) -> None:
         """Repair old-path setup without touching older clients or unrelated settings."""
         from klyk import doctor
@@ -143,7 +150,7 @@ class ClientAdapterTests(unittest.TestCase):
             self.assertEqual(legacy.read_bytes(), original)
             migrated = clients.current_entry(client)
             self.assertEqual(migrated["command"], client.entry["command"])
-            self.assertEqual(migrated["env"], custom["env"])
+            self.assertEqual(migrated["env"], {"PYTHONPATH": "", **custom["env"]})
             self.assertEqual(migrated["enabledTools"], custom["enabledTools"])
             self.assertEqual(clients.write_entry(client), "unchanged")
             with mock.patch.object(clients, "CLIENTS", {"antigravity": client}):
@@ -166,7 +173,7 @@ class ClientAdapterTests(unittest.TestCase):
             self.assertEqual(updated["setting"], data["setting"])
             self.assertEqual(updated["mcpServers"]["other"], data["mcpServers"]["other"])
             self.assertTrue(updated["mcpServers"]["klyk"]["disabled"])
-            self.assertEqual(updated["mcpServers"]["klyk"]["env"], {"CUSTOM": "keep"})
+            self.assertEqual(updated["mcpServers"]["klyk"]["env"], {"PYTHONPATH": "", "CUSTOM": "keep"})
             self.assertEqual(client.path.stat().st_mode & 0o777, 0o640)
             original = client.path.read_bytes()
             with mock.patch.object(clients, "legacy_antigravity_entry", side_effect=AssertionError("must not read legacy")):
@@ -316,6 +323,277 @@ class ClientAdapterTests(unittest.TestCase):
                 clients.write_entry(client)
 
             self.assertEqual(client.path.read_text(encoding="utf-8"), malformed)
+
+    def test_opencode_v2_refresh_preserves_native_settings_and_other_bytes(self) -> None:
+        """Edit native V2, retaining environment, disabled state and server options."""
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=2):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            selected = client.path.with_suffix(".jsonc")
+            native = {"type": "local", "command": ["/old/python"], "disabled": True,
+                      "environment": {"KLYK_UPDATE_CHECK": "0", "CUSTOM": "keep"},
+                      "cwd": ".", "codemode": False,
+                      "timeout": {"startup": 45000}, "protocol": "legacy"}
+            text = '{\r\n\t// Keep café\r\n\t"theme": "保持",\r\n\t"mcp": {"timeout": {"catalog": 60000}, "servers": ' + json.dumps({"klyk": native, "type": {"type": "local", "command": ["keep"]}}) + '}\r\n}\r\n'
+            selected.write_bytes(text.encode())
+            selected.chmod(0o640)
+            self.assertEqual(clients.current_entry(client), native)
+            self.assertEqual(clients.write_entry(client), "updated")
+            written = selected.read_bytes()
+            updated = clients.current_entry(client)
+            self.assertEqual(updated["command"], client.entry["command"])
+            self.assertEqual(updated["environment"], {"PYTHONPATH": "", **native["environment"]})
+            for key in ("disabled", "cwd", "codemode", "timeout", "protocol"):
+                self.assertEqual(updated[key], native[key])
+            self.assertIn(b"// Keep caf\xc3\xa9\r\n", written)
+            self.assertIn('"theme": "保持"'.encode(), written)
+            self.assertEqual(selected.stat().st_mode & 0o777, 0o640)
+            self.assertEqual(clients.write_entry(client), "unchanged")
+            self.assertEqual(selected.read_bytes(), written)
+            self.assertTrue(clients.remove_entry(client))
+            self.assertIsNone(clients.current_entry(client))
+            self.assertIn('"type": {"type": "local", "command": ["keep"]}', selected.read_text())
+
+    def test_opencode_v2_migrates_legacy_enable_and_timeout_without_duplicates(self) -> None:
+        """Normalize the documented V1 controls when creating a V2 server entry."""
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=2):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            legacy = {"type": "local", "command": ["old"], "enabled": False,
+                      "timeout": 30000, "environment": {"KLYK_UPDATE_CHECK": "0"}}
+            client.path.write_text(json.dumps({"mcp": {"klyk": legacy, "other": {"type": "local", "command": ["keep"]}}}))
+            self.assertEqual(clients.current_entry(client), legacy)
+            self.assertEqual(clients.write_entry(client), "updated")
+            mcp = json.loads(client.path.read_text())["mcp"]
+            self.assertNotIn("klyk", mcp)
+            self.assertEqual(mcp["other"]["command"], ["keep"])
+            entry = mcp["servers"]["klyk"]
+            self.assertTrue(entry["disabled"])
+            self.assertNotIn("enabled", entry)
+            self.assertEqual(entry["timeout"], {"catalog": 30000, "execution": 30000})
+            self.assertEqual(entry["environment"]["KLYK_UPDATE_CHECK"], "0")
+
+    def test_opencode_v2_mixed_entries_use_native_precedence_per_server(self) -> None:
+        """Supported flat members coexist, with native values winning equal names."""
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=2):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            old = {"type": "local", "command": ["old"], "enabled": False}
+            native = {"type": "local", "command": ["native"], "disabled": True}
+            client.path.write_text(json.dumps({"mcp": {"klyk": old, "servers": {"other": native}}}))
+            self.assertEqual(clients.current_entry(client), old)
+            client.path.write_text(json.dumps({"mcp": {"klyk": old, "servers": {"klyk": native}}}))
+            self.assertEqual(clients.current_entry(client), native)
+            self.assertEqual(clients.write_entry(client), "updated")
+            self.assertEqual(clients.current_entry(client)["disabled"], True)
+            self.assertNotIn("klyk", json.loads(client.path.read_text())["mcp"])
+
+    def test_opencode_v2_ignores_old_filename_but_can_migrate_its_owned_entry(self) -> None:
+        """Migrate only klyk from V1 config.json, preserving unrelated legacy data."""
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=2):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            legacy = client.path.parent / "config.json"
+            legacy.write_text(json.dumps({"theme": "old", "mcp": {"klyk": {"type": "local", "command": ["old"], "enabled": False}}}))
+            original = legacy.read_bytes()
+            self.assertIsNone(clients.current_entry(client))
+            self.assertEqual(clients.config_files(client), ())
+            self.assertEqual(clients.write_entry(client), "updated")
+            self.assertTrue(clients.current_entry(client)["disabled"])
+            self.assertEqual(legacy.read_bytes(), original)
+            self.assertNotIn("theme", json.loads(client.path.read_text()))
+            self.assertTrue(clients.remove_entry(client))
+            self.assertNotIn("klyk", json.loads(legacy.read_text())["mcp"])
+
+    def test_opencode_unknown_or_unsupported_major_refuses_mutation(self) -> None:
+        """A version lookup failure must not silently generate a V1 config."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            client.path.write_text('{"theme":"keep"}')
+            for major in (None, 3):
+                with self.subTest(major=major), \
+                     mock.patch.object(clients, "opencode_major_version", return_value=major), \
+                     mock.patch.object(clients, "opencode_executable", return_value="/fake/opencode"):
+                    with self.assertRaises(clients.ConfigFormatError):
+                        clients.write_entry(client)
+                    self.assertEqual(client.path.read_text(), '{"theme":"keep"}')
+
+    def test_opencode_version_parses_only_successful_version_output(self) -> None:
+        """Use fake CLI output without running any installed executable."""
+        cases = (("2.0.4\n", 0, 2), ("opencode v1.9.1-beta.2", 0, 1),
+                 ("2.0.4", 1, None), ("warning\n2.0.4", 0, None))
+        real_version = self._version_function
+        for output, code, expected in cases:
+            with self.subTest(output=output), \
+                 mock.patch.object(clients, "opencode_executable", return_value="/fake/opencode"), \
+                 mock.patch.object(clients.subprocess, "run", return_value=mock.Mock(stdout=output, returncode=code)) as run:
+                self.assertEqual(real_version(), expected)
+                self.assertEqual(run.call_args.args[0], ["/fake/opencode", "--version"])
+
+    def test_opencode_ambiguous_containers_and_reserved_legacy_name_are_retained(self) -> None:
+        """Never drop a duplicate container or reuse a V1 server called servers."""
+        texts = ('{"mcp":{"servers":{},"servers":{}}}',
+                 '{"mcp":{"servers":{"type":"local","command":["keep"]}}}')
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=2):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            for text in texts:
+                with self.subTest(text=text):
+                    client.path.write_text(text)
+                    with self.assertRaises(clients.ConfigFormatError):
+                        clients.write_entry(client)
+                    self.assertEqual(client.path.read_text(), text)
+
+    def test_json_refresh_preserves_deliberate_environment_and_restrictions(self) -> None:
+        """Refresh an old interpreter without enabling disabled servers or tools."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("cursor"), path=Path(directory) / "mcp.json")
+            old = {"command": "/old/python", "args": [], "disabled": True,
+                   "env": {"PYTHONPATH": "/deliberately/trusted", "KLYK_UPDATE_CHECK": "0"},
+                   "disabledTools": ["click"], "timeout": 5000}
+            client.path.write_text(json.dumps({"mcpServers": {"klyk": old, "other": {"keep": True}}}))
+            self.assertEqual(clients.write_entry(client), "updated")
+            entry = clients.current_entry(client)
+            for key in ("disabled", "env", "disabledTools", "timeout"):
+                self.assertEqual(entry[key], old[key])
+            self.assertEqual(entry["args"], ["-P", "-m", "klyk.mcp_server"])
+            self.assertEqual(client.entry["env"], {"PYTHONPATH": ""})
+
+    def test_strict_json_rejects_ambiguous_and_nonfinite_settings(self) -> None:
+        """Ambiguous values fail without modifying existing credential-bearing files."""
+        texts = ('{"mcpServers":{},"mcpServers":{}}', '{"x":NaN}',
+                 '{"x":1e10000}', '{"mcpServers":{"klyk":{"env":[]}}}',
+                 '{"x":' + '[' * 1100 + '0' + ']' * 1100 + '}')
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("cursor"), path=Path(directory) / "mcp.json")
+            for text in texts:
+                with self.subTest(text=text[:40]):
+                    client.path.write_text(text)
+                    with self.assertRaises(clients.ConfigFormatError):
+                        clients.write_entry(client)
+                    self.assertEqual(client.path.read_text(), text)
+
+    def test_new_toml_launch_includes_safe_import_environment(self) -> None:
+        """The TOML setup offers the same import boundary as JSON clients."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("codex"), path=Path(directory) / "config.toml")
+            self.assertEqual(clients.write_entry(client), "added")
+            self.assertEqual(clients.current_entry(client), client.entry)
+
+    def test_opencode_uninstall_rolls_back_earlier_file_on_replace_failure(self) -> None:
+        """Multiple managed configs do not end half-removed after a write error."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            first = client.path.parent / "config.json"
+            for path in (first, client.path):
+                path.write_text('{"mcp":{"klyk":{},"other":{"keep":true}}}')
+            before = {path: path.read_bytes() for path in (first, client.path)}
+            real_write = jsonc.atomic_write
+
+            def fail_selected(path, text, **kwargs):
+                """Fail the second destination while permitting the rollback."""
+                if path == client.path:
+                    raise OSError("fixture write failure")
+                return real_write(path, text, **kwargs)
+
+            with mock.patch.object(jsonc, "atomic_write", side_effect=fail_selected):
+                with self.assertRaises(OSError):
+                    clients.remove_entry(client)
+            self.assertEqual({path: path.read_bytes() for path in before}, before)
+
+    def test_opencode_refuses_stale_lower_precedence_customization(self) -> None:
+        """The selected file cannot override settings changed in a source during refresh."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            lower = client.path.parent / "config.json"
+            lower.write_text('{"mcp":{"klyk":{"type":"local","command":["old"],"environment":{"CUSTOM":"before"}}}}')
+            client.path.write_text('{"theme":"keep"}')
+            real_set = jsonc.set_mcp_entry
+
+            def edit_source(*args, **kwargs):
+                """Model an external editor finishing after the original snapshots."""
+                lower.write_text('{"mcp":{"klyk":{"type":"local","command":["old"],"environment":{"CUSTOM":"external"}}}}')
+                return real_set(*args, **kwargs)
+
+            with mock.patch.object(jsonc, "set_mcp_entry", side_effect=edit_source):
+                with self.assertRaises(clients.ConfigFormatError):
+                    clients.write_entry(client)
+            self.assertEqual(client.path.read_text(), '{"theme":"keep"}')
+            self.assertEqual(json.loads(lower.read_text())["mcp"]["klyk"]["environment"]["CUSTOM"], "external")
+
+    def test_opencode_duplicate_owned_policy_fields_are_not_silently_chosen(self) -> None:
+        """An ambiguous disable flag or environment must be resolved before refresh."""
+        texts = ('{"mcp":{"klyk":{"disabled":true,"disabled":false}}}',
+                 '{"mcp":{"servers":{"klyk":{"environment":{"MODE":"safe","MODE":"other"}}}}}')
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            for major, text in zip((1, 2), texts):
+                with self.subTest(major=major), mock.patch.object(clients, "opencode_major_version", return_value=major):
+                    client.path.write_text(text)
+                    with self.assertRaises(clients.ConfigFormatError):
+                        clients.write_entry(client)
+                    self.assertEqual(client.path.read_text(), text)
+
+    def test_explicit_native_shape_is_usable_when_cli_version_is_unavailable(self) -> None:
+        """Read native server maps without mistaking a server named type for V1."""
+        with tempfile.TemporaryDirectory() as directory, \
+             mock.patch.object(clients, "opencode_major_version", return_value=None), \
+             mock.patch.object(clients, "opencode_executable", return_value="/fake/opencode"):
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            client.path.write_text(json.dumps({"mcp": {"servers": {"type": {"type": "local", "command": ["keep"]}, "klyk": client.entry}}}))
+            self.assertEqual(clients.current_entry(client), client.entry)
+            self.assertEqual(clients.write_entry(client), "unchanged")
+
+    def test_v1_downgrade_cannot_enable_or_duplicate_an_existing_native_server(self) -> None:
+        """Fail closed when V1 cannot retain a native V2 server's policy semantics."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("opencode"), path=Path(directory) / "opencode.json")
+            text = '{"mcp":{"servers":{"klyk":{"type":"local","command":["old"],"disabled":true}}}}'
+            client.path.write_text(text)
+            with self.assertRaises(clients.ConfigFormatError):
+                clients.write_entry(client)
+            self.assertEqual(client.path.read_text(), text)
+
+    def test_falsey_wrong_toml_container_cannot_be_poisoned_by_append(self) -> None:
+        """An empty scalar or array is invalid schema, not an absent server table."""
+        with tempfile.TemporaryDirectory() as directory:
+            client = replace(clients.get("codex"), path=Path(directory) / "config.toml")
+            for text in ('mcp_servers = ""\n', 'mcp_servers = []\n', 'mcp_servers = 0\n', '[mcp_servers]\nklyk = []\n'):
+                with self.subTest(text=text):
+                    client.path.write_text(text)
+                    with self.assertRaises(clients.ConfigFormatError):
+                        clients.write_entry(client)
+                    self.assertEqual(client.path.read_text(), text)
+
+    def test_antigravity_refuses_stale_legacy_customization(self) -> None:
+        """Migration retains a legacy editor's later privacy setting instead of importing stale state."""
+        with tempfile.TemporaryDirectory() as directory:
+            base = Path(directory)
+            client = replace(clients.get("agy"), path=base / "config" / "mcp_config.json")
+            legacy = base / "antigravity-cli" / "mcp_config.json"
+            legacy.parent.mkdir()
+            legacy.write_text('{"mcpServers":{"klyk":{"command":"old","args":[],"env":{"CUSTOM":"before"}}}}')
+            real_refresh = clients._refreshed_entry
+
+            def edit_legacy(*args, **kwargs):
+                """Simulate a newer editor save after the migration snapshot was read."""
+                legacy.write_text('{"mcpServers":{"klyk":{"command":"old","args":[],"env":{"KLYK_UPDATE_CHECK":"0"}}}}')
+                return real_refresh(*args, **kwargs)
+
+            with mock.patch.object(clients, "_refreshed_entry", side_effect=edit_legacy):
+                with self.assertRaises(clients.ConfigFormatError):
+                    clients.write_entry(client)
+            self.assertFalse(client.path.exists())
+            self.assertEqual(json.loads(legacy.read_text())["mcpServers"]["klyk"]["env"], {"KLYK_UPDATE_CHECK": "0"})
+
+    def test_toml_snippet_preserves_unicode_paths_and_environment_values(self) -> None:
+        """Non-BMP paths use valid TOML Unicode rather than JSON surrogate escapes."""
+        with tempfile.TemporaryDirectory() as directory:
+            entry = {"command": "/fixture/🔒/python", "args": ["-P", "-m", "klyk.mcp_server"],
+                     "env": {"PYTHONPATH": "", "LABEL": "café 🔒"}}
+            client = replace(clients.get("codex"), path=Path(directory) / "config.toml", entry=entry)
+            self.assertEqual(clients.write_entry(client), "added")
+            self.assertEqual(clients.current_entry(client), entry)
 
 
 if __name__ == "__main__":

@@ -57,6 +57,22 @@ def main() -> None:
     args = sys.argv[1:]
     cmd = args[0] if args else "install"
     rest = args[1:]
+    if "--help" in rest or "-h" in rest:
+        _help()
+        return
+    flags = {
+        "install": {"--all", "--ambient", "--wait", "--list"},
+        "uninstall": {"--all"}, "update": {"--check"},
+        "doctor": {"--fix", "--json"}, "restart": set(),
+        "help": set(), "version": set(), "--version": set(), "-v": set(),
+    }
+    if cmd in flags:
+        positionals = [arg for arg in rest if not arg.startswith("-")]
+        unknown = [arg for arg in rest if arg.startswith("-") and arg not in flags[cmd]]
+        if (unknown or len(positionals) > (1 if cmd in ("install", "uninstall") else 0)
+                or (positionals and "--all" in rest)):
+            print(f"Invalid arguments for `klyk {cmd}`. Run `klyk {cmd} --help`.", file=sys.stderr)
+            sys.exit(2)
     if cmd == "install":
         _install(rest)
     elif cmd == "uninstall":
@@ -112,6 +128,8 @@ def _doctor(rest: list[str]) -> None:
 
 def _doctor_fix() -> None:
     """Repair state plus stale configured-client entries, then re-run checks."""
+    if not _persistent_install_required():
+        sys.exit(1)
     home = Path.home()
     fixed: list[str] = []
     kdir = home / ".klyk"
@@ -126,9 +144,10 @@ def _doctor_fix() -> None:
             existing = clients.current_entry(c)
             default_claude = c.key == "claude" and clients.is_present(c)
             legacy_agy = existing is None and clients.legacy_antigravity_entry(c) is not None
-            if (existing is not None or default_claude or legacy_agy) and existing != c.entry:
-                clients.write_entry(c)
-                fixed.append(f"refreshed the {c.label} config entry")
+            legacy_opencode = existing is None and clients.legacy_opencode_entry(c) is not None
+            if (existing is not None or default_claude or legacy_agy or legacy_opencode) and existing != c.entry:
+                if clients.write_entry(c) != "unchanged":
+                    fixed.append(f"refreshed the {c.label} config entry")
         except Exception:
             # The full doctor output below reports the exact file and remedy.
             continue
@@ -154,6 +173,9 @@ def _update(rest: list[str]) -> None:
 
     if "--check" in rest:
         st = updates.check(force=True)
+        if not st["enabled"]:
+            print(f"klyk {before} — update checks are disabled by KLYK_UPDATE_CHECK=0.")
+            return
         if st["latest"] is None:
             print(f"klyk {before} — could not reach PyPI to compare. "
                   "Check your connection and retry.")
@@ -174,53 +196,103 @@ def _update(rest: list[str]) -> None:
     print(f"Updating klyk {before} (installed via {method}) — running: "
           f"{' '.join(cmd)}", flush=True)
     try:
-        r = subprocess.run(cmd, capture_output=True, text=True)
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=600,
+                           env={**os.environ, "PYTHONPATH": ""})
     except FileNotFoundError:
         print(f"✗ `{cmd[0]}` is not on PATH, but this klyk lives in a {method}-"
               f"managed environment. Install {cmd[0]} (or reinstall klyk with "
               "`pipx install klyk`), then re-run `klyk update`.", file=sys.stderr)
+        sys.exit(1)
+    except subprocess.TimeoutExpired:
+        print("✗ Update did not finish within ten minutes. Check the installation before retrying.", file=sys.stderr)
         sys.exit(1)
     if r.returncode != 0:
         sys.stderr.write(r.stderr or r.stdout)
         print(f"✗ Update failed (see the {cmd[0]} output above).", file=sys.stderr)
         sys.exit(1)
 
-    after = subprocess.run(
-        [sys.executable, "-c", "import klyk; print(klyk.__version__)"],
-        capture_output=True, text=True,
-    ).stdout.strip() or before
+    if method == "uvx":
+        # uvx creates a fresh cached environment; the old interpreter remains
+        # disposable and must not verify or mutate the replacement environment.
+        match = re.fullmatch(r"klyk\s+([0-9]+(?:\.[0-9]+){1,3})", r.stdout.strip())
+        after = match[1] if match else None
+    else:
+        try:
+            verified = subprocess.run(
+                [sys.executable, "-P", "-c", "import klyk; print(klyk.__version__)"],
+                capture_output=True, text=True, timeout=15,
+                env={**os.environ, "PYTHONPATH": ""},
+            )
+            after = verified.stdout.strip() if verified.returncode == 0 else None
+        except (OSError, subprocess.TimeoutExpired):
+            after = None
+    if after is None or updates._parse(after) is None:
+        print("✗ The upgrade command finished, but the updated package could not be loaded. No server was restarted.", file=sys.stderr)
+        sys.exit(1)
     # Record the fresh state so the doctor and menu-bar stop showing a
     # now-stale "update available" the moment the upgrade lands.
-    updates.check(force=True)
+    state = updates.check(force=True)
+    if state["latest"] is not None and updates._is_newer(state["latest"], after):
+        print("✗ The package manager finished, but this installation is still behind the published version. No server was restarted.", file=sys.stderr)
+        sys.exit(1)
+
+    if method == "uvx":
+        print(f"✓ Refreshed the disposable uvx environment to klyk {after}.")
+        print("For a persistent MCP setup, run `uv tool install klyk`, then `klyk install <client>`.")
+        return
 
     if after == before:
-        print(f"✓ Already on the latest version ({before}).")
+        print(f"✓ This installation loads klyk {after}; no version change was needed.")
         return
     print(f"✓ Updated klyk {before} → {after}.")
     _restart_after_update()
 
 
+def _installation_process(pid: int):
+    """Bind restart permission to this user's exact interpreter and module command."""
+    from .launcher import process_identity
+    if not isinstance(pid, int) or isinstance(pid, bool) or not 1 < pid <= 2147483647:
+        return None
+    identity = process_identity(pid, include_command=True)
+    if not identity or identity.get("uid") != os.getuid():
+        return None
+    argv = identity.get("argv")
+    if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
+        return None
+    if os.path.abspath(argv[0]) != os.path.abspath(sys.executable):
+        return None
+    if argv[1:] not in (["-m", "klyk.mcp_server"], ["-P", "-m", "klyk.mcp_server"]):
+        return None
+    return identity
+
+
 def _restart_after_update() -> None:
-    """Stop the currently running klyk server (if any) so the MCP client
-    respawns it with the new code on the next tool call — no manual client
-    restart needed. Fully transparent about what happened."""
-    from .ownership import current_owner
+    """Restart only verified servers using this installation, rechecking PID identity."""
     from .launcher import terminate_pid
-    owner = current_owner()
-    if not owner:
-        print("  No klyk server was running — the new version loads on the next session.")
-        return
     try:
-        os.kill(owner, 0)
-    except OSError:
-        print("  No klyk server was running — the new version loads on the next session.")
-        return
-    if terminate_pid(owner):
-        print(f"  ✓ Restarted the running klyk server (pid {owner}) — connected "
-              "agents load the new version on their next call.")
+        candidates = subprocess.run(
+            ["/usr/bin/pgrep", "-u", str(os.getuid()), "-f", "klyk[.]mcp_server"],
+            capture_output=True, text=True, timeout=3,
+        )
+        pids = {int(line) for line in candidates.stdout.splitlines() if line.isdigit()}
+    except (OSError, subprocess.TimeoutExpired):
+        pids = set()
+    restarted = 0
+    failed = 0
+    for pid in sorted(pids):
+        identity = _installation_process(pid)
+        if identity is None:
+            continue
+        if terminate_pid(pid, expected_identity=identity):
+            restarted += 1
+        else:
+            failed += 1
+    if restarted:
+        print(f"  ✓ Restarted {restarted} verified klyk server(s) using this installation.")
     else:
-        print(f"  ⚠ Could not stop the running klyk server (pid {owner}). "
-              "Run `klyk restart` (or restart your AI client) to load the new version.")
+        print("  No matching server was stopped. New sessions load the updated installation.")
+    if failed:
+        print("  ⚠ Some servers could not be stopped safely. Restart their AI clients to load the update.")
 
 
 # ---------------------------------------------------------------------------
@@ -241,17 +313,16 @@ def _restart() -> None:
     if not owner:
         print("No klyk is currently running. The next session starts a fresh one.")
         return
-    try:
-        os.kill(owner, 0)
-    except OSError:
-        print(f"The recorded klyk (pid {owner}) is no longer running — nothing to stop.")
-        return
+    identity = _installation_process(owner)
+    if identity is None:
+        print("The recorded process could not be verified as this installation's klyk server. No process was stopped.", file=sys.stderr)
+        sys.exit(1)
     print(f"Stopping the active klyk (pid {owner})…")
-    if terminate_pid(owner):
+    if terminate_pid(owner, expected_identity=identity):
         print("✓ Stopped. The next session — or a take_control from another — becomes the driver.")
     else:
         print(
-            f"✗ Could not stop pid {owner}. Stop it manually: `kill -9 {owner}`.",
+            "✗ The server could not be stopped safely. Restart the AI client that launched it.",
             file=sys.stderr,
         )
         sys.exit(1)
@@ -281,8 +352,7 @@ def _configure_client(client) -> bool:
     except Exception as e:
         path = clients.config_path(client)
         print(f"  ✗ Could not read {path}: {e}")
-        print("    Fix the file, then re-run. Or add this manually:")
-        print(_indent(clients.snippet(client)))
+        print("    Fix the file or OpenCode version detection, then re-run.")
         return False
 
     # Idempotent: the "klyk" key is ours to manage, so we refresh it in place
@@ -297,8 +367,13 @@ def _configure_client(client) -> bool:
     except Exception as e:
         path = clients.config_path(client)
         print(f"  ✗ Could not write {path}: {e}")
-        print("    Add this manually instead:")
-        print(_indent(clients.snippet(client)))
+        try:
+            block = clients.snippet(client)
+        except (OSError, ValueError):
+            print("    Resolve the config or version error above before retrying.")
+        else:
+            print("    Add this manually instead:")
+            print(_indent(block))
         return False
 
     path = clients.config_path(client)
@@ -321,6 +396,8 @@ def _install(rest: list[str]) -> None:
         return
 
     _require_macos()
+    if not _persistent_install_required():
+        sys.exit(1)
     all_mode = "--all" in rest
     ambient = "--ambient" in rest  # opt-in: write the klyk-call note into GEMINI.md etc.
     wait = "--wait" in rest         # poll until macOS permissions are granted
@@ -425,11 +502,7 @@ def _install(rest: list[str]) -> None:
 
 def _opencode_executable() -> str | None:
     """Resolve OpenCode from PATH or its standard macOS installer location."""
-    found = shutil.which("opencode")
-    if found:
-        return found
-    fallback = Path.home() / ".opencode" / "bin" / "opencode"
-    return str(fallback) if fallback.is_file() else None
+    return clients.opencode_executable()
 
 
 def _verify_opencode_connection() -> bool:
@@ -456,14 +529,9 @@ def _verify_opencode_connection() -> bool:
         return False
 
     output = re.sub(r"\x1b\[[0-9;]*m", "", result.stdout + "\n" + result.stderr)
-    connected = any(
-        re.search(r"\bklyk\b", line, re.IGNORECASE)
-        and re.search(r"\bconnected\b", line, re.IGNORECASE)
-        and not re.search(
-            r"\bnot\s+connected\b|\bfailed\b|\berror\b", line, re.IGNORECASE,
-        )
-        for line in output.splitlines()
-    )
+    connected = any(re.fullmatch(
+        r"[\s│┃├└┌┐┘┤─━+✓✔●○]*klyk\s*:?\s+(?i:connected)(?:\s.*)?", line,
+    ) for line in output.splitlines())
     if result.returncode == 0 and connected:
         print("  ✓ OpenCode started klyk and reports it connected")
         return True
@@ -480,10 +548,10 @@ def _verify_opencode_connection() -> bool:
 def _write_context_guide(client) -> None:
     """--ambient: write the short klyk-call note into the client's context file
     (e.g. GEMINI.md) so the agent can fall back when native MCP is unavailable."""
-    if clients.context_block_present(client):
-        print(f"  ✓ klyk note already in {client.context_file}")
-        return
     try:
+        if clients.context_block_present(client):
+            print(f"  ✓ klyk note already in {client.context_file}")
+            return
         action = clients.write_context_block(client)
         verb = {"added": "Added", "updated": "Updated", "unchanged": "Already had"}[action]
         print(f"  ✓ {verb} the klyk note in {client.context_file}")
@@ -517,10 +585,19 @@ def _wire_other_clients(configured) -> None:
     print("  No-MCP front door: `klyk-call` (any shell agent). See the README.")
 
 
+def _persistent_install_required() -> bool:
+    """Never save an MCP command pointing into a disposable uvx environment."""
+    from . import updates
+    if updates.install_method() != "uvx":
+        return True
+    print("This is a disposable uvx environment. Run `uv tool install klyk`, then use the installed `klyk install` command.", file=sys.stderr)
+    return False
+
+
 def _open_settings(label: str, deep_link: str) -> None:
     """Open the exact System Settings pane — no prompt, no blocking. Granting is
     the one OS-mandated step klyk can't do for you, so we take you straight there."""
-    subprocess.run(["open", deep_link], check=False)
+    subprocess.run(["/usr/bin/open", deep_link], check=False)
     print(f"    → Opened Privacy & Security → {label}. Add your terminal/AI app, "
           "toggle it ON, then re-run `klyk doctor`.")
 
@@ -594,7 +671,8 @@ def _uninstall(rest: list[str]) -> None:
     client_failures = False
     for c in clients.CLIENTS.values():
         try:
-            if clients.current_entry(c) is not None or clients.context_block_present(c):
+            if (clients.current_entry(c) is not None or clients.context_block_present(c)
+                    or clients.legacy_opencode_entry(c) is not None):
                 if not _unwire_client(c):
                     client_failures = True
                 any_client = True
@@ -605,27 +683,48 @@ def _uninstall(rest: list[str]) -> None:
     if not any_client:
         print("  · none were configured")
 
+    if client_failures:
+        print("\nSome client configuration could not be removed. The state and runtime were retained.")
+        print("Fix the errors above, then re-run.")
+        sys.exit(1)
+
     print("\nFiles:")
     home = Path.home()
+    file_failures = False
     for b in ("klyk", "klyk-call"):
         f = home / ".local" / "bin" / b
         if f.is_symlink() or f.exists():
-            f.unlink(missing_ok=True)
-            print(f"  ✓ removed {f}")
-    for p in (home / ".klyk", home / "klyk.log"):
-        if p.is_dir():
-            shutil.rmtree(p, ignore_errors=True)
-            print(f"  ✓ removed {p}/")
-        elif p.exists():
-            p.unlink(missing_ok=True)
+            try:
+                f.unlink()
+                print(f"  ✓ removed {f}")
+            except OSError:
+                file_failures = True
+                print(f"  ✗ could not remove {f}")
+    files = (home / ".klyk", home / "klyk.log", *(home / f"klyk.log.{index}" for index in range(1, 6)))
+    for p in files:
+        try:
+            if p.is_symlink():
+                p.unlink()  # Never traverse a linked state or log destination.
+            elif p == home / ".klyk" and p.is_dir():
+                shutil.rmtree(p)
+            elif p.exists():
+                if p.is_dir():
+                    raise OSError("unexpected directory at a log path")
+                p.unlink()
+            else:
+                continue
+            if p.exists() or p.is_symlink():
+                raise OSError("destination remains")
             print(f"  ✓ removed {p}")
-
-    if client_failures:
-        print("\nSome client configuration could not be removed.")
-        print("Fix the errors above, then re-run.")
+        except OSError:
+            file_failures = True
+            print(f"  ✗ could not remove {p}")
+    if file_failures:
+        print("\nSome files remain. Resolve their permissions, then re-run uninstall.")
         sys.exit(1)
     print("\nklyk's config, state, and binaries are gone.")
-    print("Finally, remove the package itself:  pip uninstall klyk")
+    print("Restart any AI clients with a cached klyk configuration to stop their old sessions.")
+    print("The Python package remains installed. Remove it with the package manager used to install klyk.")
 
 
 if __name__ == "__main__":

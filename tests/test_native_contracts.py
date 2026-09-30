@@ -214,8 +214,9 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
     def test_ax_set_value_mismatched_readback_is_unverified(self):
         """An accepted AX write with stale readback stays unverified for fallback."""
         cf = MagicMock()
-        cf.CFStringCreateWithCString.return_value = 77
+        cf.CFStringCreateWithBytes.return_value = 77
         def read_attr(element, attr):
+            """Keep the native role fixture independent of the owned readback pointer."""
             return "AXTextField" if attr == b"AXRole" else "old value"
 
         ns = {
@@ -224,6 +225,8 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
             "_ax_element_at": lambda *args: 500,
             "_ax_matches_pid": lambda element, pid: True,
             "_ax_str_attr": read_attr,
+            "_ax_read_attr_ptr": lambda element, attr: 88,
+            "_cftype_to_str": lambda pointer: "old value",
             "_ax_is_web_backed": lambda element: False,
             "_ax_attr_is_settable": lambda element, attr: True,
             "_ax_set_attr_value": lambda element, attr, value: True,

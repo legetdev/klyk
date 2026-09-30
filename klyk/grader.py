@@ -4,6 +4,7 @@ No internal AI calls — the calling agent evaluates using its vision.
 """
 
 from __future__ import annotations
+import math
 import os
 from typing import TYPE_CHECKING
 
@@ -38,6 +39,17 @@ CRITERIA_BY_PLATFORM = {
 }
 
 
+def ui_pass_threshold() -> tuple[float, str | None]:
+    """Keep malformed owner configuration from breaking grading or evidence output."""
+    try:
+        threshold = float(os.getenv("KLYK_UI_PASS_THRESHOLD", "7.0"))
+        if math.isfinite(threshold) and 0 <= threshold <= 10:
+            return threshold, None
+    except (TypeError, ValueError):
+        pass
+    return 7.0, "UI pass threshold must be a finite number from 0 to 10; using the default 7.0."
+
+
 def grade_ui(session: "Session") -> dict:
     """Capture the current window geometry and return platform grading criteria."""
     from . import capture
@@ -56,10 +68,10 @@ def grade_ui(session: "Session") -> dict:
         win_y=session.win_y,
     )
 
-    threshold = float(os.getenv("KLYK_UI_PASS_THRESHOLD", "7.0"))
+    threshold, warning = ui_pass_threshold()
     criteria = CRITERIA_BY_PLATFORM.get(session.target, _CRITERIA_BASE)
 
-    return {
+    result = {
         "screenshot": screenshot_b64,
         "width": w,
         "height": h,
@@ -73,3 +85,6 @@ def grade_ui(session: "Session") -> dict:
             "Respond with: score, issues list, passed (bool)."
         ),
     }
+    if warning:
+        result["configuration_warning"] = warning
+    return result

@@ -18,10 +18,13 @@ defensive, and avoids exfiltration of secrets that aren't klyk's to
 hold.
 """
 
+import copy
 import logging
 from logging.handlers import RotatingFileHandler
+import os
 from pathlib import Path
 import re
+import select
 import threading
 from collections import deque
 from dataclasses import dataclass, field
@@ -40,12 +43,43 @@ class PrivateLogHandler(RotatingFileHandler):
         """Secure the descriptor before the first byte, including after rotation."""
         return open_private(self.baseFilename, "a", encoding=self.encoding or "utf-8")
 
+    def format(self, record):
+        """Bound and scrub diagnostics without retaining exception tracebacks."""
+        safe = copy.copy(record)
+        if isinstance(safe.args, tuple):
+            safe.args = tuple(type(value).__name__ if isinstance(value, BaseException) else value
+                              for value in safe.args)
+        elif isinstance(safe.args, dict):
+            safe.args = {key: type(value).__name__ if isinstance(value, BaseException) else value
+                         for key, value in safe.args.items()}
+        message = safe.getMessage()
+        if len(message) > _LOG_LINE_CAP or len(message.encode("utf-8", errors="replace")) > _LOG_LINE_CAP:
+            message = "[oversized diagnostic record omitted]"
+        message = _scrub(message)
+        message = re.sub(
+            r"[\x00-\x1f\x7f\u202a-\u202e\u2066-\u2069]",
+            lambda match: f"\\u{ord(match.group()):04x}", message,
+        )
+        if len(message.encode("utf-8", errors="replace")) > _LOG_LINE_CAP:
+            message = "[oversized diagnostic record omitted]"
+        safe.msg, safe.args = message, ()
+        safe.exc_info = safe.exc_text = safe.stack_info = None
+        return super().format(safe)
+
+    def handleError(self, record):
+        """A failed write must not replay the original private record on stderr."""
+        pass
+
 
 def configure_logging(path: str) -> logging.Logger:
     """Persist Klyk diagnostics only; SDK protocol payloads never enter this file."""
     logger = logging.getLogger("klyk")
     logger.setLevel(logging.INFO)
     logger.propagate = False
+    for previous in logger.handlers[:]:
+        if getattr(previous, "_klyk_owned", False):
+            logger.removeHandler(previous)
+            previous.close()
     try:
         # Existing rotations may predate owner-only creation. Never follow links.
         for backup in range(1, 6):
@@ -60,6 +94,7 @@ def configure_logging(path: str) -> logging.Logger:
         # Diagnostics must neither prevent connection nor fall back to leaking
         # private exception contents through the caller's stderr/root logger.
         handler = logging.NullHandler()
+    handler._klyk_owned = True
     logger.addHandler(handler)
     return logger
 
@@ -67,13 +102,17 @@ def configure_logging(path: str) -> logging.Logger:
 # leading key/label (group 1) plus `=***`. Patterns deliberately leave the
 # *key* visible — the agent still sees "password=" so it can reason about
 # the surrounding failure — and just hide the *value*.
+_CREDENTIAL_KEY = (
+    r"(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|secret[_-]?key|"
+    r"(?:access|refresh|id|session)[_-]?token|(?:client|consumer)[_-]?secret|"
+    r"aws[_-]?(?:secret[_-]?)?access[_-]?key|private[_-]?key|auth(?:orization)?)"
+)
 _SCRUBBERS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
     # JSON strings can contain whitespace and escaped quotes; redact the whole
     # value, including quoted keys that the plain key/value rule cannot match.
     (
         re.compile(
-            r'(?i)("(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|'
-            r'auth(?:orization)?)"\s*:\s*)"(?:\\.|[^"\\])*"'
+            r'(?i)("' + _CREDENTIAL_KEY + r'"\s*:\s*)"(?:\\.|[^"\\])*"'
         ),
         lambda m: f'{m.group(1)}"***"',
     ),
@@ -88,7 +127,14 @@ _SCRUBBERS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
     # Quoted plaintext/Python-repr credentials and multi-word HTTP auth values.
     (
         re.compile(
-            r'''(?i)(["']?(?:password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|auth(?:orization)?)["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+            r'''(?i)(["']?''' + _CREDENTIAL_KEY + r'''["']?\s*[:=]\s*)("(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*')'''
+        ),
+        lambda m: f"{m.group(1)}{m.group(2)[0]}***{m.group(2)[0]}",
+    ),
+    # Crashed writers and timeout diagnostics can end inside a quoted value.
+    (
+        re.compile(
+            r'''(?i)(["']?''' + _CREDENTIAL_KEY + r'''["']?\s*[:=]\s*)("(?:\\.|[^"\\])*\\?|'(?:\\.|[^'\\])*\\?)$'''
         ),
         lambda m: f"{m.group(1)}{m.group(2)[0]}***{m.group(2)[0]}",
     ),
@@ -96,11 +142,14 @@ _SCRUBBERS: list[tuple[re.Pattern[str], Callable[[re.Match[str]], str]]] = [
         re.compile(r'(?i)\b(Authorization\s*:\s*)(?:Basic|Digest)\s+[^\r\n]+'),
         lambda m: f"{m.group(1)}***",
     ),
+    (
+        re.compile(r'(?i)\b((?:Cookie|Set-Cookie)\s*:\s*)[^\r\n]+'),
+        lambda m: f"{m.group(1)}***",
+    ),
     # key=value / key: value (password, secret, token, api[_-]key, etc.)
     (
         re.compile(
-            r'(?i)\b(password|passwd|pwd|secret|token|api[_-]?key|access[_-]?key|'
-            r'auth(?:orization)?)\s*[:=]\s*(?!(?:bearer)\b)\S+'
+            r'(?i)\b(' + _CREDENTIAL_KEY + r')\s*[:=]\s*(?!(?:bearer)\b)\S+'
         ),
         lambda m: f"{m.group(1)}=***",
     ),
@@ -126,6 +175,41 @@ def _scrub(line: str) -> str:
     for pattern, repl in _SCRUBBERS:
         line = pattern.sub(repl, line)
     return line
+
+
+class LogRecordBuffer:
+    """Assemble bounded stderr records before scrubbing, including split credentials."""
+
+    def __init__(self) -> None:
+        """Retain at most one 8 KiB partial record between byte reads."""
+        self._pending = bytearray()
+        self._discarding = False
+
+    def feed(self, chunk: bytes) -> list[str]:
+        """Return complete safe lines; discard every fragment of oversized records."""
+        lines = []
+        fragments = chunk.split(b"\n")
+        for index, fragment in enumerate(fragments):
+            complete = index < len(fragments) - 1
+            if not self._discarding:
+                if len(self._pending) + len(fragment) > _LOG_LINE_CAP:
+                    self._pending.clear()
+                    self._discarding = True
+                    lines.append("[oversized log line omitted]")
+                else:
+                    self._pending.extend(fragment)
+            if complete:
+                if not self._discarding:
+                    line = self.partial()
+                    if line:
+                        lines.append(line)
+                self._pending.clear()
+                self._discarding = False
+        return lines
+
+    def partial(self) -> str:
+        """Return a scrubbed final/timeout diagnostic without exposing discarded tails."""
+        return _scrub(self._pending.decode("utf-8", errors="replace").rstrip())
 
 
 def _new_buffer() -> Deque[str]:
@@ -183,16 +267,17 @@ class NativeLogCapture:
         # Drop oversize records in full: keeping their tail can leak a credential
         # whose identifying key was discarded at the truncation boundary.
         self._buffer.app_errors.append(
-            "[oversized log line omitted]" if len(line) > _LOG_LINE_CAP else _scrub(line.rstrip())
+            "[oversized log line omitted]"
+            if len(line) > _LOG_LINE_CAP or len(line.encode("utf-8", errors="replace")) > _LOG_LINE_CAP
+            else _scrub(line.rstrip())
         )
 
 
 class StderrReader:
     """
     Reads from a pipe in a background daemon thread and appends lines to a LogBuffer.
-    Call `stop()` (or close the underlying pipe externally) to make the reader
-    unblock and exit — without this, the thread sits on the pipe forever once the
-    session closes, leaking the FD and a daemon thread per dead session.
+    Real pipe reads use nonblocking descriptors and short polling, so stop never
+    waits for the app or an inherited writer descriptor to reach EOF.
     """
 
     def __init__(self, pipe, log_buffer: LogBuffer) -> None:
@@ -205,31 +290,41 @@ class StderrReader:
     def _run(self) -> None:
         """Read bounded records and discard all fragments of an oversized line."""
         try:
-            discarding = False
-            while True:
-                raw = self._pipe.readline(_LOG_LINE_CAP + 1)
+            try:
+                fd = self._pipe.fileno()
+            except (AttributeError, OSError):
+                fd = None  # In-memory fixture streams have no OS descriptor.
+            if fd is not None:
+                os.set_blocking(fd, False)
+            records = LogRecordBuffer()
+            while not self._stop.is_set():
+                if fd is None:
+                    raw = self._pipe.readline(_LOG_LINE_CAP + 1)
+                else:
+                    ready, _, _ = select.select([fd], [], [], 0.05)
+                    if not ready:
+                        continue
+                    try:
+                        raw = os.read(fd, 65536)
+                    except BlockingIOError:
+                        continue
                 if not raw:
+                    final = records.partial()
+                    if final:
+                        self._buffer.app_errors.append(final)
                     break
-                if self._stop.is_set():
-                    break
-                newline = raw.endswith(b"\n" if isinstance(raw, bytes) else "\n")
-                if discarding or len(raw) > _LOG_LINE_CAP:
-                    if not discarding:
-                        self._buffer.app_errors.append("[oversized log line omitted]")
-                    discarding = not newline
-                    continue
-                if isinstance(raw, bytes):
-                    raw = raw.decode("utf-8", errors="replace")
-                line = raw.rstrip()
-                if line:
-                    self._buffer.app_errors.append(_scrub(line))
+                if isinstance(raw, str):
+                    raw = raw.encode("utf-8", errors="replace")
+                self._buffer.app_errors.extend(records.feed(raw))
         except Exception:
             pass
+        finally:
+            try:
+                self._pipe.close()
+            except Exception:
+                pass
 
     def stop(self) -> None:
-        """Signal the reader to exit and close the pipe so the blocking read returns."""
+        """Stop under a short bound without acquiring a blocked buffered-reader lock."""
         self._stop.set()
-        try:
-            self._pipe.close()
-        except Exception:
-            pass
+        self._thread.join(timeout=0.3)

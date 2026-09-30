@@ -13,13 +13,13 @@ Input uses Apple's CoreGraphics and private SkyLight APIs via Python `ctypes`; s
 Sessions are keyed by app name. Agents never handle a `session_id` — they just use the app's name:
 
 ```python
-screenshot(app="Youty")              # launches Youty if not running, returns screenshot
+screenshot(app="Youty")              # observes Youty; a cold launch requires active control
 fill_field(app="Youty", x=100, y=100, text="Example")  # type into a field
 click(app="Youty", x=100, y=100)             # click a button
 verdict(app="Youty", test_description="...")  # evidence for the agent to assess
 ```
 
-Tools that create an app session automatically launch the app if needed. Subsequent calls reuse the session.
+Tools attach to a running app without activating it. Creating a session for a stopped app requires active control and a cleared emergency latch because launching changes the desktop. Selecting background mode alone never launches an app. Subsequent calls reuse the selected session and window; observation does not activate or raise them, including in humanoid mode.
 
 ---
 
@@ -35,7 +35,8 @@ klyk/                   # Runtime package
 ├── skylight.py          # Private invisible-input bindings and delivery self-test
 ├── launcher.py          # Native app launch and Chromium detection
 ├── ocr.py               # On-device Apple Vision text recognition
-├── matcher.py           # NumPy template matching
+├── matcher.py           # NumPy template matching and retained-template budgets
+├── image_bounds.py      # Pure PNG header, payload, and dimension validation
 ├── ownership.py         # Cross-process control token
 ├── activity.py          # Bounded action history and observers
 ├── menubar.py           # Activity and control menu
@@ -69,9 +70,9 @@ LICENSE                 # MIT
 ## Architecture Details
 
 ### MCP client configuration
-`clients.py` keeps every supported local agent in one registry and always points it at the exact Python interpreter that owns the installed klyk package. Most JSON clients share a simple `mcpServers` merge; Codex/Grok use append-only TOML blocks because Python's standard library cannot safely rewrite TOML.
+`clients.py` keeps every supported local agent in one registry and always points it at the exact Python interpreter that owns the installed klyk package, using `-P -m klyk.mcp_server` so a workspace cannot shadow the package. Apple command-line helpers use their fixed macOS system paths rather than inherited `PATH`. Explicit MCP-client environment settings remain authoritative; startup does not search for `.env` files. Most JSON clients share a simple `mcpServers` merge; Codex/Grok use append-only TOML blocks because Python's standard library cannot safely rewrite TOML.
 
-OpenCode has a distinct global `mcp` shape and accepts both JSON and JSONC. Its stdlib-only span editor parses comments and trailing commas, edits only `mcp.klyk`, preserves unrelated bytes and file permissions, writes through an atomic same-directory replace, follows OpenCode's `config.json` → `opencode.json` → `opencode.jsonc` precedence, and removes klyk from every loaded global file on uninstall. Invalid or ambiguous structures fail closed with an exact manual snippet; no config is partially rewritten. After installation, the CLI runs `opencode mcp list` as a native end-to-end gate because macOS permissions are launcher-specific: a doctor pass in the installer process does not prove that OpenCode's spawned server has the same grant.
+OpenCode accepts JSON and JSONC, using `mcp.klyk` in V1 and `mcp.servers.klyk` in V2. Its stdlib-only span editor preserves comments, trailing commas, unrelated bytes, file permissions, custom environment values, and client-specific server settings. It follows the installed schema and loaded global-file precedence and removes klyk from every loaded schema on uninstall. Bounded regular-file reads reject special files; an exact file snapshot is rechecked before atomic replacement to refuse concurrent external edits. Invalid or ambiguous structures fail closed with an exact manual snippet; no config is partially rewritten. After installation, the CLI runs `opencode mcp list` as a native end-to-end gate because macOS permissions are launcher-specific: a doctor pass in the installer process does not prove that OpenCode's spawned server has the same grant.
 
 ### CoreGraphics via ctypes
 All input events use Apple's CoreGraphics framework directly via Python's `ctypes`. No third-party computer use libraries. The "humanoid" mode posts events to `kCGHIDEventTap` — the hardware input tap — so the OS processes them identically to physical input. The default "autonomous" mode and the strict "background" mode route mouse events through SkyLight instead (see Seamless Mode section below).
@@ -158,19 +159,19 @@ The flag applies only on cold launch. A running browser is attached without rest
 `get_template` / `find_template` use a normalized cross-correlation (the `TM_CCOEFF_NORMED` metric), implemented in **pure NumPy** — the numerator via an FFT (5-smooth-padded for speed), the per-window sums for zero-normalization via integral images. PNG decode/encode go through klyk's first-party CoreGraphics codec (`capture.decode_png_to_rgb_array` / `encode_rgb_array_to_png_b64`). There is no OpenCV dependency: it was the only package forcing `numpy>=2`, which broke shared Python environments. The result is numerically close to OpenCV's `matchTemplate` in the recorded comparison (elementwise max|Δ|≈2.6e-7); a full-window (1800×1169) match runs in ~430 ms, an order of magnitude faster with a `search_region`. The reason this is exposed as two explicit tools (rather than folded into `click_element`) is that it needs the agent to first identify a region from one screenshot, then locate it later — a different mental model from "find by label." Use it for icons, custom graphics, and anything else without text.
 
 ### Template cache
-`get_template` stores the captured PNG in `session.template_cache` (per-session dict, cap 50, FIFO eviction) and returns a short `template_id` like `tpl_abc123`. `find_template` and `wait_for_visual` accept either `template_id` or raw `template_b64`. The cache exists because large base64 PNGs are fragile when the LLM transcribes them — the short id is the safer reference. On miss, the error names the cache and tells the agent how to refresh.
+`get_template` stores the captured PNG in `session.template_cache` (per-session dict, at most 50 entries and 8 MiB encoded data, least-recently-used eviction) and returns a short `template_id` like `tpl_abc123`. `find_template` and `wait_for_visual` accept either `template_id` or raw `template_b64`. The cache exists because large base64 PNGs are fragile when the LLM transcribes them — the short id is the safer reference. Oversized entries are rejected before evicting valid templates. With at most 64 sessions, retained templates total at most 512 MiB. On miss, the error names the cache and tells the agent how to refresh. Template extraction and matching check a conservative 512 MiB working-set budget before PNG decode, float maps, integral images, or FFT arrays; the refusal points to a narrower search region.
 
 ### Screenshot + AX folding
 `inspect` returns the image plus a filtered AX element list capped at 50 entries (`ax_elements`, `ax_element_count`, `ax_truncated` when over cap); `screenshot` defaults to image only. The AX read is best-effort: if it fails, `ax_elements=[]` and `ax_error` is set, while a successful screenshot remains usable. Canonical truth: the image is the source for visual state; the AX list is a reference for label-based targeting.
 
 `inspect` captures pixels and reads the selected window's AX subtree concurrently. Labels/values are capped at 200 characters in observations. `ax_snapshot` provides an expanded bounded list; `screenshot` is the image-only path. Bounded traversal is not evidence that an absent element does not exist. Per-session mutation timestamps wait only for the unused portion of a 150 ms repaint interval, so agent think time already spent waiting is not charged again.
 
-Top-level MCP requests serialize target state and input; nested `run` steps share their owning request. Cancelled native input workers retain request ownership until cleanup finishes. Partial/uncertain input failures stop rather than trigger a second delivery path. Native field writes are read back immediately; accepted writes with different readback report unverified and are never followed by a blind paste.
+Top-level MCP requests serialize target state and input; nested `run` steps share their owning request. A cross-process input lease prevents another server from taking control until native input and cancellation cleanup finish. Cancelled native input workers stop at input checkpoints and are drained before that lease is released. The physical emergency chord ignores key autorepeat, and exit cleanup releases registered held keys and buttons. Partial/uncertain input failures stop rather than trigger a second delivery path. Native field writes are read back immediately; accepted writes with different readback report unverified and are never followed by a blind paste.
 
 Pass `save_path` to write the PNG to disk instead of returning it inline. The path is expanded (`~`-relative is fine) and resolved to an absolute path; on success the response gains `saved_path` and the inline image is omitted (saves tokens when the agent only needs the file). On write failure the response still contains the inline image plus a `save_error` string — the screenshot itself doesn't fail. The parent directory must already exist; klyk doesn't auto-create.
 
 ### Click hint
-After every `click(x, y)`, the server scans the AX tree for any labeled element within 20 px of the requested point. If one exists, the response gains a `nearby_ax_hint` block (label, role, distance, suggestion to use `click_element` instead). Logged identically. Costs one AX snapshot per click; only affects `click`, not `click_element`.
+After every `click(x, y)`, the server scans the AX tree for any labeled element within 20 px of the requested point. If one exists, the response gains a `nearby_ax_hint` block (label, role, distance, suggestion to use `click_element` instead). The hint is returned only to the caller; persistent diagnostics omit its label and value. Costs one AX snapshot per click; only affects `click`, not `click_element`.
 
 ### OCR three-tier fallback + recovery candidates
 `click_element`'s OCR path runs fast-mode Vision first (which can miss small or thin text). If that yields no substring match, it re-runs in accurate mode (slower, catches sub-15 px links and icon captions). If accurate mode still has no substring match, a third tier compares the query to each observation with **all whitespace collapsed**, accepting only an *exact* stripped-equality hit — this rescues a single rendered word Vision fragmented across a stray gap (`"ENTER"` → `"EN TER"`) without ever widening matching to unrelated text (exact-only, never substring). Coordinate delivery uses the same bounds, focus, and mode gates as `click`. The `via` field combines the match tier (`ocr` or `ocr_despaced`) with the actual input route. All passes use Apple Vision (`VNRecognizeTextRequest`) on-device.
@@ -218,7 +219,7 @@ Stale window IDs (closed/relaunched) surface as a clear error naming the missing
 
 `_focus_if_needed` refuses target-dependent input when a requested window cannot become key. Background mode returns a structured refusal instead of activating the app. `run` preserves explicit window identity on every step and stops after the first failed, refused, ambiguous, or interrupted step; remaining steps are counted as skipped. It never retries an action automatically.
 
-Use a window label or ID for precise multi-window targeting. The default resolved window may differ from the app's frontmost window. Losing a selected window does not authorize terminating the app: `list_windows` can enumerate survivors, after which the caller explicitly chooses a current window. Existing sessions are capped at 64; close an unused session before opening another.
+Use a window label or ID for precise multi-window targeting. The default resolved window may differ from the app's frontmost window. Session identity includes the process start token, and termination rechecks it before each signal. Losing a selected window does not authorize terminating the app: `list_windows` can enumerate survivors, after which the caller explicitly chooses a current window. Existing sessions are capped at 64; close an unused session before opening another.
 
 `verify=true` adds a focused-state observation, not proof that the user's task succeeded. Missing evidence is marked unavailable. `verdict` packages available evidence for the caller to assess; an empty error log does not prove network or console health.
 
@@ -243,7 +244,7 @@ Historical layering — modules at the top have no dependencies on those below, 
 
 ## Known Limitations & Risks
 
-Local persistence uses `private_files.py`: screenshots, the ownership token, and every diagnostic log rotation are restricted before writing, and linked or special-file destinations are refused. `klyk-call` uses exclusive random cache filenames under an owner-only capture directory. Persistent logging is attached only to the Klyk logger; MCP protocol debug records and tool exception contents are excluded. App stderr is bounded per record as well as per channel. PNG decoding checks encoded size and dimensions before native allocation; the shell transport caps its response buffer. See `SECURITY.md` for exact limits and the same-user trust boundary.
+Local persistence uses `private_files.py`: screenshots, the ownership token, and every diagnostic log rotation are restricted before writing, and linked or special-file destinations are refused. `klyk-call` uses exclusive random cache filenames under an owner-only capture directory. Persistent logging is attached only to the Klyk logger; MCP protocol debug records and tool exception contents are excluded. App stderr is bounded per record as well as per channel. PNG decoding checks encoded size and dimensions before native allocation; the shell transport caps its response buffer, withholds raw stderr on connection failures, and retains no more than 20 image files per response. Cache eviction tolerates invalid entries and protects files named in the current response. Background log readers poll nonblocking descriptors so an inherited writer cannot stall session cleanup. See `SECURITY.md` for exact limits and the same-user trust boundary.
 
 The single authoritative register of every known limitation and operational risk in klyk. Other docs link here rather than restating it. Ordered by severity: operational risks (things that can fail in production) first, then dependency and maturity caveats, then a pointer to the API-level hard limits tabled below.
 

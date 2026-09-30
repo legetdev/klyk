@@ -10,6 +10,7 @@ import ctypes
 import os
 from pathlib import Path
 import subprocess
+import struct
 import sys
 import time
 from types import ModuleType, SimpleNamespace
@@ -17,6 +18,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from test_input_cleanup import load_functions
+from klyk.image_bounds import png_dimensions, validate_image_dimensions
 
 
 class CaptureScopeTests(unittest.TestCase):
@@ -32,13 +34,14 @@ class CaptureScopeTests(unittest.TestCase):
             "base64": base64,
             "time": SimpleNamespace(sleep=lambda _seconds: None),
             "window_capture": SimpleNamespace(),
+            "_validate_image_dimensions": validate_image_dimensions, "png_dimensions": png_dimensions,
         }
         load_functions("capture.py", {"take_screenshot"}, self.namespace)
 
     @staticmethod
     def _png():
         """Return a minimally valid PNG payload large enough for the size guard."""
-        return b"\x89PNG\r\n\x1a\n" + b"x" * 120
+        return b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + struct.pack(">II", 20, 30) + b"\0" * 120
 
     def test_window_id_wins_over_rectangle_in_cli_fallback(self):
         """Supplying both forms must use screencapture's window selector only."""
@@ -47,7 +50,7 @@ class CaptureScopeTests(unittest.TestCase):
         def run(command, **kwargs):
             """Create controlled capture output and conversion dimensions."""
             commands.append(command)
-            if command[0] == "screencapture":
+            if command[0] == "/usr/sbin/screencapture":
                 Path(command[-1]).write_bytes(self._png())
                 return SimpleNamespace(returncode=0)
             Path(command[-1]).write_bytes(self._png())
@@ -109,6 +112,7 @@ class CaptureScopeTests(unittest.TestCase):
             "kCGWindowImageBoundsIgnoreFraming": 3,
             "kCGWindowImageDefault": 4,
             "kCGNullWindowID": 0,
+            "_validate_image_dimensions": validate_image_dimensions,
         })
         load_functions("capture.py", {"_take_screenshot_cg"}, self.namespace)
         with self.assertRaisesRegex(RuntimeError, "returned NULL"):
@@ -210,8 +214,8 @@ class WindowCaptureCacheTests(unittest.TestCase):
         quartz.CGPreflightScreenCaptureAccess = lambda: True
         quartz.CGImageGetWidth = lambda _image: 20
         quartz.CGImageGetHeight = lambda _image: 30
-        quartz.CGImageDestinationCreateWithData = lambda *_args: object()
-        quartz.CGImageDestinationAddImage = lambda *_args: None
+        quartz.CGImageDestinationCreateWithData = lambda data, *_args: data
+        quartz.CGImageDestinationAddImage = lambda data, *_args: data.extend(CaptureScopeTests._png())
         quartz.CGImageDestinationFinalize = lambda *_args: True
         self.modules = {"objc": objc, "Foundation": foundation, "Quartz": quartz}
         self.module._load = MagicMock(return_value=self._classes())
@@ -223,6 +227,15 @@ class WindowCaptureCacheTests(unittest.TestCase):
         self.module._TTL = self._original_ttl
         self.module._plans.clear()
         self.module._plans.update(self._original_plans)
+
+    def test_invalid_window_plan_rejected_before_native_import_or_lookup(self):
+        """Malformed direct requests cannot become a different integer window plan."""
+        for values in ((True, 20, 30), (1.5, 20, 30), (2 ** 32 + 1, 20, 30),
+                       (1, "20", 30), (1, 20.5, 30), (1, 8193, 1)):
+            with self.subTest(values=values), self.assertRaises(ValueError):
+                self.module.take(*values)
+        self.module._load.assert_not_called()
+        self.assertEqual(len(self.module._plans), 0)
 
     def _classes(self):
         """Build fake ScreenCaptureKit classes whose selectors are observable."""
@@ -309,6 +322,7 @@ class WindowCaptureCacheTests(unittest.TestCase):
             "_resize_cgimage": MagicMock(side_effect=RuntimeError("resize failed")),
             "_cgimage_to_png_bytes": MagicMock(),
             "base64": base64,
+            "_validate_image_dimensions": validate_image_dimensions,
         }
         load_functions("capture.py", {"_take_screenshot_cg"}, namespace)
         with self.assertRaisesRegex(RuntimeError, "resize failed"):

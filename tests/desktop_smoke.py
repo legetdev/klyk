@@ -67,7 +67,7 @@ def main():
             if existing.stdout.strip():raise RuntimeError('An existing Chrome process prevents isolated app-name targeting')
             chrome=subprocess.Popen([str(chrome_executable),'--user-data-dir='+chrome_profile.name,
                                      '--no-first-run','--no-default-browser-check','--new-window',
-                                     '--window-position=100,100','--window-size=900,700',url],
+                                     '--window-position=50,50','--window-size=900,650',url],
                                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['browser_pid']=chrome.pid
             ready=capture.wait_for_window(chrome.pid,timeout=20)

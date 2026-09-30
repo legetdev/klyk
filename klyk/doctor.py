@@ -111,8 +111,8 @@ def check_python_version() -> CheckResult:
 
 def check_klyk_version() -> CheckResult:
     """Installed vs latest published release. Uses the shared daily cache
-    (a fresh doctor run refetches when the cache is stale, capped at a 3 s
-    network wait). Offline or disabled is never a failure — the detail says
+    (a fresh doctor run refetches stale metadata using a short socket timeout
+    and bounded reads). Offline or disabled is never a failure — the detail says
     exactly what happened either way."""
     from . import __version__, updates
     if not updates.enabled():
@@ -130,9 +130,9 @@ def check_klyk_version() -> CheckResult:
         return CheckResult(
             "klyk version", "warn",
             f"{__version__} → {st['latest']} available",
-            "Run `klyk update` — one command upgrades klyk for every "
-            "connected AI client at once and restarts the running server, "
-            "so agents load the new version on their next call.",
+            "Run `klyk update` to upgrade this installation and restart its "
+            "verified server processes. Clients with separate installations "
+            "need their own update.",
         )
     return CheckResult("klyk version", "ok", f"{__version__} (latest release)")
 
@@ -368,6 +368,10 @@ def check_mcp_client_entries() -> CheckResult:
                 problems.append(f"{client.label}: klyk exists only in the legacy config; current agy reads {client.path}")
                 repair_keys.append(client.key)
                 continue
+            if entry is None and clients.legacy_opencode_entry(client) is not None:
+                problems.append(f"{client.label}: klyk exists only in another stored configuration; use a matching OpenCode version or migrate the entry")
+                repair_keys.append(client.key)
+                continue
         except Exception as exc:
             problems.append(f"{client.label}: unreadable config ({exc})")
             repair_keys.append(client.key)
@@ -403,6 +407,12 @@ def check_mcp_client_entries() -> CheckResult:
             continue
         if not matches:
             problems.append(f"{client.label}: entry points at a different klyk installation")
+            repair_keys.append(client.key)
+            continue
+        environment = entry.get("environment" if client.fmt == "opencode" else "env")
+        if (not isinstance(environment, dict) or "PYTHONPATH" not in environment
+                or not all(isinstance(value, str) for value in environment.values())):
+            problems.append(f"{client.label}: launch environment does not explicitly control Python imports")
             repair_keys.append(client.key)
             continue
         valid.append(client.label)
@@ -441,7 +451,7 @@ def check_control_owner() -> CheckResult:
         owner = ownership.current_owner()
     except Exception as e:
         return CheckResult("Control owner", "warn", f"could not check: {type(e).__name__}")
-    if not owner:
+    if not isinstance(owner, int) or isinstance(owner, bool) or not 1 < owner <= 2147483647:
         return CheckResult("Control owner", "ok", "free — no klyk running")
     alive = True
     try:

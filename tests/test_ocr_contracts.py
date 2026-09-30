@@ -1,11 +1,18 @@
 """Portable OCR contracts using fake Foundation, Quartz, and Vision objects."""
 
 import base64
+import math
+import struct
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock
 
 from test_input_cleanup import load_functions
+from klyk.image_bounds import validate_image_dimensions, validated_png_bytes
+
+_IMAGE = base64.b64encode(
+    b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + struct.pack(">II", 200, 100) + b"\0" * 9
+).decode()
 
 
 class _NativeArray:
@@ -34,6 +41,9 @@ class OcrContractTests(unittest.TestCase):
         handler._init_handler = init_handler
         return {
             "base64": base64,
+            "math": math,
+            "validate_image_dimensions": validate_image_dimensions,
+            "validated_png_bytes": validated_png_bytes,
             "NSData": data,
             "NSDictionary": dictionary,
             "NSArray": array,
@@ -60,7 +70,7 @@ class OcrContractTests(unittest.TestCase):
         ns = self._namespace(request, handler)
         load_functions("ocr.py", {"recognize_all"}, ns)
         with self.assertRaisesRegex(ValueError, "fit inside"):
-            ns["recognize_all"]("aGVsbG8=", region=(150, 80, 60, 30))
+            ns["recognize_all"](_IMAGE, region=(150, 80, 60, 30))
         handler.performRequests_error_.assert_not_called()
 
     def test_region_is_normalized_and_results_return_full_image_coordinates(self):
@@ -82,7 +92,7 @@ class OcrContractTests(unittest.TestCase):
         handler.performRequests_error_.return_value = (True, None)
         ns = self._namespace(request, handler)
         load_functions("ocr.py", {"recognize_all", "_configure_compute"}, ns)
-        result = ns["recognize_all"]("aGVsbG8=", region=(20, 10, 100, 40))
+        result = ns["recognize_all"](_IMAGE, region=(20, 10, 100, 40))
         self.assertEqual(request.setRegionOfInterest_.call_args.args[0], ((0.1, 0.5), (0.5, 0.4)))
         self.assertEqual(result[0]["text"], "Hello")
         self.assertEqual((result[0]["x"], result[0]["y"], result[0]["width"], result[0]["height"]), (55, 40, 20, 4))
@@ -96,7 +106,7 @@ class OcrContractTests(unittest.TestCase):
         ns = self._namespace(request, handler)
         load_functions("ocr.py", {"recognize_all", "_configure_compute"}, ns)
         with self.assertRaisesRegex(RuntimeError, "Vision failed"):
-            ns["recognize_all"]("aGVsbG8=")
+            ns["recognize_all"](_IMAGE)
 
     def test_modern_compute_selects_supported_cpu_devices(self):
         """Modern Vision stages select an available ML CPU device per stage."""
@@ -131,7 +141,7 @@ class OcrContractTests(unittest.TestCase):
         handler.performRequests_error_.return_value = (True, None)
         ns = self._namespace(request, handler)
         load_functions("ocr.py", {"recognize_all", "_configure_compute"}, ns)
-        ns["recognize_all"]("aGVsbG8=", languages=["de-DE"])
+        ns["recognize_all"](_IMAGE, languages=["de-DE"])
         self.assertIsInstance(handler._init_handler.call_args.args[1], _NativeDictionary)
         requests = handler.performRequests_error_.call_args.args[0]
         self.assertIsInstance(requests, _NativeArray)

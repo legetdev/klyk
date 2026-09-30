@@ -23,6 +23,10 @@ class SaveDialogTests(unittest.IsolatedAsyncioTestCase):
         self.server.computer.ax_navigate_save_panel.return_value = "Temporary folder"
         self.server.computer.ax_set_save_filename.return_value = True
         self.server.computer.ax_read_alert.return_value = None
+        self.server.computer.ax_snapshot.return_value = [
+            {"role": "AXSheet", "label": "Save"},
+            {"role": "AXTextField", "label": "Save As", "focused": True},
+        ]
 
     async def save(self, path):
         """Exercise the production save handler and decode its result."""
@@ -80,6 +84,54 @@ class SaveDialogTests(unittest.IsolatedAsyncioTestCase):
             result = await self.save(path)
         self.assertFalse(result["saved"])
         self.assertIn("remained open", result["error"])
+
+    async def test_multiple_panels_refuse_before_filename_or_button_actions(self):
+        """Two simultaneous documents must not make the save target an implicit first match."""
+        self.server.computer.ax_snapshot.return_value = [{"role": "AXSheet"}, {"role": "AXDialog"}]
+        result = await self.save("/tmp/fixture-output.txt")
+        self.assertFalse(result["ok"])
+        self.server.computer.ax_focus_save_field.assert_not_called()
+        self.server.computer.ax_set_save_filename.assert_not_called()
+        self.server.computer.ax_press_panel_button.assert_not_called()
+
+    async def test_unknown_navigation_effect_never_falls_through_to_save(self):
+        """An attempted but unverified sidebar write cannot be retried through keyboard input."""
+        self.server.computer.ax_navigate_save_panel.side_effect = RuntimeError("Navigation effect is unknown; inspect first")
+        self.server.computer.press_key = AsyncMock()
+        self.server.computer.type_text_char_by_char = AsyncMock()
+        result = await self.save("/tmp/fixture-output.txt")
+        self.assertFalse(result["ok"])
+        self.server.computer.ax_set_save_filename.assert_not_called()
+        self.server.computer.ax_press_panel_button.assert_not_called()
+        self.server.computer.press_key.assert_not_awaited()
+        self.server.computer.type_text_char_by_char.assert_not_awaited()
+
+    async def test_failed_filename_write_sends_no_keys_and_does_not_press_save(self):
+        """Failure to prove the filename cannot trigger a destructive select-all fallback."""
+        self.server.computer.ax_set_save_filename.return_value = False
+        self.server.computer.press_key = AsyncMock()
+        self.server.computer.type_text_char_by_char = AsyncMock()
+        result = await self.save("/tmp/fixture-output.txt")
+        self.assertFalse(result["ok"])
+        self.server.computer.ax_press_panel_button.assert_not_called()
+        self.server.computer.press_key.assert_not_awaited()
+        self.server.computer.type_text_char_by_char.assert_not_awaited()
+
+    async def test_missing_save_button_never_falls_back_to_return(self):
+        """A button miss must not send Return into the document or another modal."""
+        self.server.computer.ax_press_panel_button.return_value = False
+        self.server.computer.press_key = AsyncMock()
+        result = await self.save("/tmp/fixture-output.txt")
+        self.assertFalse(result["ok"])
+        self.server.computer.press_key.assert_not_awaited()
+
+    async def test_save_without_path_explicitly_leaves_destination_unverified(self):
+        """Panel closure alone does not identify which file was created or overwritten."""
+        self.server.computer.ax_press_panel_button.return_value = True
+        result = payload(await self.server.call_tool("handle_system_dialog", {"app": "Fixture", "action": "save"}))
+        self.assertTrue(result["ok"])
+        self.assertIsNone(result["saved"])
+        self.assertFalse(result["verified"])
 
 
 if __name__ == "__main__":

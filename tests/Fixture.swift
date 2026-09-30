@@ -39,11 +39,15 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var opened = ""
     var clicks = 0
     var selections = 0
+    var inputEvents: [String: Int] = [:]
+    var inputMonitor: Any?
     var statePath = ProcessInfo.processInfo.environment["KLYK_FIXTURE_STATE"]!
+    let compactLayout = ProcessInfo.processInfo.environment["KLYK_FIXTURE_COMPACT"] == "1"
 
     // Build two independently addressable windows and native controls with stable labels.
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        startInputMonitor()
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
@@ -62,7 +66,7 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         NSApp.mainMenu = menu
         for index in 0..<2 {
             let step = ProcessInfo.processInfo.environment["KLYK_FIXTURE_OVERLAP"] == "1" ? 0 : 420
-            let window = NSWindow(contentRect: NSRect(x: 120 + index * step, y: 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
+            let window = NSWindow(contentRect: NSRect(x: 120 + index * step, y: compactLayout ? 20 : 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
             window.title = index == 0 ? "Klyk Fixture A" : "Klyk Fixture B"
             window.isReleasedWhenClosed = false
             let offset = Double(ProcessInfo.processInfo.environment["KLYK_FIXTURE_OFFSET"] ?? "0") ?? 0
@@ -110,6 +114,25 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         writeState()
     }
 
+    // Observe actual delivered input pairs without consuming or changing their events.
+    func startInputMonitor() {
+        let mask: NSEvent.EventTypeMask = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
+            .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .leftMouseDragged,
+            .rightMouseDragged, .otherMouseDragged, .scrollWheel, .mouseMoved]
+        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self else { return event }
+            let name: String
+            switch event.type {
+            case .keyDown: name = "key_down:\(event.keyCode)"
+            case .keyUp: name = "key_up:\(event.keyCode)"
+            default: name = "event:\(event.type.rawValue)"
+            }
+            self.inputEvents[name, default: 0] += 1
+            self.writeState()
+            return event
+        }
+    }
+
     // Count actual AppKit action delivery independently from the MCP response.
     @objc func clicked(_ sender: Any?) { clicks += 1; writeState() }
     // Count popup/slider action delivery independently from the input driver.
@@ -133,8 +156,8 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     }
     // Atomically expose fixture state for independent assertions without inspecting private apps.
     func writeState() {
-        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive, "clicks":clicks,"opened":opened,"selections":selections,
-            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["id":$0.windowNumber,"title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height]}]
+        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive, "layout":compactLayout ? "compact" : "default", "clicks":clicks,"opened":opened,"selections":selections,"input_events":inputEvents,
+            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["id":$0.windowNumber,"title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height,"content_width":$0.contentView?.bounds.width ?? 0,"content_height":$0.contentView?.bounds.height ?? 0]}]
         if let encoded = try? JSONSerialization.data(withJSONObject:data,options:[.sortedKeys]) { try? encoded.write(to:URL(fileURLWithPath:statePath),options:.atomic) }
     }
 }

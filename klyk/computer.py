@@ -12,7 +12,6 @@ import os
 import subprocess
 import threading
 import time
-import time
 
 from .keycodes import parse_key_combo, char_to_keycode, MODIFIER_FLAGS
 
@@ -31,11 +30,18 @@ log = logging.getLogger("klyk.computer")
 # ---------------------------------------------------------------------------
 
 class CGPoint(ctypes.Structure):
+    """Represent CoreGraphics logical-point coordinates at the native boundary."""
     _fields_ = [("x", ctypes.c_double), ("y", ctypes.c_double)]
 
 
 class CGSize(ctypes.Structure):
+    """Represent native window dimensions without guessing coordinate scale."""
     _fields_ = [("width", ctypes.c_double), ("height", ctypes.c_double)]
+
+
+class CFRange(ctypes.Structure):
+    """Represent an exact CoreFoundation UTF-16 range for complete string reads."""
+    _fields_ = [("location", ctypes.c_long), ("length", ctypes.c_long)]
 
 
 # ---------------------------------------------------------------------------
@@ -75,10 +81,14 @@ _cf.CFRetain.restype = ctypes.c_void_p
 _cf.CFRetain.argtypes = [ctypes.c_void_p]
 _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
 _cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
+_cf.CFStringCreateWithBytes.restype = ctypes.c_void_p
+_cf.CFStringCreateWithBytes.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long, ctypes.c_uint32, ctypes.c_bool]
 _cf.CFStringGetCString.restype = ctypes.c_bool
 _cf.CFStringGetCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_long, ctypes.c_uint32]
 _cf.CFStringGetLength.restype = ctypes.c_long
 _cf.CFStringGetLength.argtypes = [ctypes.c_void_p]
+_cf.CFStringGetCharacters.restype = None
+_cf.CFStringGetCharacters.argtypes = [ctypes.c_void_p, CFRange, ctypes.POINTER(ctypes.c_uint16)]
 _cf.CFCopyDescription.restype = ctypes.c_void_p
 _cf.CFCopyDescription.argtypes = [ctypes.c_void_p]
 _cf.CFGetTypeID.restype = ctypes.c_ulong
@@ -229,6 +239,8 @@ _cf.CFMachPortCreateRunLoopSource.restype  = ctypes.c_void_p
 _cf.CFMachPortCreateRunLoopSource.argtypes = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_long]
 _cf.CFRunLoopAddSource.restype             = None
 _cf.CFRunLoopAddSource.argtypes            = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
+_cf.CFRunLoopRemoveSource.restype          = None
+_cf.CFRunLoopRemoveSource.argtypes         = [ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p]
 _cf.CFRunLoopGetCurrent.restype            = ctypes.c_void_p
 _cf.CFRunLoopGetCurrent.argtypes           = []
 _cf.CFRunLoopRun.restype                   = None
@@ -254,12 +266,51 @@ _EMERGENCY_STOP_FLAGS   = 0x120000  # Cmd (0x100000) | Shift (0x020000)
 _stop_engaged     = [False]
 _last_chord_t     = [0.0]
 _CHORD_DEBOUNCE_S = 0.6   # ignore key-repeat / panic double-taps within this window
-_stop_lock        = threading.Lock()
+_stop_lock        = threading.RLock()  # Signal cleanup may interrupt a stop check on this thread.
 _worker_state = threading.local()
+_held_lock = threading.RLock()
+_held_inputs: dict[tuple, object] = {}
 
 
 class EmergencyStop(RuntimeError):
+    """An input request attempted to continue after the user's stop latch engaged."""
     pass
+
+
+def _begin_input(token: tuple, press, release) -> None:
+    """Register release before a down event so exit cleanup cannot miss a held input."""
+    with _held_lock:
+        _check_stop()
+        _held_inputs.setdefault(token, release)
+        try:
+            press()
+        except BaseException:
+            _finish_input(token)
+            raise
+
+
+def _finish_input(token: tuple) -> bool:
+    """Release one held input exactly once, even when stop or cancellation is active."""
+    with _held_lock:
+        release = _held_inputs.pop(token, None)
+        if release is None:
+            return False
+        release()
+        return True
+
+
+def release_held_input() -> None:
+    """Halt new downs and release every held key/button before a hard process exit."""
+    with _stop_lock:
+        _stop_engaged[0] = True
+    with _held_lock:
+        pending = list(_held_inputs.values())
+        _held_inputs.clear()
+        for release in pending:
+            try:
+                release()
+            except Exception:
+                log.warning("A held input could not be released during exit cleanup.")
 
 
 def _check_stop() -> None:
@@ -344,9 +395,18 @@ _TAP_CB_TYPE = ctypes.CFUNCTYPE(
 
 
 def _make_stop_callback():
+    """Ignore key repeats and recover a disabled listener without changing the stop latch."""
     def _cb(proxy, etype, event, refcon):
+        """Handle one event-tap notification without consuming the user's physical input."""
         try:
+            if etype in (0xFFFFFFFE, 0xFFFFFFFF):
+                tap = _stop_tap[0]
+                if tap:
+                    _cg.CGEventTapEnable(ctypes.c_void_p(tap), True)
+                return event
             if etype == kCGEventKeyDown:
+                if _cg.CGEventGetIntegerValueField(ctypes.c_void_p(event), 8):
+                    return event  # A held chord must never toggle an engaged stop off.
                 kc = _cg.CGEventGetIntegerValueField(
                     ctypes.c_void_p(event), kCGKeyboardEventKeycode
                 )
@@ -364,10 +424,16 @@ def _make_stop_callback():
 
 
 _tap_callback = _make_stop_callback()
+_stop_tap = [None]
+_cg.CGEventTapEnable.restype = None
+_cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
 
 
 def _start_emergency_stop_tap() -> None:
+    """Install the listener on a daemon run loop and retain its handle for recovery."""
     def _run():
+        """Run the native listener without activating any application."""
+        tap = src = rl = None
         try:
             common_modes = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopCommonModes").value
             tap = _cg.CGEventTapCreate(
@@ -381,13 +447,25 @@ def _start_emergency_stop_tap() -> None:
             if not tap:
                 log.warning("Emergency stop tap could not be created (Accessibility permission required)")
                 return
+            _stop_tap[0] = tap
             src = _cf.CFMachPortCreateRunLoopSource(None, ctypes.c_void_p(tap), 0)
+            if not src:
+                log.warning("Emergency stop listener could not create its run-loop source.")
+                return
             rl  = _cf.CFRunLoopGetCurrent()
             _cf.CFRunLoopAddSource(ctypes.c_void_p(rl), ctypes.c_void_p(src), common_modes)
             log.info("Emergency stop tap active — Cmd+Shift+Escape will halt all input")
             _cf.CFRunLoopRun()
-        except Exception as e:
-            log.warning(f"Emergency stop tap error: {e}")
+        except Exception as error:
+            log.warning("Emergency stop listener failed (%s).", type(error).__name__)
+        finally:
+            _stop_tap[0] = None
+            if src:
+                if rl:
+                    _cf.CFRunLoopRemoveSource(ctypes.c_void_p(rl), ctypes.c_void_p(src), common_modes)
+                _cf.CFRelease(ctypes.c_void_p(src))
+            if tap:
+                _cf.CFRelease(ctypes.c_void_p(tap))
 
     threading.Thread(target=_run, daemon=True, name="klyk-stop").start()
 
@@ -397,30 +475,41 @@ def _start_emergency_stop_tap() -> None:
 # ---------------------------------------------------------------------------
 
 def _post(event_ptr: int) -> None:
-    _cg.CGEventPost(kCGHIDEventTap, ctypes.c_void_p(event_ptr))
-    _cf.CFRelease(ctypes.c_void_p(event_ptr))
+    """Post and release one owned event; allocation failures must never reach native APIs."""
+    if not event_ptr:
+        raise RuntimeError("Input event could not be created; no input was sent.")
+    try:
+        _cg.CGEventPost(kCGHIDEventTap, ctypes.c_void_p(event_ptr))
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(event_ptr))
 
 
 def _post_to_pid(pid: int, event_ptr: int) -> None:
     """Post keyboard event directly to a process — no window activation needed."""
-    _cg.CGEventPostToPid(ctypes.c_int32(pid), ctypes.c_void_p(event_ptr))
-    _cf.CFRelease(ctypes.c_void_p(event_ptr))
+    if not event_ptr:
+        raise RuntimeError("Input event could not be created; no input was sent.")
+    try:
+        _cg.CGEventPostToPid(ctypes.c_int32(pid), ctypes.c_void_p(event_ptr))
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(event_ptr))
 
 
 def _cfstr_to_py(cf_str: int) -> str:
-    """Decode bounded native text without dropping values beyond the old 2 KB buffer."""
+    """Decode every bounded UTF-16 code unit; unreadable text must never resemble empty text."""
     if not cf_str:
         return ""
     length = _cf.CFStringGetLength(ctypes.c_void_p(cf_str))
-    if length > 100_000:
-        return ""  # Bound native allocations; oversized writes remain explicitly unverified.
-    size = max(1, length * 4 + 1)
-    buf = ctypes.create_string_buffer(size)
-    ok = _cf.CFStringGetCString(ctypes.c_void_p(cf_str), buf, size, kCFStringEncodingUTF8)
-    return buf.value.decode("utf-8", errors="replace") if ok else ""
+    if not 0 <= length <= 100_000:
+        raise ValueError("The complete accessibility value exceeds its safe text limit.")
+    if length == 0:
+        return ""
+    units = (ctypes.c_uint16 * length)()
+    _cf.CFStringGetCharacters(ctypes.c_void_p(cf_str), CFRange(0, length), units)
+    return bytes(units).decode("utf-16-le", "strict")
 
 
 def _cftype_to_str(val_ref: int) -> str:
+    """Read native strings and scalar values without substituting unreadable values."""
     if not val_ref:
         return ""
     string_tid = _cf.CFStringGetTypeID()
@@ -439,9 +528,10 @@ def _cftype_to_str(val_ref: int) -> str:
         return ""
     desc = _cf.CFCopyDescription(ctypes.c_void_p(val_ref))
     if desc:
-        result = _cfstr_to_py(desc)
-        _cf.CFRelease(ctypes.c_void_p(desc))
-        return result
+        try:
+            return _cfstr_to_py(desc)
+        finally:
+            _cf.CFRelease(ctypes.c_void_p(desc))
     return ""
 
 
@@ -470,8 +560,10 @@ def _ax_attribute_at(x: float, y: float, attribute_bytes: bytes) -> str | None:
         if err != 0 or not val_ref.value:
             return None
 
-        result = _cftype_to_str(val_ref.value)
-        _cf.CFRelease(val_ref)
+        try:
+            result = _cftype_to_str(val_ref.value)
+        finally:
+            _cf.CFRelease(val_ref)
         return result if result else None
 
     except Exception:
@@ -480,49 +572,48 @@ def _ax_attribute_at(x: float, y: float, attribute_bytes: bytes) -> str | None:
 
 def _press_key_sync(keycode: int, flags: int, pid: int | None = None) -> None:
     """Post an exact modifier state, including zero, so preceding shortcuts cannot leak Shift."""
-    post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
-    ev_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
-    post(ev_down)
-    time.sleep(0.005)
-    ev_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-    post(ev_up)
+    _key_down_sync(keycode, flags, pid)
+    try:
+        time.sleep(0.005)
+    finally:
+        _key_up_sync(keycode, flags, pid)
 
 
 def _key_down_sync(keycode: int, flags: int, pid: int | None = None) -> None:
     """Post a single keydown — no matching keyup. Used by hold_key to press
     the key at the start of the hold; the hold loop reposts dragged-style
     keydowns to keep auto-repeat alive in apps that listen for repeats."""
-    post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
-    ev_down = _cg.CGEventCreateKeyboardEvent(None, keycode, True)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
-    post(ev_down)
+    _begin_input(("key", pid, keycode),
+                 lambda: _send_key_event(keycode, flags, True, pid),
+                 lambda: _send_key_event(keycode, flags, False, pid))
 
 
 def _key_up_sync(keycode: int, flags: int, pid: int | None = None) -> None:
     """Post a single keyup — pairs with _key_down_sync at the end of a hold."""
-    post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
-    ev_up = _cg.CGEventCreateKeyboardEvent(None, keycode, False)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-    post(ev_up)
+    _finish_input(("key", pid, keycode))
+
+
+def _send_key_event(keycode: int, flags: int, is_down: bool, pid: int | None) -> None:
+    """Construct a keyboard event with explicit flags and release its native reference."""
+    event = _cg.CGEventCreateKeyboardEvent(None, keycode, is_down)
+    if not event:
+        raise RuntimeError("Keyboard event could not be created; input was interrupted.")
+    try:
+        _cg.CGEventSetFlags(ctypes.c_void_p(event), flags)
+    except BaseException:
+        _cf.CFRelease(ctypes.c_void_p(event))
+        raise
+    (_post_to_pid(pid, event) if pid else _post(event))
 
 
 def _paste_sync(pid: int | None = None) -> None:
-    post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
+    """Deliver Cmd+V with the same balanced-key cleanup as every other shortcut."""
     # Resolve V against the active layout so Cmd+V works regardless of
     # whether the V key sits at the US-QWERTY position (kc 9).
     v_keycode, _ = char_to_keycode("v")
     if v_keycode is None:
         v_keycode = 9  # last-ditch fallback
-    cmd_flag = MODIFIER_FLAGS["cmd"]
-    ev_down = _cg.CGEventCreateKeyboardEvent(None, v_keycode, True)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), cmd_flag)
-    post(ev_down)
-    time.sleep(0.005)
-    ev_up = _cg.CGEventCreateKeyboardEvent(None, v_keycode, False)
-    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), cmd_flag)
-    post(ev_up)
+    _press_key_sync(v_keycode, MODIFIER_FLAGS["cmd"], pid)
 
 
 # ---------------------------------------------------------------------------
@@ -547,19 +638,23 @@ def check_accessibility() -> None:
 
 async def activate_app(pid: int) -> None:
     """Bring app window to front using native ProcessManager API. Falls back to osascript if unavailable."""
+    _check_stop()
     try:
         psn = _PSN()
         err = _appserv.GetProcessForPID(pid, ctypes.byref(psn))
         if err == 0:
-            _appserv.SetFrontProcessWithOptions(ctypes.byref(psn), _kSetFrontProcessFrontWindowOnly)
-            await asyncio.sleep(0.005)
-            return
+            _check_stop()
+            if _appserv.SetFrontProcessWithOptions(ctypes.byref(psn), _kSetFrontProcessFrontWindowOnly) == 0:
+                await asyncio.sleep(0.005)
+                return
+    except RuntimeError:
+        raise
     except Exception:
         pass
     # Fallback: shortened osascript (no AXRaise, just frontmost)
     script = f'tell application "System Events" to set frontmost of (first process whose unix id is {pid}) to true'
-    await asyncio.get_event_loop().run_in_executor(
-        None, lambda: subprocess.run(["osascript", "-e", script], capture_output=True, timeout=3)
+    await run_input(
+        lambda: subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=3)
     )
     await asyncio.sleep(0.05)
 
@@ -603,6 +698,7 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
         "ok"         — value was read successfully
         "no_value"   — AX call succeeded but the element exposes no AXValue
         "no_element" — no AX element resolved at the coordinate
+        "unreadable_value" — the full value cannot be safely decoded
     Lets handlers tell agents whether to retry (transient AX failure) or stop
     asking (the element fundamentally doesn't expose a value).
     """
@@ -632,8 +728,12 @@ def ax_value_at_detailed(x: float, y: float, max_retries: int = 4, settle_ms: in
                     # Element resolved, attribute call ok, but no value present.
                     # That's a stable signal — element just doesn't expose AXValue.
                     return (None, "no_value")
-                value = _cftype_to_str(val_ref.value)
-                _cf.CFRelease(val_ref)
+                try:
+                    value = _cftype_to_str(val_ref.value)
+                except ValueError:
+                    return (None, "unreadable_value")
+                finally:
+                    _cf.CFRelease(val_ref)
                 return (value, "ok")
             finally:
                 _cf.CFRelease(elem_ref)
@@ -651,7 +751,7 @@ def _ax_matches_pid(element: int, expected_pid: int | None) -> bool:
             and pid.value == expected_pid)
 
 
-def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | None = None, window_id: int | None = None) -> dict:
+def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | None = None, window_id: int | None = None, expected_label: str | None = None) -> dict:
     """
     Resolve the AX element at (x, y) and invoke AXUIElementPerformAction with
     the named action (e.g. AXPress, AXShowMenu, AXIncrement).
@@ -673,7 +773,7 @@ def ax_perform_action_at(x: float, y: float, action: str, expected_pid: int | No
     _check_stop()
     action_bytes = action.encode("utf-8")
 
-    elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id))
+    elem_ref = ctypes.c_void_p(_ax_element_at(x, y, expected_pid, window_id, expected_label))
     if not elem_ref.value:
         return {"ok": False, "action": action, "status": "no_element"}
 
@@ -895,24 +995,33 @@ def ax_grid_text(pid: int, window_id: int, points: list[tuple[float, float]]) ->
 # ---------------------------------------------------------------------------
 
 def _ax_read_attr_ptr(elem: int, attr: bytes) -> int:
+    """Return an owned AX attribute only when the native read succeeded."""
     attr_key = _cf.CFStringCreateWithCString(None, attr, kCFStringEncodingUTF8)
     if not attr_key:
         return 0
     val_ref = ctypes.c_void_p(0)
-    err = _appserv.AXUIElementCopyAttributeValue(
-        ctypes.c_void_p(elem), ctypes.c_void_p(attr_key), ctypes.byref(val_ref)
-    )
-    _cf.CFRelease(ctypes.c_void_p(attr_key))
+    try:
+        err = _appserv.AXUIElementCopyAttributeValue(
+            ctypes.c_void_p(elem), ctypes.c_void_p(attr_key), ctypes.byref(val_ref)
+        )
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(attr_key))
+    if err != 0:
+        if val_ref.value:
+            _cf.CFRelease(val_ref)
+        return 0
     return val_ref.value or 0
 
 
 def _ax_str_attr(elem: int, attr: bytes) -> str:
+    """Decode one owned attribute while balancing references on failed or oversized reads."""
     ptr = _ax_read_attr_ptr(elem, attr)
     if not ptr:
         return ""
-    result = _cftype_to_str(ptr)
-    _cf.CFRelease(ctypes.c_void_p(ptr))
-    return result
+    try:
+        return _cftype_to_str(ptr)
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(ptr))
 
 
 def _ax_cgpoint(elem: int) -> tuple[float, float] | None:
@@ -1437,7 +1546,9 @@ def ax_read_open_menu(pid: int, max_depth: int = 8, deadline_seconds: float = 0.
 # ---------------------------------------------------------------------------
 
 def _cfstr(s: str) -> int:
-    return _cf.CFStringCreateWithCString(None, s.encode("utf-8"), kCFStringEncodingUTF8)
+    """Build an exact UTF-8 string without silently truncating embedded NUL characters."""
+    encoded = s.encode("utf-8")
+    return _cf.CFStringCreateWithBytes(None, encoded, len(encoded), kCFStringEncodingUTF8, False)
 
 
 def _ax_str(elem: int, attr: bytes) -> str:
@@ -1456,6 +1567,8 @@ def _ax_set_value(elem: int, value: str) -> bool:
     a = _cfstr("AXValue")
     v = _cfstr(value)
     try:
+        if not a or not v:
+            return False
         return _appserv.AXUIElementSetAttributeValue(
             ctypes.c_void_p(elem), ctypes.c_void_p(a), ctypes.c_void_p(v)
         ) == 0
@@ -1471,6 +1584,8 @@ def _ax_press(elem: int, action: str = "AXPress") -> bool:
     _check_stop()
     a = _cfstr(action)
     try:
+        if not a:
+            return False
         return _appserv.AXUIElementPerformAction(
             ctypes.c_void_p(elem), ctypes.c_void_p(a)
         ) == 0
@@ -1479,65 +1594,86 @@ def _ax_press(elem: int, action: str = "AXPress") -> bool:
             _cf.CFRelease(ctypes.c_void_p(a))
 
 
-def ax_set_save_filename(pid: int, filename: str) -> bool:
-    """Set the 'Save As:' filename field of an open save panel via AX (no
-    keystrokes — focus-independent). The panel is an AXSheet in the app's tree;
-    the filename field is the AXTextField immediately following the 'Save As:'
-    label (the deep AXTextFields are file-list rows, and one is the 'tag editor'
-    — both excluded). Returns True if the value was set."""
+def _ax_save_field(pid: int) -> int | None:
+    """Retain one unambiguous Save As field within a bounded, read-only panel walk."""
+    _check_stop()
+    app = _appserv.AXUIElementCreateApplication(pid)
+    if not app:
+        return None
+    fields = []
+    state = {"label": False, "nodes": 0, "complete": True}
+    deadline = time.monotonic() + 1.5
     try:
-        app = _appserv.AXUIElementCreateApplication(pid)
-        if not app:
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS)
+
+        def walk(element: int, depth: int, in_panel: bool) -> None:
+            """Collect candidates before any write so duplicates never produce partial input."""
+            _check_stop()
+            state["nodes"] += 1
+            if depth > 16 or state["nodes"] > 600 or time.monotonic() >= deadline:
+                state["complete"] = False
+                return
+            role = _ax_str(element, b"AXRole")
+            if role in ("AXSheet", "AXDialog"):
+                in_panel = True
+                state["label"] = False
+            if in_panel:
+                if role == "AXStaticText" and _ax_str(element, b"AXValue").strip().rstrip(":").casefold() == "save as":
+                    state["label"] = True
+                elif role == "AXTextField" and state["label"] and _ax_str(element, b"AXTitle").casefold() != "tag editor":
+                    fields.append(_cf.CFRetain(ctypes.c_void_p(element)))
+                    state["label"] = False
+            children = _ax_read_attr_ptr(element, b"AXChildren")
+            if children:
+                try:
+                    count = _cf.CFArrayGetCount(ctypes.c_void_p(children))
+                    if count > 80:
+                        state["complete"] = False
+                    for index in range(min(count, 80)):
+                        if not state["complete"]:
+                            break
+                        child = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children), index)
+                        if child:
+                            walk(child, depth + 1, in_panel)
+                finally:
+                    _cf.CFRelease(ctypes.c_void_p(children))
+
+        walk(app, 0, False)
+        if not state["complete"] or len(fields) != 1:
+            return None
+        field = fields[0]
+        if _ax_str(field, b"AXRole") != "AXTextField":
+            return None
+        return fields.pop()
+    finally:
+        for field in fields:
+            _cf.CFRelease(ctypes.c_void_p(field))
+        _cf.CFRelease(ctypes.c_void_p(app))
+
+
+def ax_set_save_filename(pid: int, filename: str) -> bool:
+    """Write one verified Save As field once; a failed AX write never targets a second field."""
+    try:
+        field = _ax_save_field(pid)
+        if not field:
             return False
         try:
-            _appserv.AXUIElementSetMessagingTimeout(
-                ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS
-            )
-        except Exception:
-            pass
-        state = {"saw_label": False, "done": False}
-
-        def walk(e: int, depth: int, in_sheet: bool) -> None:
-            if depth > 16 or state["done"]:
-                return
-            role = _ax_str(e, b"AXRole")
-            in_sheet = in_sheet or role == "AXSheet"
-            if in_sheet:
-                if role == "AXStaticText":
-                    v = _ax_str(e, b"AXValue").strip().rstrip(":").lower()
-                    if v == "save as":
-                        state["saw_label"] = True
-                elif role == "AXTextField":
-                    if state["saw_label"] and _ax_str(e, b"AXTitle") != "tag editor":
-                        if _ax_set_value(e, filename):
-                            state["done"] = True
-                        return
-            ch = _ax_read_attr_ptr(e, b"AXChildren")
-            if ch:
-                try:
-                    n = _cf.CFArrayGetCount(ctypes.c_void_p(ch))
-                    for i in range(min(n, 80)):
-                        if state["done"]:
-                            break
-                        k = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(ch), i)
-                        if k:
-                            walk(k, depth + 1, in_sheet)
-                finally:
-                    _cf.CFRelease(ctypes.c_void_p(ch))
-
-        try:
-            walk(app, 0, False)
+            return _ax_set_value(field, filename)
         finally:
-            _cf.CFRelease(ctypes.c_void_p(app))
-        return state["done"]
+            _cf.CFRelease(ctypes.c_void_p(field))
+    except RuntimeError:
+        raise
     except Exception:
         return False
 
 
 def _ax_set_focused(elem: int) -> bool:
     """Set AXFocused=true on an element (gives it keyboard focus)."""
+    _check_stop()
     a = _cfstr("AXFocused")
     try:
+        if not a:
+            return False
         return _appserv.AXUIElementSetAttributeValue(
             ctypes.c_void_p(elem), ctypes.c_void_p(a), _kCFBooleanTrue
         ) == 0
@@ -1547,75 +1683,29 @@ def _ax_set_focused(elem: int) -> bool:
 
 
 def ax_focus_save_field(pid: int) -> bool:
-    """Give keyboard focus to a save/open panel's 'Save As:' field via AX, so the
-    panel SHEET (not the document behind it) becomes the key window before we
-    send Go-To-Folder keystrokes — without this, those keys leak into the
-    document. Same AXSheet walk as ax_set_save_filename; sets AXFocused on the
-    field. Returns True if the field was found and focused."""
+    """Focus one verified Save As field; never redirect navigation keys into another field."""
     try:
-        app = _appserv.AXUIElementCreateApplication(pid)
-        if not app:
+        field = _ax_save_field(pid)
+        if not field:
             return False
         try:
-            _appserv.AXUIElementSetMessagingTimeout(
-                ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS
-            )
-        except Exception:
-            pass
-        state = {"saw_label": False, "done": False}
-
-        def walk(e: int, depth: int, in_sheet: bool) -> None:
-            if depth > 16 or state["done"]:
-                return
-            role = _ax_str(e, b"AXRole")
-            in_sheet = in_sheet or role == "AXSheet"
-            if in_sheet:
-                if role == "AXStaticText":
-                    v = _ax_str(e, b"AXValue").strip().rstrip(":").lower()
-                    if v == "save as":
-                        state["saw_label"] = True
-                elif role == "AXTextField":
-                    if state["saw_label"] and _ax_str(e, b"AXTitle") != "tag editor":
-                        state["done"] = _ax_set_focused(e)
-                        return
-            ch = _ax_read_attr_ptr(e, b"AXChildren")
-            if ch:
-                try:
-                    n = _cf.CFArrayGetCount(ctypes.c_void_p(ch))
-                    for i in range(min(n, 80)):
-                        if state["done"]:
-                            break
-                        k = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(ch), i)
-                        if k:
-                            walk(k, depth + 1, in_sheet)
-                finally:
-                    _cf.CFRelease(ctypes.c_void_p(ch))
-
-        try:
-            walk(app, 0, False)
+            return _ax_set_focused(field)
         finally:
-            _cf.CFRelease(ctypes.c_void_p(app))
-        return state["done"]
+            _cf.CFRelease(ctypes.c_void_p(field))
+    except RuntimeError:
+        raise
     except Exception:
         return False
 
 
 def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
-    """Navigate an OPEN save/open panel to target_dir via accessibility — fully
-    invisible (no cursor, no keystrokes). Selects the sidebar location whose name
-    matches the target directory's basename: covers the home folder, Desktop,
-    Downloads, iCloud Drive, and any user-added Favourite. Returns the location
-    name it landed on (verified against the panel's 'Where' value), or None when
-    there is no sidebar match — the caller then reports honestly. Subfolders that
-    aren't sidebar entries return None by design: the panel's file browser is a
-    virtualized NSBrowser that doesn't expose its cells to AX reliably.
-
-    Why this works where keystrokes don't: the panel is a separate (sandboxed)
-    process, so a global Cmd+Shift+G is misrouted to the host app. AX, by
-    contrast, bridges into the panel — the same channel that already sets the
-    filename and presses Save. Setting AXSelected on a sidebar row navigates it.
+    """Select a sidebar row only when its local URL proves the exact requested directory.
+    Return None before writing if path evidence is absent; an attempted but
+    unverified selection raises so callers cannot assume another navigation is safe.
     """
-    want = os.path.basename(os.path.abspath(os.path.expanduser(target_dir)).rstrip("/"))
+    from urllib.parse import unquote, urlparse
+    target_path = os.path.realpath(os.path.abspath(os.path.expanduser(target_dir)))
+    want = os.path.basename(target_path.rstrip("/"))
     if not want:
         return None
     try:
@@ -1628,9 +1718,18 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
             )
         except Exception:
             pass
+        deadline = time.monotonic() + 1.5
+        visited = [0]
+
+        def within_budget():
+            """Bound repeated accessibility traversal and stop cancelled requests before writes."""
+            _check_stop()
+            visited[0] += 1
+            return visited[0] <= 600 and time.monotonic() < deadline
 
         def name_of(e, d=0):
-            if d > 5:
+            """Read a sidebar row's bounded visible name without guessing a path from it."""
+            if d > 5 or not within_budget():
                 return None
             if _ax_str(e, b"AXRole") == "AXStaticText":
                 v = _ax_str(e, b"AXValue")
@@ -1649,10 +1748,13 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
                     _cf.CFRelease(ctypes.c_void_p(ch))
             return None
 
-        def where_value(e, d=0):
-            if d > 18:
+        def where_value(e, d=0, in_panel=False):
+            """Read an explicit current-location label; an empty value is no evidence."""
+            if d > 18 or not within_budget():
                 return None
-            if _ax_str(e, b"AXRole") == "AXPopUpButton":
+            role = _ax_str(e, b"AXRole")
+            in_panel = in_panel or role in ("AXSheet", "AXDialog")
+            if in_panel and role == "AXPopUpButton":
                 lbl = (_ax_str(e, b"AXDescription") or _ax_str(e, b"AXTitle") or "")
                 if "where" in lbl.lower():
                     return _ax_str(e, b"AXValue")
@@ -1662,7 +1764,7 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
                     for i in range(min(_cf.CFArrayGetCount(ctypes.c_void_p(ch)), 130)):
                         k = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(ch), i)
                         if k:
-                            r = where_value(k, d + 1)
+                            r = where_value(k, d + 1, in_panel)
                             if r:
                                 return r
                 finally:
@@ -1671,13 +1773,29 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
 
         found = {"row": None}  # holds a CFRetain'd row ref (survives array release)
 
-        def walk(e, in_sidebar, depth):
-            if depth > 16 or found["row"]:
+        def row_path(element):
+            """Read a real local directory URL; a visible favourite name is never a path."""
+            value = _ax_str(element, b"AXURL") or _ax_str(element, b"AXDocument")
+            if not value:
+                return None
+            parsed = urlparse(value)
+            if parsed.scheme == "file" and parsed.netloc in ("", "localhost"):
+                value = unquote(parsed.path)
+            elif parsed.scheme or not value.startswith("/"):
+                return None
+            return os.path.realpath(value)
+
+        def walk(e, in_sidebar, depth, in_panel=False):
+            """Select only a bounded sidebar match for later full-path validation."""
+            if depth > 16 or found["row"] or not within_budget():
                 return
             role = _ax_str(e, b"AXRole")
-            if role == "AXOutline":
+            if role in ("AXSheet", "AXDialog"):
+                in_panel = True
+                in_sidebar = False
+            if in_panel and role == "AXOutline":
                 in_sidebar = True
-            if in_sidebar and role == "AXRow" and name_of(e) == want:
+            if in_sidebar and role == "AXRow" and row_path(e) == target_path:
                 # Retain — the row is borrowed from a CFArray we release below.
                 found["row"] = _cf.CFRetain(ctypes.c_void_p(e))
                 return
@@ -1689,7 +1807,7 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
                             break
                         k = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(ch), i)
                         if k:
-                            walk(k, in_sidebar, depth + 1)
+                            walk(k, in_sidebar, depth + 1, in_panel)
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(ch))
 
@@ -1698,22 +1816,35 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
             row = found["row"]
             if not row:
                 return None
-            a = _cfstr("AXSelected")
             try:
-                _appserv.AXUIElementSetAttributeValue(
-                    ctypes.c_void_p(row), ctypes.c_void_p(a), _kCFBooleanTrue
-                )
-            finally:
-                if a:
+                if row_path(row) != target_path:
+                    return None
+                row_label = name_of(row) or want
+                _check_stop()
+                a = _cfstr("AXSelected")
+                if not a:
+                    return None
+                try:
+                    status = _appserv.AXUIElementSetAttributeValue(
+                        ctypes.c_void_p(row), ctypes.c_void_p(a), _kCFBooleanTrue
+                    )
+                    if status != 0:
+                        raise RuntimeError("The save-panel location change failed; inspect the panel before continuing.")
+                finally:
                     _cf.CFRelease(ctypes.c_void_p(a))
-            _cf.CFRelease(ctypes.c_void_p(row))
-            time.sleep(0.2)  # let the panel commit the location change
-            wv = where_value(app) or ""
-            if want and (want in wv or wv in want):
-                return wv or want
+                time.sleep(0.2)  # let the panel commit the location change
+                wv = where_value(app) or ""
+                selected = _ax_str(row, b"AXSelected").casefold() == "true"
+                if selected and row_path(row) == target_path and wv and wv.casefold() in (want.casefold(), row_label.casefold()):
+                    return wv
+                raise RuntimeError("The save-panel location change could not be verified; inspect the panel before continuing.")
+            finally:
+                _cf.CFRelease(ctypes.c_void_p(row))
             return None
         finally:
             _cf.CFRelease(ctypes.c_void_p(app))
+    except RuntimeError:
+        raise
     except Exception:
         return None
 
@@ -1723,7 +1854,9 @@ def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False) -> s
     via AX (focus-independent). `titles` is tried in order; `substring=True`
     matches when a wanted string is contained in a button title (for variable
     labels like 'Use ".txt"'). Returns the matched button's title, else None."""
+    _check_stop()
     wanted = [t.lower() for t in titles]
+    candidates = []
     try:
         app = _appserv.AXUIElementCreateApplication(pid)
         if not app:
@@ -1734,30 +1867,37 @@ def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False) -> s
             )
         except Exception:
             pass
-        state = {"pressed": None}
+        state = {"nodes": 0, "complete": True}
+        deadline = time.monotonic() + 1.5
 
         def matches(title: str) -> bool:
+            """Check the caller's specific title policy without triggering any action."""
             t = title.lower()
             if substring:
                 return any(w in t for w in wanted)
             return t in wanted
 
         def walk(e: int, depth: int, in_sheet: bool) -> None:
-            if depth > 16 or state["pressed"]:
+            """Collect all bounded candidates so duplicate titles are rejected before a press."""
+            _check_stop()
+            state["nodes"] += 1
+            if depth > 16 or state["nodes"] > 600 or time.monotonic() >= deadline:
+                state["complete"] = False
                 return
             role = _ax_str(e, b"AXRole")
-            in_sheet = in_sheet or role == "AXSheet"
+            in_sheet = in_sheet or role in ("AXSheet", "AXDialog")
             if in_sheet and role == "AXButton":
                 title = _ax_str(e, b"AXTitle")
-                if title and matches(title) and _ax_press(e):
-                    state["pressed"] = title
-                    return
+                if title and matches(title):
+                    candidates.append((_cf.CFRetain(ctypes.c_void_p(e)), title))
             ch = _ax_read_attr_ptr(e, b"AXChildren")
             if ch:
                 try:
                     n = _cf.CFArrayGetCount(ctypes.c_void_p(ch))
+                    if n > 80:
+                        state["complete"] = False
                     for i in range(min(n, 80)):
-                        if state["pressed"]:
+                        if not state["complete"]:
                             break
                         k = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(ch), i)
                         if k:
@@ -1767,9 +1907,19 @@ def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False) -> s
 
         try:
             walk(app, 0, False)
+            if not state["complete"] or len(candidates) != 1:
+                return None
+            element, title = candidates[0]
+            _check_stop()
+            if _ax_str(element, b"AXRole") != "AXButton" or _ax_str(element, b"AXTitle") != title:
+                return None
+            return title if _ax_press(element) else None
         finally:
+            for element, title in candidates:
+                _cf.CFRelease(ctypes.c_void_p(element))
             _cf.CFRelease(ctypes.c_void_p(app))
-        return state["pressed"]
+    except RuntimeError:
+        raise
     except Exception:
         return None
 
@@ -2180,9 +2330,11 @@ def ax_focused_summary(pid: int) -> dict:
 # ---------------------------------------------------------------------------
 
 def set_clipboard(text: str) -> None:
+    """Replace the clipboard only while the current input request remains permitted."""
+    _check_stop()
     # timeout so a contended/stuck pasteboard server (e.g. behind a modal sheet)
     # fails fast instead of hanging the tool for minutes (was unbounded).
-    subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+    subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
 
 
 def set_clipboard_image(image_path: str) -> str:
@@ -2190,9 +2342,10 @@ def set_clipboard_image(image_path: str) -> str:
     path = os.path.abspath(os.path.expanduser(image_path))
     if not os.path.isfile(path):
         raise FileNotFoundError(f"image not found: {path}")
+    _check_stop()
     escaped = path.replace("\\", "\\\\").replace('"', '\\"')
     script = f'set the clipboard to (read (POSIX file "{escaped}") as «class PNGf»)'
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"clipboard image write failed: {err}")
@@ -2200,8 +2353,9 @@ def set_clipboard_image(image_path: str) -> str:
 
 
 def get_clipboard() -> str:
+    """Read clipboard text with a bounded subprocess timeout."""
     # timeout so a contended/stuck pasteboard server fails fast (was unbounded).
-    result = subprocess.run(["pbpaste"], capture_output=True, check=True, timeout=5)
+    result = subprocess.run(["/usr/bin/pbpaste"], capture_output=True, check=True, timeout=5)
     return result.stdout.decode("utf-8", errors="replace")
 
 
@@ -2218,6 +2372,7 @@ def click_menu(pid: int, path: list[str]) -> None:
     """Click a menu-bar item by path, e.g. ["Tools", "Annotate", "Arrow"]. Min length 2."""
     if len(path) < 2:
         raise ValueError("menu path needs at least the top menu and one item")
+    _check_stop()
     leaf, parent = _ascript_str(path[-1]), _ascript_str(path[-2])
     target = f'menu item "{leaf}" of menu "{parent}"'
     for k in range(len(path) - 2, 0, -1):
@@ -2228,7 +2383,7 @@ def click_menu(pid: int, path: list[str]) -> None:
         f'tell application "System Events" to tell (first process whose unix id is {pid}) '
         f"to click {target}"
     )
-    result = subprocess.run(["osascript", "-e", script], capture_output=True, timeout=5)
+    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         # AppleScript "Can't get menu item …" → the path was wrong.
@@ -2237,13 +2392,16 @@ def click_menu(pid: int, path: list[str]) -> None:
 
 def set_window_bounds(pid: int, x: int, y: int, width: int | None = None, height: int | None = None) -> None:
     """Move (and optionally resize) the frontmost window of a process via System Events."""
-    cmd = ["osascript", "-e",
+    _check_stop()
+    cmd = ["/usr/bin/osascript", "-e",
            f'tell application "System Events" to tell (first process whose unix id is {pid}) '
            f"to set position of window 1 to {{{int(x)}, {int(y)}}}"]
-    if width is not None and height is not None:
+    if width is not None or height is not None:
+        width_expr = str(int(width)) if width is not None else "item 1 of (size of window 1)"
+        height_expr = str(int(height)) if height is not None else "item 2 of (size of window 1)"
         cmd.extend(["-e",
                     f'tell application "System Events" to tell (first process whose unix id is {pid}) '
-                    f"to set size of window 1 to {{{int(width)}, {int(height)}}}"])
+                    f"to set size of window 1 to {{{width_expr}, {height_expr}}}"])
     result = subprocess.run(cmd, capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
@@ -2544,9 +2702,7 @@ def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = No
         if not _ax_attr_is_settable(int(elem_ref.value), b"AXValue"):
             return {"ok": False, "role": role, "status": "not_settable"}
 
-        cfstr = _cf.CFStringCreateWithCString(
-            None, text.encode("utf-8"), kCFStringEncodingUTF8,
-        )
+        cfstr = _cfstr(text)
         if not cfstr:
             return {"ok": False, "role": role, "status": "set_failed", "err": "cfstring_alloc"}
         try:
@@ -2556,7 +2712,15 @@ def ax_set_value_at(x: float, y: float, text: str, expected_pid: int | None = No
         if not ok:
             raise RuntimeError('The accessibility write failed; its effect is unknown. Observe before retrying.')
         # Acceptance alone is not evidence that the native control changed.
-        verified = _ax_str_attr(int(elem_ref.value), b'AXValue') == text
+        value_ref = _ax_read_attr_ptr(int(elem_ref.value), b'AXValue')
+        verified = False
+        if value_ref:
+            try:
+                verified = _cftype_to_str(value_ref) == text
+            except ValueError as error:
+                raise RuntimeError("The accessibility write was accepted, but its complete value could not be verified. Observe before retrying.") from error
+            finally:
+                _cf.CFRelease(ctypes.c_void_p(value_ref))
         return {"ok": verified, "role": role, "status": "set" if verified else "unverified",
                 "attempted": True, "verified": verified, "via": "ax_set_value"}
     finally:
@@ -2714,7 +2878,7 @@ def set_window_bounds_by_id(pid: int, window_id: int, x: int, y: int, width: int
     """
     from . import capture
     win = capture.get_window_by_id(window_id)
-    if not win:
+    if not win or win.get("pid") != pid:
         raise RuntimeError(
             f"Window {window_id} not found on screen (pid {pid}). "
             "Call list_windows to get a current window ID."
@@ -2741,7 +2905,9 @@ def set_window_bounds_by_id(pid: int, window_id: int, x: int, y: int, width: int
 
         result = {"ok": True, "window_id": window_id, "x": x, "y": y}
 
-        if width is not None and height is not None:
+        if width is not None or height is not None:
+            width = width if width is not None else int(win["width"])
+            height = height if height is not None else int(win["height"])
             sz = CGSize(width=float(width), height=float(height))
             size_val = _appserv.AXValueCreate(kAXValueCGSizeType, ctypes.byref(sz))
             if not size_val:
@@ -2763,15 +2929,31 @@ def set_window_bounds_by_id(pid: int, window_id: int, x: int, y: int, width: int
 # Mouse input
 # ---------------------------------------------------------------------------
 
+def _send_mouse_event(kind: int, point: CGPoint, button: int, flags: int = 0, click_state: int = 1) -> None:
+    """Build an owned mouse event with explicit flags before posting it once."""
+    event = _cg.CGEventCreateMouseEvent(None, kind, point, button)
+    if not event:
+        raise RuntimeError("Mouse event could not be created; input was interrupted.")
+    try:
+        _cg.CGEventSetFlags(ctypes.c_void_p(event), flags)
+        _cg.CGEventSetIntegerValueField(ctypes.c_void_p(event), kCGMouseEventClickState, click_state)
+    except BaseException:
+        _cf.CFRelease(ctypes.c_void_p(event))
+        raise
+    _post(event)
+
 async def move_cursor(x: int, y: int) -> None:
+    """Move the global cursor only after input ownership's serialized delivery permits it."""
     _check_stop()
     async with _input_lock:
+        _check_stop()
         pt = CGPoint(x=float(x), y=float(y))
         ev = _cg.CGEventCreateMouseEvent(None, kCGEventMouseMoved, pt, kCGMouseButtonLeft)
         _post(ev)
 
 
 def _modifier_flags(modifiers: list[str] | None) -> int:
+    """Combine supported named modifier flags for explicit per-event stamping."""
     if not modifiers:
         return 0
     flags = 0
@@ -2788,6 +2970,7 @@ def modifier_flags_from_list(modifiers: list[str] | None) -> int:
 
 
 async def click(x: int, y: int, button: str = "left", modifiers: list[str] | None = None) -> None:
+    """Deliver one visible click while retaining its release through stop, cancel, and exit."""
     _check_stop()
     async with _input_lock:
         pt = CGPoint(x=float(x), y=float(y))
@@ -2796,18 +2979,14 @@ async def click(x: int, y: int, button: str = "left", modifiers: list[str] | Non
         else:
             down_t, up_t, btn = kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft
         flags = _modifier_flags(modifiers)
-        ev_down = _cg.CGEventCreateMouseEvent(None, down_t, pt, btn)
-        if flags:
-            _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
-        _post(ev_down)
+        token = ("mouse", None, btn)
+        _begin_input(token, lambda: _send_mouse_event(down_t, pt, btn, flags),
+                     lambda: _send_mouse_event(up_t, pt, btn, flags))
         try:
             await asyncio.sleep(0.005)
         finally:
             # Cancellation must release the button before relinquishing input.
-            ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
-            if flags:
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-            _post(ev_up)
+            _finish_input(token)
 
 
 async def long_press(x: int, y: int, duration: float = 1.0, button: str = "left") -> None:
@@ -2824,8 +3003,9 @@ async def long_press(x: int, y: int, duration: float = 1.0, button: str = "left"
             down_t, up_t, btn = kCGEventRightMouseDown, kCGEventRightMouseUp, kCGMouseButtonRight
         else:
             down_t, up_t, btn = kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGMouseButtonLeft
-        ev_down = _cg.CGEventCreateMouseEvent(None, down_t, pt, btn)
-        _post(ev_down)
+        token = ("mouse", None, btn)
+        _begin_input(token, lambda: _send_mouse_event(down_t, pt, btn),
+                     lambda: _send_mouse_event(up_t, pt, btn))
         try:
             # Hold. Caller-provided duration; use small interval so an emergency
             # stop can interrupt during a long hold without waiting for the full
@@ -2837,30 +3017,24 @@ async def long_press(x: int, y: int, duration: float = 1.0, button: str = "left"
                 await asyncio.sleep(min(step, duration - elapsed))
                 elapsed += step
         finally:
-            ev_up = _cg.CGEventCreateMouseEvent(None, up_t, pt, btn)
-            _post(ev_up)
+            _finish_input(token)
 
 
 async def double_click(x: int, y: int, modifiers: list[str] | None = None) -> None:
+    """Deliver a double click while rechecking stop before each separate press."""
     _check_stop()
     async with _input_lock:
         pt = CGPoint(x=float(x), y=float(y))
         flags = _modifier_flags(modifiers)
         for click_state in (1, 2):
-            ev_down = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft)
-            _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_down), kCGMouseEventClickState, click_state)
-            if flags:
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
-            _post(ev_down)
+            token = ("mouse", None, kCGMouseButtonLeft)
+            _begin_input(token, lambda: _send_mouse_event(kCGEventLeftMouseDown, pt, kCGMouseButtonLeft, flags, click_state),
+                         lambda: _send_mouse_event(kCGEventLeftMouseUp, pt, kCGMouseButtonLeft, flags, click_state))
             try:
                 await asyncio.sleep(0.02)
             finally:
                 # Preserve click-state and modifiers even when cancelled mid-pair.
-                ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
-                _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
-                if flags:
-                    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-                _post(ev_up)
+                _finish_input(token)
             await asyncio.sleep(0.02)
 
 
@@ -2872,20 +3046,14 @@ async def triple_click(x: int, y: int, modifiers: list[str] | None = None) -> No
         pt = CGPoint(x=float(x), y=float(y))
         flags = _modifier_flags(modifiers)
         for click_state in (1, 2, 3):
-            ev_down = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, pt, kCGMouseButtonLeft)
-            _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_down), kCGMouseEventClickState, click_state)
-            if flags:
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), flags)
-            _post(ev_down)
+            token = ("mouse", None, kCGMouseButtonLeft)
+            _begin_input(token, lambda: _send_mouse_event(kCGEventLeftMouseDown, pt, kCGMouseButtonLeft, flags, click_state),
+                         lambda: _send_mouse_event(kCGEventLeftMouseUp, pt, kCGMouseButtonLeft, flags, click_state))
             try:
                 await asyncio.sleep(0.02)
             finally:
                 # Preserve click-state and modifiers even when cancelled mid-pair.
-                ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, pt, kCGMouseButtonLeft)
-                _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev_up), kCGMouseEventClickState, click_state)
-                if flags:
-                    _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), flags)
-                _post(ev_up)
+                _finish_input(token)
             await asyncio.sleep(0.02)
 
 
@@ -2893,7 +3061,15 @@ async def triple_click(x: int, y: int, modifiers: list[str] | None = None) -> No
 # Keyboard input
 # ---------------------------------------------------------------------------
 
-async def press_key(key_string: str, pid: int | None = None) -> None:
+def _check_frontmost(expected_pid: int | None) -> None:
+    """Refuse global typing after the foreground app changes or cannot be verified."""
+    _check_stop()
+    if expected_pid is not None and not is_frontmost_app(expected_pid):
+        raise RuntimeError("The foreground app changed; no further keys were sent. Inspect the dialog before continuing.")
+
+
+async def press_key(key_string: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
+    """Deliver one parsed key and recheck stop after any renderer settling delay."""
     _check_stop()
     async with _input_lock:
         keycode, flags = parse_key_combo(key_string)
@@ -2904,6 +3080,7 @@ async def press_key(key_string: str, pid: int | None = None) -> None:
         # path (pid=None, humanoid) doesn't hit the renderer dead-zone.
         if pid is not None:
             await asyncio.sleep(0.060)
+        _check_frontmost(expected_frontmost_pid)
         _press_key_sync(keycode, flags, pid)
 
 
@@ -2911,6 +3088,8 @@ async def hold_key(
     key_string: str,
     duration: float,
     pid: int | None = None,
+    *,
+    expected_frontmost_pid: int | None = None,
 ) -> None:
     """
     Press `key_string` and hold it down for `duration` seconds, then release.
@@ -2930,6 +3109,7 @@ async def hold_key(
     _check_stop()
     async with _input_lock:
         # Initial press.
+        _check_frontmost(expected_frontmost_pid)
         _key_down_sync(keycode, flags, pid)
         # Hold loop — reposts keydown every 50 ms so apps that expect a
         # repeat stream see one. macOS itself emits ~33 ms repeats for held
@@ -2944,6 +3124,7 @@ async def hold_key(
                 if elapsed < duration:
                     # Re-post keydown for auto-repeat. Skip the final repost
                     # — the keyup is fired below.
+                    _check_frontmost(expected_frontmost_pid)
                     _key_down_sync(keycode, flags, pid)
         finally:
             # Always release, even on _check_stop interrupt — leaving a key
@@ -2952,7 +3133,7 @@ async def hold_key(
             _key_up_sync(keycode, flags, pid)
 
 
-async def press_keys(keys: list[str], pid: int | None = None) -> None:
+async def press_keys(keys: list[str], pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """
     Press a sequence of keys back-to-back under a single input-lock acquisition.
     Parses every entry up front so a bad key string fails the whole batch before
@@ -2983,6 +3164,7 @@ async def press_keys(keys: list[str], pid: int | None = None) -> None:
             _check_stop()
             if not first:
                 await asyncio.sleep(0.018)
+            _check_frontmost(expected_frontmost_pid)
             _press_key_sync(keycode, flags, pid)
             first = False
 
@@ -3039,8 +3221,8 @@ async def press_system_key(name: str) -> None:
     NX_KEYUP = 0xB
 
     async with _input_lock:
-        for is_down in (True, False):
-            _check_stop()
+        def emit(is_down):
+            """Construct the matching system event; releasing bypasses the engaged stop."""
             phase = NX_KEYDOWN if is_down else NX_KEYUP
             # data1 packs: high 16 = key code, low 16 = (phase << 8) | flags.
             # flags = 0 for a single press. Setting bit 0 of the low byte
@@ -3059,27 +3241,31 @@ async def press_system_key(name: str) -> None:
             )
             cg = ev.CGEvent()
             _Q.CGEventPost(_Q.kCGHIDEventTap, cg)
-            if is_down:
-                # Tiny gap between down and up so the OS treats it as a real
-                # one-shot press, not a too-fast phantom.
-                await asyncio.sleep(0.01)
+        token = ("system", code)
+        _begin_input(token, lambda: emit(True), lambda: emit(False))
+        try:
+            await asyncio.sleep(0.01)
+        finally:
+            _finish_input(token)
 
 
 # The user's pasteboard contents captured before a paste, pending restore.
 # Held at module scope (not a local) so the atexit safety net can flush it if
 # the process exits inside the post-paste restore window. None = nothing pending.
 _clipboard_snapshot: list | None = None
+_clipboard_change_count: int | None = None
 
 
-def _snapshot_pasteboard() -> list | None:
+def _snapshot_pasteboard() -> tuple[list, int] | None:
     """Capture the general pasteboard's full typed contents so a paste can be
     undone byte-for-byte — preserving images, files, RTF, or an empty
     clipboard, not just plain text (pbpaste silently flattens all of those to
-    ''). Returns NSPasteboardItem copies, or None if AppKit is unavailable so
-    the caller skips the restore rather than clobbering with empty text."""
+    ''). Returns (NSPasteboardItem copies, change count), or None when a stable
+    snapshot could not be captured; the caller then leaves the clipboard intact."""
     try:
         from AppKit import NSPasteboard, NSPasteboardItem  # lazy, like NSEvent
         pb = NSPasteboard.generalPasteboard()
+        change_count = pb.changeCount()
         snapshot = []
         for item in (pb.pasteboardItems() or []):
             copy = NSPasteboardItem.alloc().init()
@@ -3088,7 +3274,7 @@ def _snapshot_pasteboard() -> list | None:
                 if data is not None:
                     copy.setData_forType_(data, t)
             snapshot.append(copy)
-        return snapshot
+        return (snapshot, change_count) if pb.changeCount() == change_count else None
     except Exception:
         return None
 
@@ -3112,30 +3298,47 @@ def _restore_pasteboard(snapshot: list | None) -> None:
 def _flush_clipboard_restore() -> None:
     """Best-effort synchronous restore for the narrow window where the process
     exits while a paste is awaiting clipboard restoration."""
-    if _clipboard_snapshot is not None:
-        _restore_pasteboard(_clipboard_snapshot)
+    global _clipboard_snapshot, _clipboard_change_count
+    snapshot, change_count = _clipboard_snapshot, _clipboard_change_count
+    # Detach pending state first so signal cleanup and atexit cannot restore twice.
+    _clipboard_snapshot = _clipboard_change_count = None
+    if snapshot is None or change_count is None:
+        return
+    try:
+        from AppKit import NSPasteboard
+        if NSPasteboard.generalPasteboard().changeCount() == change_count:
+            _restore_pasteboard(snapshot)
+    except Exception:
+        pass
 
 
 atexit.register(_flush_clipboard_restore)
 
 
-async def type_text(text: str, pid: int | None = None) -> None:
+async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """Paste while preserving every clipboard type, including on failure or cancellation."""
     from AppKit import NSPasteboard
-    global _clipboard_snapshot
+    global _clipboard_snapshot, _clipboard_change_count
     _check_stop()
     async with _input_lock:
-        snapshot = _snapshot_pasteboard()
-        if snapshot is None:
+        _check_stop()
+        preserved = _snapshot_pasteboard()
+        if preserved is None:
             raise RuntimeError("Could not preserve the clipboard; use mode='keys' or try again.")
-        _clipboard_snapshot = snapshot
+        snapshot, captured_count = preserved
         pb = NSPasteboard.generalPasteboard()
         change_count = pb.changeCount()
+        if change_count != captured_count:
+            raise RuntimeError("The clipboard changed before the paste; nothing was written. Try again or use mode='keys'.")
+        _clipboard_snapshot = snapshot
+        _clipboard_change_count = None  # An in-flight pbcopy has no verified generation yet.
         try:
-            subprocess.run(["pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            _check_frontmost(expected_frontmost_pid)
+            subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
             change_count = pb.changeCount()
+            _clipboard_change_count = change_count
             await asyncio.sleep(0.005)
-            _check_stop()
+            _check_frontmost(expected_frontmost_pid)
             _paste_sync(pid)
             # Finish restoration before the next tool can intentionally replace
             # the clipboard. This also bounds cleanup after cancelled pastes.
@@ -3145,9 +3348,10 @@ async def type_text(text: str, pid: int | None = None) -> None:
             if pb.changeCount() == change_count:
                 _restore_pasteboard(snapshot)
             _clipboard_snapshot = None
+            _clipboard_change_count = None
 
 
-async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
+async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """
     Per-character keydown/keyup sequence. Used by type_text(mode='keys')
     for keypress-driven contexts (web games, canvas editors).
@@ -3169,7 +3373,7 @@ async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
         # renderer dead-zone. Cost: 60 ms once per call, regardless of length.
         await asyncio.sleep(0.060)
         for char in text:
-            _check_stop()
+            _check_frontmost(expected_frontmost_pid)
             keycode, flags = char_to_keycode(char)
             if keycode is not None:
                 _press_key_sync(keycode, flags, pid)
@@ -3177,19 +3381,13 @@ async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
                 encoded = char.encode("utf-16-le")
                 units = len(encoded) // 2
                 uni = (ctypes.c_uint16 * units).from_buffer_copy(encoded)
-                ev_down = _cg.CGEventCreateKeyboardEvent(None, 0, True)
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_down), 0)
-                _cg.CGEventKeyboardSetUnicodeString(
-                    ctypes.c_void_p(ev_down), units, ctypes.cast(uni, ctypes.c_void_p)
-                )
-                post(ev_down)
-                time.sleep(0.005)
-                ev_up = _cg.CGEventCreateKeyboardEvent(None, 0, False)
-                _cg.CGEventSetFlags(ctypes.c_void_p(ev_up), 0)
-                _cg.CGEventKeyboardSetUnicodeString(
-                    ctypes.c_void_p(ev_up), units, ctypes.cast(uni, ctypes.c_void_p)
-                )
-                post(ev_up)
+                token = ("unicode", pid)
+                _begin_input(token, lambda: _send_unicode_event(uni, units, True, pid),
+                             lambda: _send_unicode_event(uni, units, False, pid))
+                try:
+                    time.sleep(0.005)
+                finally:
+                    _finish_input(token)
             await asyncio.sleep(0.015)
 
 
@@ -3197,12 +3395,28 @@ async def type_text_char_by_char(text: str, pid: int | None = None) -> None:
 # Drag and drop
 # ---------------------------------------------------------------------------
 
+def _send_unicode_event(units_pointer, units: int, is_down: bool, pid: int | None) -> None:
+    """Deliver every UTF-16 code unit with balanced keyboard flags and native ownership."""
+    event = _cg.CGEventCreateKeyboardEvent(None, 0, is_down)
+    if not event:
+        raise RuntimeError("Unicode keyboard event could not be created; input was interrupted.")
+    try:
+        _cg.CGEventSetFlags(ctypes.c_void_p(event), 0)
+        _cg.CGEventKeyboardSetUnicodeString(ctypes.c_void_p(event), units, ctypes.cast(units_pointer, ctypes.c_void_p))
+    except BaseException:
+        _cf.CFRelease(ctypes.c_void_p(event))
+        raise
+    (_post_to_pid(pid, event) if pid else _post(event))
+
 async def drag(
     x1: int, y1: int,
     x2: int, y2: int,
     steps: int = 20,
     step_delay: float = 0.010,
     hover_target_seconds: float = 0.0,
+    *,
+    button: str = "left",
+    modifiers: list[str] | None = None,
 ) -> None:
     """
     Drag from (x1, y1) to (x2, y2) with smooth intermediate events.
@@ -3218,9 +3432,18 @@ async def drag(
     async with _input_lock:
         src = CGPoint(x=float(x1), y=float(y1))
         dst = CGPoint(x=float(x2), y=float(y2))
+        if button == "right":
+            down, up, dragged, btn = kCGEventRightMouseDown, kCGEventRightMouseUp, kCGEventRightMouseDragged, kCGMouseButtonRight
+        elif button == "left":
+            down, up, dragged, btn = kCGEventLeftMouseDown, kCGEventLeftMouseUp, kCGEventLeftMouseDragged, kCGMouseButtonLeft
+        else:
+            raise ValueError("Drag button must be left or right; no input was sent.")
+        flags = _modifier_flags(modifiers)
 
-        ev_down = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDown, src, kCGMouseButtonLeft)
-        _post(ev_down)
+        last_point = [src]
+        token = ("mouse", None, btn)
+        _begin_input(token, lambda: _send_mouse_event(down, src, btn, flags),
+                     lambda: _send_mouse_event(up, last_point[0], btn, flags))
         try:
             await asyncio.sleep(0.05)
 
@@ -3231,8 +3454,9 @@ async def drag(
                     x=x1 + (x2 - x1) * t,
                     y=y1 + (y2 - y1) * t,
                 )
-                ev_drag = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseDragged, pt, kCGMouseButtonLeft)
-                _post(ev_drag)
+                _check_stop()
+                _send_mouse_event(dragged, pt, btn, flags)
+                last_point[0] = pt
                 await asyncio.sleep(step_delay)
 
             if hover_target_seconds > 0:
@@ -3245,18 +3469,16 @@ async def drag(
                     slice_s = min(0.05, remaining)
                     await asyncio.sleep(slice_s)
                     remaining -= slice_s
+                    _check_stop()
                     # Re-emit a dragged event at the target to keep the OS-side
                     # hover state alive — some apps drop the spring trigger if no
                     # events arrive for too long.
-                    ev_idle = _cg.CGEventCreateMouseEvent(
-                        None, kCGEventLeftMouseDragged, dst, kCGMouseButtonLeft,
-                    )
-                    _post(ev_idle)
+                    _send_mouse_event(dragged, dst, btn, flags)
+                    last_point[0] = dst
             else:
                 await asyncio.sleep(0.02)
         finally:
-            ev_up = _cg.CGEventCreateMouseEvent(None, kCGEventLeftMouseUp, dst, kCGMouseButtonLeft)
-            _post(ev_up)
+            _finish_input(token)
 
 
 # ---------------------------------------------------------------------------
@@ -3271,6 +3493,7 @@ async def scroll(x: int, y: int, direction: str, amount: int, modifiers: list[st
         ev_move = _cg.CGEventCreateMouseEvent(None, kCGEventMouseMoved, pt, kCGMouseButtonLeft)
         _post(ev_move)
         await asyncio.sleep(0.01)
+        _check_stop()
 
         if direction in ("up", "down"):
             delta = amount if direction == "up" else -amount
@@ -3278,10 +3501,16 @@ async def scroll(x: int, y: int, direction: str, amount: int, modifiers: list[st
         else:
             delta = amount if direction == "right" else -amount
             ev = _cg.CGEventCreateScrollWheelEvent(None, kCGScrollEventUnitLine, 1, 0)
-            _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev), kCGScrollWheelEventDeltaAxis2, delta)
 
-        _check_stop()
-        _cg.CGEventSetFlags(ctypes.c_void_p(ev), modifier_flags_from_list(modifiers))
+        if not ev:
+            raise RuntimeError("Scroll event could not be created; no scroll was sent.")
+        try:
+            if direction not in ("up", "down"):
+                _cg.CGEventSetIntegerValueField(ctypes.c_void_p(ev), kCGScrollWheelEventDeltaAxis2, delta)
+            _cg.CGEventSetFlags(ctypes.c_void_p(ev), modifier_flags_from_list(modifiers))
+        except BaseException:
+            _cf.CFRelease(ctypes.c_void_p(ev))
+            raise
         _post(ev)
 
 

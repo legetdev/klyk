@@ -6,6 +6,7 @@ import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 
 # Chromium-family browsers. When Klyk launches one of these, it appends
@@ -165,6 +166,8 @@ def _quick_pid_for_app(bundle_id: str | None, app_name: str | None) -> int | Non
 def launch_native_app(
     app_name: str | None = None,
     bundle_id: str | None = None,
+    *,
+    check_stop=None,
 ) -> tuple[int, bool]:
     """
     Launch a native macOS app. Returns (pid, was_already_running).
@@ -180,10 +183,12 @@ def launch_native_app(
         # Electron apps launched with an isolated user-data directory).
         return prior_pid, True
 
+    if check_stop is not None:
+        check_stop()
     if bundle_id:
-        subprocess.Popen(["open", "-b", bundle_id])
+        subprocess.Popen(["/usr/bin/open", "-b", bundle_id])
     elif app_name:
-        cmd = ["open", "-a", app_name]
+        cmd = ["/usr/bin/open", "-a", app_name]
         if app_name in CHROMIUM_BROWSERS and not was_already_running:
             cmd += ["--args", "--force-renderer-accessibility"]
         subprocess.Popen(cmd)
@@ -199,14 +204,14 @@ def launch_native_app(
 def start_native_log_stream(pid: int) -> subprocess.Popen:
     """Start a log stream watcher for a native app's unified log output. Returns the Popen."""
     return subprocess.Popen(
-        ["log", "stream", "--predicate", f"processID == {pid}",
+        ["/usr/bin/log", "stream", "--predicate", f"processID == {pid}",
          "--level", "default", "--style", "compact"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
 
 
-def launch_electron_app(app_path: str) -> tuple[int, subprocess.Popen]:
+def launch_electron_app(app_path: str, *, check_stop=None) -> tuple[int, subprocess.Popen]:
     """
     Launch an Electron .app bundle.
     Returns (pid, proc) where proc.stderr is a pipe for log capture.
@@ -214,6 +219,8 @@ def launch_electron_app(app_path: str) -> tuple[int, subprocess.Popen]:
     if not os.path.exists(app_path):
         raise FileNotFoundError(f"App not found: {app_path}")
     executable = _find_app_executable(app_path)
+    if check_stop is not None:
+        check_stop()
     proc = subprocess.Popen([executable], stderr=subprocess.PIPE)
     time.sleep(1.5)
     return proc.pid, proc
@@ -268,7 +275,99 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
+class _ProcessInfo(ctypes.Structure):
+    """Public macOS proc_bsdinfo layout, including microsecond process start identity."""
+
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+    _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+    _fields_ += [(name, ctypes.c_uint32) for name in ("nfiles", "pgid", "jobc", "tdev", "tpgid")]
+    _fields_ += [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+
+def _process_argv(pid: int) -> list[str] | None:
+    """Read exact kernel argv boundaries without returning any process environment values."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sysctl.restype = ctypes.c_int
+    libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid.
+    length = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(length), None, 0) != 0 or not 5 <= length.value <= 1024 * 1024:
+        return None
+    data = ctypes.create_string_buffer(length.value)
+    if libc.sysctl(mib, 3, data, ctypes.byref(length), None, 0) != 0:
+        return None
+    raw = data.raw[:length.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+    path_end = raw.find(b"\0", 4)
+    if not 1 <= argc <= 4096 or path_end < 0:
+        return None
+    offset = path_end + 1
+    # The executable path is followed by padding before the argv[0] string.
+    while offset < len(raw) and raw[offset] == 0:
+        offset += 1
+    arguments = []
+    for _ in range(argc):
+        end = raw.find(b"\0", offset)
+        if end < 0:
+            return None
+        arguments.append(raw[offset:end].decode("utf-8", "strict"))
+        offset = end + 1
+    return arguments
+
+
+def process_identity(pid: int, *, include_command: bool = False) -> dict | None:
+    """Read a process start token without activating apps; optional command data stays internal."""
+    if sys.platform != "darwin" or not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        info = _ProcessInfo()
+        if libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+            return None
+        if info.pid != pid or not info.start_sec:
+            return None
+        identity = {"pid": pid, "uid": int(info.uid), "started": (int(info.start_sec), int(info.start_usec))}
+        if include_command:
+            libproc.proc_pidpath.restype = ctypes.c_int
+            libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            path = ctypes.create_string_buffer(4096)
+            if libproc.proc_pidpath(pid, path, len(path)) <= 0:
+                return None
+            arguments = _process_argv(pid)
+            if arguments is None:
+                return None
+            identity["executable"] = path.value.decode("utf-8", "strict")
+            identity["argv"] = arguments
+            # The command must belong to the same process observed before the read.
+            current = process_identity(pid)
+            if current != {key: identity[key] for key in ("pid", "uid", "started")}:
+                return None
+        return identity
+    except (OSError, ValueError, UnicodeError, AttributeError):
+        return None
+
+
+def _same_process(pid: int, expected_identity: dict) -> bool:
+    """Compare the stable token rather than trusting a PID that the OS may have reused."""
+    current = process_identity(pid)
+    return bool(current and all(current.get(key) == expected_identity.get(key) for key in ("pid", "uid", "started")))
+
+
+def _process_status(pid: int, expected_identity: dict) -> str:
+    """Separate a vanished original process from a failed identity lookup."""
+    current = process_identity(pid)
+    if current is None:
+        return "unknown" if pid_alive(pid) else "gone"
+    if all(current.get(key) == expected_identity.get(key) for key in ("pid", "uid", "started")):
+        return "same"
+    return "gone"
+
+
+def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dict | None = None) -> bool:
     """
     Best-effort terminate. Sends SIGTERM, polls up to `term_timeout` seconds,
     escalates to SIGKILL if still alive, then verifies. Returns True iff the
@@ -279,6 +378,12 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
     """
     if not pid or pid <= 1:
         return False
+    expected_identity = expected_identity or process_identity(pid)
+    if expected_identity is None:
+        return not pid_alive(pid)
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -290,6 +395,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
 
     deadline = time.monotonic() + term_timeout
     while time.monotonic() < deadline:
+        status = _process_status(pid, expected_identity)
+        if status != "same":
+            return status == "gone"  # Never signal a replacement or an unknown process.
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -299,6 +407,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
         time.sleep(0.1)
 
     # SIGTERM ignored — escalate.
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -308,6 +419,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
 
     # Final verification.
     time.sleep(0.2)
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

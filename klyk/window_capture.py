@@ -68,13 +68,16 @@ def _complete(start, deadline):
 
 def take(window_id, width, height):
     """Return fresh PNG pixels at logical window dimensions; never widen capture scope."""
+    from .image_bounds import png_dimensions, validate_image_dimensions
+
+    if (isinstance(window_id, bool) or not isinstance(window_id, int)
+            or not 1 <= window_id <= 0xffffffff):
+        raise ValueError('Window capture requires a valid positive window ID.')
+    validate_image_dimensions(width, height)
+    key = (window_id, width, height)
     import objc
     import Quartz
     from Foundation import NSMutableData
-
-    key = (int(window_id), int(width), int(height))
-    if min(key) <= 0:
-        raise ValueError('Window capture requires positive identity and dimensions.')
     if not Quartz.CGPreflightScreenCaptureAccess():
         raise RuntimeError('Screen Recording permission is required.')
     deadline = time.monotonic() + _TIMEOUT
@@ -121,7 +124,12 @@ def take(window_id, width, height):
             Quartz.CGImageDestinationAddImage(destination, image, None)
             if not Quartz.CGImageDestinationFinalize(destination):
                 raise RuntimeError('Window screenshot encoding failed.')
-            return base64.b64encode(bytes(data)).decode('ascii'), *actual
+            if len(data) > 24 * 1024 * 1024:
+                raise ValueError('PNG output exceeds the supported size; use a smaller window or crop.')
+            encoded = base64.b64encode(bytes(data)).decode('ascii')
+            if png_dimensions(encoded) != actual:
+                raise RuntimeError('Window screenshot encoding changed its dimensions; observe again.')
+            return encoded, *actual
         except Exception:
             _plans.pop(key, None)
             raise

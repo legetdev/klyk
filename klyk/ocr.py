@@ -12,7 +12,9 @@ coordinates in the same window-relative pixel space the rest of Klyk uses.
 
 from __future__ import annotations
 
-import base64
+import math
+
+from .image_bounds import validate_image_dimensions, validated_png_bytes
 
 try:
     import objc
@@ -100,7 +102,19 @@ def recognize_all(
     """
     _require()
 
-    img_bytes = base64.b64decode(image_b64)
+    if level not in (0, 1):
+        raise ValueError("OCR level must be fast (1) or accurate (0).")
+    if region is not None:
+        if not isinstance(region, (tuple, list)) or len(region) != 4:
+            raise ValueError("OCR region requires four finite coordinates.")
+        try:
+            region = tuple(float(value) for value in region)
+        except (TypeError, ValueError) as error:
+            raise ValueError("OCR region requires four finite coordinates.") from error
+        if not all(math.isfinite(value) for value in region):
+            raise ValueError("OCR region requires four finite coordinates.")
+
+    img_bytes = validated_png_bytes(image_b64)
     ns_data = NSData.dataWithBytes_length_(img_bytes, len(img_bytes))
 
     src = CGImageSourceCreateWithData(ns_data, None)
@@ -112,6 +126,7 @@ def recognize_all(
 
     width = CGImageGetWidth(cg_image)
     height = CGImageGetHeight(cg_image)
+    validate_image_dimensions(width, height)
 
     # Native NSDictionary returns nil for absent option keys. A bridged Python
     # dict raises on those lookups in recent Vision builds, before OCR starts.

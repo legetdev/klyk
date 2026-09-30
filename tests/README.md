@@ -10,6 +10,23 @@ The portable tests cover validation, batch failures, targeting, emergency-latch 
 
 Focused regressions also exercise real subprocess pipes (large requests, noisy stderr, partial responses, timeouts, and cleanup), failed atomic configuration/cache writes, capture-scope refusal, cancelled click pairs, and save-result evidence. These run without opening apps or operating the desktop.
 
+## Verification while the owner uses the Mac
+
+Portable tests operate on temporary files, controlled native adapters, and ordinary Python subprocesses. They do not launch apps, post input, or change the clipboard. A normal MCP launch installs a visible menu-bar item and performs an off-screen input self-test; a normal connection smoke check therefore does not meet an instruction to remain completely invisible.
+
+The `silent_protocol_smoke.py` check runs the actual package entry point and installed MCP SDK through real subprocess pipes, with real metadata-only permission checks. Its external test bootstrap prevents AppKit initialization, the status item, event-tap installation, input delivery, clipboard access, app activation, subprocess launches, and screen capture. It can check tool discovery, screen metadata, rejected requests, diagnostic privacy, and process cleanup. It explicitly records every substituted boundary. This is protocol integration evidence and cannot satisfy native desktop acceptance.
+
+```sh
+python3 -B tests/silent_protocol_smoke.py --output .verification/silent-protocol.json
+python3 -B tests/silent_lifecycle_smoke.py --output .verification/silent-lifecycle.json
+```
+
+The lifecycle check adds real EOF, SIGTERM, and SIGINT against disposable guarded server children. It uses the production held-input registry with inert keyboard, mouse, and media callbacks to observe release order, exactly-once cleanup, refusal of queued input, and child reaping. Clipboard restoration and native event delivery remain mocked boundaries; this is process-lifecycle integration evidence.
+
+After installing a candidate wheel in a fresh environment, add `--installed` to either silent check and run with that environment's interpreter. This selects the installed client and server, requires the package to live inside that environment, and compares every runtime Python file with the reviewed checkout before launching the child. A source import or an older/different installed artifact fails before protocol calls.
+
+Native ImageIO and Vision checks on generated, static images can run invisibly when they neither start AppKit nor capture the owner's screen. Existing `live_smoke.py`, `desktop_smoke.py`, and the development branch's `background_smoke.py` create real windows; none is suitable while an owner has prohibited visible or audible computer changes. Keep major desktop candidates unpublished until the required real acceptance can run within the owner's constraints.
+
 ## Real Mac verification
 
 For a low-interruption pass, use the background-only suite:
@@ -27,7 +44,13 @@ python3 -B tests/live_smoke.py --output .verification/native.json
 python3 -B tests/desktop_smoke.py --output .verification/desktop.json
 ```
 
-These checks actively operate the desktop. Run them on a Mac available for testing, with Accessibility and Screen Recording permission for the runner. The native check uses disposable windows, text, files, menus, and dialogs. The desktop check requires Chrome and Visual Studio Code already installed; it creates a local browser page and an isolated editor profile, and refuses to run the editor check if Code is already running. It checks the exact editor process and fixture document before sending input. No paid model or remote test service is used.
+These checks actively operate the desktop. Run them on a Mac available for testing, with Accessibility and Screen Recording permission for the runner. The native check uses disposable windows, text, files, menus, and dialogs. The desktop check requires Chrome and Visual Studio Code already installed; it creates a local browser page and isolated browser/editor processes and profiles. Chrome is launched through its own executable with a disposable profile, so the fixture needs no extra Chrome AppleEvents grant. An existing Chrome or Code process prevents isolated app-name targeting and stops the check. The exact owned process, selected window, and fixture document are verified before input. No paid model or remote test service is used.
+
+`KLYK_FIXTURE_COMPACT=1` retains the native fixture's 400×600 control content on a 1024×700 or larger desktop. The primary windows sit at x=120/540, y=20 in Cocoa coordinates; the selected right window moves to x=560. The receiver's two windows overlap at x=120, y=20, leaving the selected source and receiver as separate real drag surfaces. The report includes actual native frame/content bounds and asserts compact geometry. Compact geometry adds checks while keeping all 48 required native outcomes. The default full-size desktop layout is unchanged; compact mode still creates visible windows and belongs only on an isolated test Mac or remote runner.
+
+The opt-in [`native-verification.yml`](../.github/workflows/native-verification.yml) provides an isolated remote route on standard GitHub-hosted macOS runners in this public repository. Candidate pushes run only the read-only permission/display probe. A same-repository PR labeled `native-verification`, or an explicit workflow dispatch with `full_suite` enabled, requests the full matrix on both supported MCP majors. The probe checks existing Accessibility and Screen Recording grants, the fixture apps, and sufficient desktop geometry; it repeats with the fresh-installed interpreter before any UI. Missing grants or geometry fail the job and remain incomplete acceptance, without requesting permissions or modifying TCC. Capable runners then run fresh-install doctor, real stdio/schema checks, and the full native and Chromium/Electron suites.
+
+Remote evidence is limited to named fixture JSON reports emitted in checksummed log chunks. Screenshots, application logs, browser/editor profiles, and temporary documents are not uploaded, and no paid artifact storage is used. Download and validate the exact completed reports before release; a capability probe or a passing guarded local protocol check cannot replace the full major acceptance gate.
 
 The checks cover these workflow groups:
 
@@ -47,7 +70,7 @@ The checks cover these workflow groups:
 14. Chromium fallback and isolated Electron editing with independent page/file outcomes.
 15. Batch interruption, mode refusals, diagnostics, and evidence-qualified verdicts.
 
-Reports contain environment versions, tool calls, timings, payload sizes, independent assertions, and a source fingerprint. Screenshots, compiled fixtures, temporary documents, and reports stay in ignored `.verification/`. Run the native check with each supported MCP major version in separate environments. A pass covers these fixture cases on the recorded machine, not every control, application, permission configuration, or display setup. Multiple-display hardware needs a separate real-device check. The physical emergency-stop chord also needs a person; automated latch tests do not establish physical shortcut acceptance.
+Reports contain environment versions, tool calls, timings, payload sizes, independent assertions, and a source fingerprint. Fixture-local counters observe delivered key-down/key-up events; the held-key check requires a matching release rather than inferring it from later text. Absent-dialog refusal also requires unchanged input counters and fixture state. Screenshots, compiled fixtures, temporary documents, and reports stay in ignored `.verification/`. Run the native check with each supported MCP major version in separate environments. A pass covers these fixture cases on the recorded machine, not every control, application, permission configuration, or display setup. Multiple-display hardware needs a separate real-device check. The physical emergency-stop chord also needs a person; automated latch tests do not establish physical shortcut acceptance.
 
 ## Release gate
 
@@ -66,9 +89,11 @@ For a minor release, save a private JSON report with `scope: "minor"`, a nonempt
 For major functionality changes, supply fresh full-suite evidence:
 
 ```sh
-python3 tests/release_check.py --live .verification/native.json --desktop .verification/desktop.json
+python3 tests/release_check.py --live .verification/native-mcp1.json --live .verification/native-mcp2.json --desktop .verification/desktop.json
 python3 tests/release_check.py --archives
 ./release.sh vX.Y.Z --live .verification/native-mcp1.json --live .verification/native-mcp2.json --desktop .verification/desktop.json --notes-file /tmp/release-notes.md --dry-run
 ```
 
 The release script requires a reviewed, committed candidate on synchronized `main`, passing portable tests, fresh evidence for the selected scope, and clean package archives. Omit `--dry-run` only when publication is authorized. GitHub CI runs portable tests on both MCP major versions; Linux CI does not replace any real Mac checks required by the changed behavior.
+
+Full reports must record supported versions in `environment.mcp`, with native reports for both MCP majors. Each native report must discover and call every tool actually declared in the candidate source, validate every schema returned by the real SDK, and include all independent native acceptance checks. The desktop report must include the independent Chromium and Electron workflow checks. Partial, empty, stale, malformed, or truthy-string assertions are rejected. Privacy checks compare paths without regard to case and reject absolute or parent-traversing archive paths. Tracked Git paths use raw NUL-separated filenames so display escaping cannot hide private directories. These controls validate evidence completeness; the owner still reviews whether recorded assertions describe checks that actually ran.

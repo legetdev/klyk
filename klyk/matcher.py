@@ -56,9 +56,14 @@ Python environments.
 
 from __future__ import annotations
 
+import math
 import numpy as np
 
 from . import capture
+from .image_bounds import png_dimensions, validated_png_bytes
+
+_TEMPLATE_CACHE_BYTES = 8 * 1024 * 1024
+_TEMPLATE_CACHE_ENTRIES = 50
 
 
 # ---------------------------------------------------------------------------
@@ -107,6 +112,64 @@ def _next_fast_len(target: int) -> int:
     return int(best)
 
 
+def _validate_match_budget(
+    height: int, width: int, template_height: int, template_width: int,
+    decoded_pixels: int | None = None,
+    encoded_bytes: int = 0,
+) -> None:
+    """Reject expensive decoding/FFT/map allocations using a 512 MiB work estimate."""
+    if min(height, width, template_height, template_width) <= 0:
+        raise ValueError("Template matching requires non-empty images")
+    if template_width > width or template_height > height:
+        raise ValueError(
+            f"Template ({template_width}×{template_height}) is larger than search area ({width}×{height})"
+        )
+    fh = _next_fast_len(height + template_height - 1)
+    fw = _next_fast_len(width + template_width - 1)
+    area = height * width
+    valid_area = (height - template_height + 1) * (width - template_width + 1)
+    if decoded_pixels is None:
+        decoded_pixels = area + template_height * template_width
+    # RGB float64 inputs, padded complex transforms (including temporaries and
+    # the previous channel), integral-image passes, and all live correlation maps.
+    fft_bytes = decoded_pixels * 24 + encoded_bytes + 8 * (6 * fh * fw + 6 * area + 8 * valid_area)
+    # A 16-bit RGBA PNG can occupy 8 native bytes per pixel before conversion
+    # into the 4-byte canonical bitmap and 24-byte float64 RGB output.
+    decode_bytes = decoded_pixels * 36 + encoded_bytes * 4
+    if max(fft_bytes, decode_bytes) > 512 * 1024 * 1024:
+        raise ValueError(
+            "Template search exceeds the 512 MiB work limit; use a smaller screenshot, crop the template, or use a smaller search_region."
+        )
+
+
+def _clip_region(region, width: int, height: int, kind: str) -> tuple[int, int, int, int]:
+    """Validate and clip one integer rectangle without NumPy negative-index wrapping."""
+    if not isinstance(region, (tuple, list)) or len(region) != 4 or any(
+        isinstance(value, bool) or not isinstance(value, (int, np.integer)) for value in region
+    ):
+        raise ValueError(f"{kind} region must contain four integer coordinates")
+    x1, y1, x2, y2 = (int(value) for value in region)
+    x1, y1, x2, y2 = max(0, x1), max(0, y1), min(width, x2), min(height, y2)
+    if x2 <= x1 or y2 <= y1:
+        raise ValueError(f"Invalid {kind.lower()} region: ({x1},{y1})→({x2},{y2}) for screenshot {width}×{height}")
+    return x1, y1, x2, y2
+
+
+def cache_template(cache: dict[str, str], template_id: str, png_b64: str) -> None:
+    """Keep a 50-entry / 8 MiB LRU cache, validating new images before any eviction."""
+    validated_png_bytes(png_b64)
+    entry_bytes = len(png_b64)
+    if entry_bytes > _TEMPLATE_CACHE_BYTES:
+        raise ValueError("Template exceeds the 8 MiB cache budget; crop a smaller region.")
+    remaining_bytes = sum(len(value) for key, value in cache.items() if key != template_id)
+    cache.pop(template_id, None)
+    while cache and (len(cache) >= _TEMPLATE_CACHE_ENTRIES
+                     or remaining_bytes + entry_bytes > _TEMPLATE_CACHE_BYTES):
+        oldest = next(iter(cache))
+        remaining_bytes -= len(cache.pop(oldest))
+    cache[template_id] = png_b64
+
+
 def _xcorr_valid(plane: np.ndarray, template: np.ndarray) -> np.ndarray:
     """
     Cross-correlation Σ(plane · template) over each fully-overlapping window,
@@ -117,6 +180,7 @@ def _xcorr_valid(plane: np.ndarray, template: np.ndarray) -> np.ndarray:
     """
     h, w = plane.shape
     th, tw = template.shape
+    _validate_match_budget(h, w, th, tw)
     fh = _next_fast_len(h + th - 1)
     fw = _next_fast_len(w + tw - 1)
     fft_plane = np.fft.rfft2(plane, (fh, fw))
@@ -135,6 +199,9 @@ def _match_ncc(haystack: np.ndarray, template: np.ndarray) -> np.ndarray:
     """
     h, w, c = haystack.shape
     th, tw, _ = template.shape
+    if c != 3 or template.shape[2] != 3:
+        raise ValueError("Template matching requires RGB images")
+    _validate_match_budget(h, w, th, tw)
     n = th * tw
     num = np.zeros((h - th + 1, w - tw + 1), dtype=np.float64)
     den_hay = np.zeros_like(num)
@@ -174,18 +241,16 @@ def crop(
     Coordinates are window-relative, matching Klyk's coordinate system.
     The returned value is a template suitable for passing to find().
     """
+    w, h = png_dimensions(screenshot_b64)
+    x1, y1, x2, y2 = _clip_region((x1, y1, x2, y2), w, h, "Crop")
+    source_pixels = w * h
+    crop_pixels = (x2 - x1) * (y2 - y1)
+    decode_bytes = source_pixels * 36 + len(screenshot_b64) * 4
+    # Float64 source, cropped uint8, BGRX/provider copies, and PNG/base64 output.
+    encode_bytes = source_pixels * 24 + crop_pixels * 32 + len(screenshot_b64)
+    if max(decode_bytes, encode_bytes) > 512 * 1024 * 1024:
+        raise ValueError("Template extraction exceeds the 512 MiB work limit; use a smaller screenshot or crop.")
     img = capture.decode_png_to_rgb_array(screenshot_b64)
-    h, w = img.shape[:2]
-
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(w, x2), min(h, y2)
-
-    if x2 <= x1 or y2 <= y1:
-        raise ValueError(
-            f"Invalid crop region: ({x1},{y1})→({x2},{y2}) "
-            f"for screenshot {w}×{h}"
-        )
-
     return capture.encode_rgb_array_to_png_b64(img[y1:y2, x1:x2].astype(np.uint8))
 
 
@@ -226,32 +291,26 @@ def find(
         box          — [x1, y1, x2, y2] bounding box of match
     None if threshold was a float and no match exceeded it.
     """
-    haystack = capture.decode_png_to_rgb_array(screenshot_b64)
-    needle = capture.decode_png_to_rgb_array(template_b64)
-
-    nh, nw = needle.shape[:2]
-
-    # Optionally restrict the search area
+    if threshold is not None:
+        if (isinstance(threshold, bool) or not isinstance(threshold, (int, float, np.number))
+                or not math.isfinite(float(threshold)) or not 0 <= threshold <= 1):
+            raise ValueError("Match threshold must be a finite number between 0 and 1")
+    hw, hh = png_dimensions(screenshot_b64)
+    nw, nh = png_dimensions(template_b64)
+    decoded_pixels = hw * hh + nw * nh
     offset_x, offset_y = 0, 0
     if search_region is not None:
-        sx1, sy1, sx2, sy2 = search_region
-        h, w = haystack.shape[:2]
-        sx1, sy1 = max(0, sx1), max(0, sy1)
-        sx2, sy2 = min(w, sx2), min(h, sy2)
-        if sx2 <= sx1 or sy2 <= sy1:
-            raise ValueError(
-                f"Invalid search region: ({sx1},{sy1})→({sx2},{sy2}) "
-                f"for screenshot {w}×{h}"
-            )
-        haystack = haystack[sy1:sy2, sx1:sx2]
+        sx1, sy1, sx2, sy2 = _clip_region(search_region, hw, hh, "Search")
         offset_x, offset_y = sx1, sy1
-
-    hh, hw = haystack.shape[:2]
-    if nw > hw or nh > hh:
-        raise ValueError(
-            f"Template ({nw}×{nh}) is larger than search area ({hw}×{hh})"
-        )
-
+        hw, hh = sx2 - sx1, sy2 - sy1
+    _validate_match_budget(
+        hh, hw, nh, nw, decoded_pixels=decoded_pixels,
+        encoded_bytes=len(screenshot_b64) + len(template_b64),
+    )
+    haystack = capture.decode_png_to_rgb_array(screenshot_b64)
+    needle = capture.decode_png_to_rgb_array(template_b64)
+    if search_region is not None:
+        haystack = haystack[sy1:sy2, sx1:sx2]
     result = _match_ncc(haystack, needle)
     # result is (rows=y, cols=x); argmax gives the top-left corner of the match.
     max_y, max_x = np.unravel_index(int(np.argmax(result)), result.shape)

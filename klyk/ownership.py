@@ -32,6 +32,10 @@ from __future__ import annotations
 
 import fcntl
 import os
+import contextvars
+import asyncio
+import threading
+from contextlib import contextmanager
 from pathlib import Path
 
 from .private_files import open_private, private_directory
@@ -44,16 +48,17 @@ OWNER_PATH = Path(
 
 # Captured once at import — stable for the process lifetime.
 _MY_PID = os.getpid()
+_control_held = contextvars.ContextVar("klyk_control_held", default=None)
 
 
 def _read_pid(fh) -> int:
     """Read the owner pid from an open, positioned file handle. 0 if empty
     or unparseable."""
     fh.seek(0)
-    raw = fh.read(64).strip()
     try:
+        raw = fh.read(64).strip()
         return int(raw)
-    except (ValueError, TypeError):
+    except (ValueError, TypeError, UnicodeError):
         return 0
 
 
@@ -94,12 +99,72 @@ def _open():
         return None
 
 
+def _lock(fh, mode: int) -> bool:
+    """Fail promptly when another process holds the token instead of wedging startup."""
+    try:
+        fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
+        return True
+    except OSError:
+        return False
+
+
+@contextmanager
+def _action_lease():
+    """Keep a handoff from overlapping input that the current request is still releasing."""
+    try:
+        task = asyncio.current_task()
+    except RuntimeError:
+        task = None
+    holder = (threading.get_ident(), task)
+    if _control_held.get() == holder:
+        yield
+        return
+    fh = None
+    token = None
+    try:
+        try:
+            if OWNER_PATH.parent == Path.home() / ".klyk":
+                private_directory(OWNER_PATH.parent)
+            else:
+                OWNER_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            fh = open_private(OWNER_PATH.with_name(OWNER_PATH.name + ".input"), "a+")
+        except OSError as error:
+            raise RuntimeError("Control cannot be verified because its local input lock is unavailable.") from error
+        if not _lock(fh, fcntl.LOCK_EX):
+            raise RuntimeError("Control is busy with an input request; wait for it to finish before taking control.")
+        token = _control_held.set(holder)
+        yield
+    finally:
+        if token is not None:
+            _control_held.reset(token)
+        if fh is not None:
+            try:
+                fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+            finally:
+                fh.close()
+
+
+@contextmanager
+def control_request():
+    """Serialize control across servers and retain the lease through cancellation cleanup."""
+    with _action_lease():
+        if not is_owner():
+            raise RuntimeError("Another session owns control, or ownership is unavailable. Call take_control only when the user requests a handoff.")
+        yield
+
+
 def claim_ownership() -> int:
     """Make THIS process the control owner. Returns the previous owner pid,
     or 0 if there was none / it was us. Raises when the owner file is
     unavailable because control cannot be verified. This is the FORCEFUL
     claim — it is `take_control`. Startup uses `claim_ownership_if_unowned`
     instead so a respawn doesn't yank control from a live, active driver."""
+    with _action_lease():
+        return _claim_ownership()
+
+
+def _claim_ownership() -> int:
+    """Write an explicit transfer only while the input lease prevents overlapping drivers."""
     fh = _open()
     if fh is None:
         raise RuntimeError(
@@ -107,7 +172,8 @@ def claim_ownership() -> int:
             "so control ownership cannot be verified."
         )
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if not _lock(fh, fcntl.LOCK_EX):
+            raise RuntimeError("Control ownership is busy; wait for the current request to finish.")
         prev = _read_pid(fh)
         _write_pid(fh, _MY_PID)
         return prev if prev != _MY_PID else 0
@@ -136,7 +202,8 @@ def claim_ownership_if_unowned() -> int:
     if fh is None:
         return 0
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if not _lock(fh, fcntl.LOCK_EX):
+            return 0
         owner = _read_pid(fh)
         if owner == _MY_PID or not _alive(owner):
             _write_pid(fh, _MY_PID)
@@ -158,7 +225,8 @@ def is_owner() -> bool:
     if fh is None:
         return False
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_EX)
+        if not _lock(fh, fcntl.LOCK_EX):
+            return False
         owner = _read_pid(fh)
         if owner == _MY_PID:
             return True
@@ -181,7 +249,8 @@ def current_owner() -> int:
     if fh is None:
         return 0
     try:
-        fcntl.flock(fh.fileno(), fcntl.LOCK_SH)
+        if not _lock(fh, fcntl.LOCK_SH):
+            return 0
         return _read_pid(fh)
     finally:
         try:
