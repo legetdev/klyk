@@ -102,23 +102,11 @@ def fixture_panel_diagnostic(computer, pid):
     started=time.monotonic();deadline=started+1.5
     result={'host_pid':pid,'scope':'owned generated fixture host and its AX descendants only',
             'max_elements':400,'traversal_budget_seconds':1.5,'elements':[],'raw_panel_elements':[]}
-    try:
-        elements=computer.ax_snapshot(pid,max_results=400,max_children_per_node=100,deadline_seconds=.65)
-        result['elements']=[{key:(value[:256] if isinstance(value,str) else value)
-                             for key,value in element.items()
-                             if key in ('role','label','value','focused','x','y','width','height')}
-                            for element in elements[:400]]
-    except Exception as error:
-        result['snapshot_error']=type(error).__name__
-    try:
-        if time.monotonic()<deadline:
-            result['focused_summary']=computer.ax_focused_summary(pid)
-    except Exception as error:
-        result['focused_summary_error']=type(error).__name__
     attributes=(b'AXRole',b'AXTitle',b'AXDescription',b'AXPlaceholderValue',b'AXSubrole',
                 b'AXValue',b'AXFocused',b'AXURL',b'AXDocument',b'AXSelected',b'AXPosition',b'AXSize',b'AXChildren')
-    panel_roles={'AXSheet','AXDialog','AXTextField','AXTextArea','AXComboBox','AXButton','AXStaticText','AXRow','AXCell'}
+    panel_roles={'AXSheet','AXDialog','AXTextField','AXTextArea','AXComboBox','AXButton','AXStaticText','AXRow','AXCell','AXList','AXTable'}
     field_roles={'AXTextField','AXTextArea','AXComboBox'}
+    action_roles=field_roles|{'AXSheet','AXDialog','AXButton','AXRow','AXCell','AXList','AXTable'}
     seen=set();app=0;focused=0
 
     def release(values):
@@ -126,6 +114,14 @@ def fixture_panel_diagnostic(computer, pid):
         for value in values or ():
             if value:
                 computer._cf.CFRelease(ctypes.c_void_p(value))
+
+    def element_pid(element):
+        """Read ownership before following a prioritized native reference or exposing its actions."""
+        if time.monotonic()>=deadline:
+            return None
+        owner=ctypes.c_int()
+        status=computer._appserv.AXUIElementGetPid(ctypes.c_void_p(element),ctypes.byref(owner))
+        return owner.value if status==0 else None
 
     def action_names(element):
         """Read only advertised native actions, retaining at most 16 names before releasing the array."""
@@ -150,7 +146,7 @@ def fixture_panel_diagnostic(computer, pid):
         finally:
             release((names.value,))
 
-    def parent_chain(element):
+    def parent_chain(element, *, strict=False):
         """Read up to eight actual AXParent references, retaining no native references in evidence."""
         chain=[];parent=0
         try:
@@ -161,6 +157,11 @@ def fixture_panel_diagnostic(computer, pid):
                 try:
                     item={key:(computer._cftype_to_str(value)[:256] if value else None)
                           for key,value in zip(('AXRole','AXTitle','AXSubrole'),raw or ())}
+                    item['element_pid']=element_pid(parent)
+                    if strict and item['element_pid']!=pid:
+                        item['scope_rejected']='foreign_or_unverified_owner'
+                        chain.append(item)
+                        break
                     if item.get('AXRole')=='AXSheet' and sum(parent.get('AXRole')=='AXSheet' for parent in chain)<2:
                         item.update(action_names(parent))
                     chain.append(item)
@@ -181,54 +182,98 @@ def fixture_panel_diagnostic(computer, pid):
         if geometry:
             x,y,width,height=geometry
             item.update(x=x+width/2,y=y+height/2,width=width,height=height)
-        if time.monotonic()<deadline:
-            owner=ctypes.c_int()
-            status=computer._appserv.AXUIElementGetPid(ctypes.c_void_p(element),ctypes.byref(owner))
-            item['element_pid']=owner.value if status==0 else None
-        if item.get('AXRole') in field_roles:
+        item['element_pid']=element_pid(element)
+        if item.get('AXRole') in action_roles and (item['element_pid']==pid or item.get('AXRole') in field_roles):
             item.update(action_names(element))
+            item['parents']=parent_chain(element,strict=item.get('AXRole') not in field_roles)
+        elif item.get('AXRole') in action_roles:
+            item['scope_rejected']='foreign_or_unverified_owner'
+        if item.get('AXRole') in field_roles:
             item['settable']={}
             for attribute in (b'AXValue',b'AXFocused'):
                 if time.monotonic()<deadline:
                     item['settable'][attribute.decode()]=computer._ax_attr_is_settable(element,attribute)
-            item['parents']=parent_chain(element)
         return item
 
-    def walk(element, depth=0):
+    def default_button(element):
+        """Inspect only a same-host focused chooser's copied default button, without invoking it."""
+        button=0
+        try:
+            if time.monotonic()>=deadline or len(seen)>=400:
+                return None
+            button=computer._ax_read_attr_ptr(element,b'AXDefaultButton')
+            if not button:
+                return None
+            owner=element_pid(button)
+            if owner!=pid:
+                return {'element_pid':owner,'scope_rejected':'foreign_or_unverified_owner'}
+            if time.monotonic()>=deadline:
+                return None
+            seen.add(button)
+            raw=computer._ax_read_multi(button,attributes)
+            try:
+                if not raw:
+                    return None
+                if not raw[0] or computer._cftype_to_str(raw[0])!='AXButton':
+                    return {'scope_rejected':'not_a_button'}
+                return describe(button,raw)
+            finally:
+                release(raw)
+        finally:
+            release((button,))
+
+    def walk(element, depth=0, *, prioritized=False):
         """Stay within the owned app tree, 400 nodes, depth 30, and the shared read deadline."""
         if element in seen or len(seen)>=400 or depth>30 or time.monotonic()>=deadline:
             return
         seen.add(element)
+        if element_pid(element)!=pid or time.monotonic()>=deadline:
+            return
         raw=computer._ax_read_multi(element,attributes)
         if not raw:
             return
         try:
             role=computer._cftype_to_str(raw[0]) if raw[0] else ''
             if role in panel_roles:
-                result['raw_panel_elements'].append(describe(element,raw))
+                item=describe(element,raw)
+                item.update(depth=depth,prioritized=prioritized)
+                result['raw_panel_elements'].append(item)
             children=raw[-1]
             if children:
                 count=computer._cf.CFArrayGetCount(ctypes.c_void_p(children))
+                if role in panel_roles:
+                    item['children_count']=count
+                    item['children_truncated']=count>400
                 for index in range(min(count,400)):
                     if len(seen)>=400 or time.monotonic()>=deadline:
                         break
                     child=computer._cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children),index)
                     if child:
-                        walk(child,depth+1)
+                        walk(child,depth+1,prioritized=prioritized)
+                if role in panel_roles and (time.monotonic()>=deadline or len(seen)>=400):
+                    item['children_truncated']=True
         finally:
             release(raw)
 
     try:
         if time.monotonic()<deadline:
             app=computer._appserv.AXUIElementCreateApplication(pid)
-            if app:
+            if app and time.monotonic()<deadline:
                 computer._appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app),.05)
-                focused=computer._ax_read_attr_ptr(app,b'AXFocusedUIElement')
+                focused=computer._ax_read_attr_ptr(app,b'AXFocusedUIElement') if time.monotonic()<deadline else 0
                 if focused and time.monotonic()<deadline:
                     raw=computer._ax_read_multi(focused,attributes)
                     try:
                         if raw:
-                            result['raw_host_focus']=describe(focused,raw)
+                            role=computer._cftype_to_str(raw[0]) if raw[0] else ''
+                            owner=element_pid(focused) if role in ('AXSheet','AXDialog') else None
+                            if role in ('AXSheet','AXDialog') and owner!=pid:
+                                result['raw_host_focus']={'AXRole':role,'element_pid':owner,'scope_rejected':'foreign_or_unverified_owner'}
+                            else:
+                                result['raw_host_focus']=describe(focused,raw)
+                                if role in ('AXSheet','AXDialog') and time.monotonic()<deadline:
+                                    result['raw_host_focus']['default_button']=default_button(focused)
+                                    walk(focused,prioritized=True)
                     finally:
                         release(raw)
                 windows=computer._ax_read_attr_ptr(app,b'AXWindows') if time.monotonic()<deadline else 0
@@ -249,7 +294,25 @@ def fixture_panel_diagnostic(computer, pid):
         result['raw_probe_error']=type(error).__name__
     finally:
         release((focused,app))
+    try:
+        remaining=deadline-time.monotonic()
+        if remaining>0:
+            elements=computer.ax_snapshot(pid,max_results=400,max_children_per_node=100,deadline_seconds=min(.65,remaining))
+            result['elements']=[{key:(value[:256] if isinstance(value,str) else value)
+                                 for key,value in element.items()
+                                 if key in ('role','label','value','focused','x','y','width','height')}
+                                for element in elements[:400]]
+    except Exception as error:
+        result['snapshot_error']=type(error).__name__
+    focus=result.get('raw_host_focus')
+    if focus and 'scope_rejected' not in focus:
+        # Reuse the bounded own-host observation instead of starting another
+        # multi-read focus lookup at the end of the shared deadline.
+        result['focused_summary']={'focused':{'label':focus.get('AXTitle') or focus.get('AXDescription') or '',
+                                             'role':focus.get('AXRole') or '', 'value':focus.get('AXValue') or ''}}
+        result['focused_summary_source']='raw_host_focus'
     result['raw_visited_nodes']=len(seen)
+    result['raw_node_limit_reached']=len(seen)>=400
     result['elapsed_ms']=round((time.monotonic()-started)*1000)
     result['deadline_reached']=time.monotonic()>=deadline
     return result

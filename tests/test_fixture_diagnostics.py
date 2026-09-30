@@ -15,7 +15,7 @@ class FakeAX:
     def __init__(self, *, step=0):
         """Model a host sheet with a service-owned empty path field and one selected file row."""
         self.now=0.;self.step=step;self.reads=[];self.references=Counter();self.values={};self.next_pointer=1000
-        self.array_children={};self.actions={3:['AXConfirm'],4:['AXConfirm']};self.action_status=0
+        self.array_children={};self.actions={3:['AXConfirm'],4:['AXConfirm']};self.action_status=0;self.action_reads=[]
         self.nodes={
             1:{'AXRole':'AXApplication','AXWindows':[2],'AXFocusedUIElement':4},
             2:{'AXRole':'AXWindow','AXTitle':'Open','AXChildren':[3],'AXParent':1},
@@ -65,7 +65,8 @@ class FakeAX:
 
     def snapshot(self, pid, **kwargs):
         """Return a host-wide snapshot whose comparison-derived focus differs from raw AXFocused."""
-        if pid!=123 or kwargs!={'max_results':400,'max_children_per_node':100,'deadline_seconds':.65}:
+        if (pid!=123 or kwargs.get('max_results')!=400 or kwargs.get('max_children_per_node')!=100
+                or not 0<kwargs.get('deadline_seconds',0)<=.65 or set(kwargs)!={'max_results','max_children_per_node','deadline_seconds'}):
             raise AssertionError('unscoped or unbounded snapshot')
         return [{'role':'AXTextField','value':'','focused':False,'x':110,'y':35,'width':200,'height':30}]
 
@@ -101,6 +102,7 @@ class FakeAX:
     def copy_actions(self, element, output):
         """Copy advertised names with owned array callbacks, never perform an action."""
         self.record('copy_action_names')
+        self.action_reads.append(element.value)
         names=[self.value(name) for name in self.actions.get(element.value,[])]
         array=self.value(names);self.array_children[array]=names
         ctypes.cast(output,ctypes.POINTER(ctypes.c_void_p))[0]=array
@@ -149,6 +151,8 @@ class FixtureDiagnosticTests(unittest.TestCase):
         self.assertEqual(focus['AXPlaceholderValue'],'/folder')
         self.assertEqual(focus['settable'],{'AXValue':True,'AXFocused':False})
         self.assertEqual(focus['action_names'],['AXConfirm'])
+        self.assertEqual(report['focused_summary_source'],'raw_host_focus')
+        self.assertEqual(report['focused_summary']['focused']['value'],focus['AXValue'])
         self.assertEqual(focus['parents'][0]['action_names'],['AXConfirm'])
         self.assertEqual([parent['AXRole'] for parent in focus['parents']],['AXSheet','AXWindow','AXApplication'])
         row=next(element for element in report['raw_panel_elements'] if element['AXRole']=='AXRow')
@@ -172,18 +176,91 @@ class FixtureDiagnosticTests(unittest.TestCase):
 
     def test_expired_shared_budget_stops_additional_native_reads(self):
         """Read calls stop at the shared deadline, allowing only the last already-in-flight operation."""
-        fake=FakeAX(step=.11);report=fake.run()
-        self.assertTrue(report['deadline_reached'])
-        self.assertLess(report['elapsed_ms'],1700)
-        self.assertTrue(all(start<1.5 for name,start in fake.reads))
-        self.assertFalse(any(fake.references.values()))
-        fake=FakeAX()
-        def exhausted(*args,**kwargs):
-            """Represent an already-exhausted snapshot without any real waiting."""
-            fake.now=2.;return []
-        fake.computer.ax_snapshot=exhausted
+        for focused in (4,3):
+            with self.subTest(focused=focused):
+                fake=FakeAX(step=.11);fake.nodes[1]['AXFocusedUIElement']=focused
+                report=fake.run()
+                self.assertTrue(report['deadline_reached'])
+                self.assertLess(report['elapsed_ms'],1700)
+                self.assertTrue(all(start<1.5 for name,start in fake.reads))
+                self.assertFalse(any(fake.references.values()))
+        fake=FakeAX(step=2.)
         self.assertEqual(fake.run()['raw_visited_nodes'],0)
-        self.assertEqual(fake.reads,[])
+        self.assertEqual(fake.reads,[('application',0.)])
+
+    def test_focused_sheet_metadata_and_selected_path_precede_outer_file_lists(self):
+        """The observed post-confirmation sheet exposes actions and selected path before a wide file view."""
+        fake=FakeAX(step=.001)
+        fake.nodes[1]['AXFocusedUIElement']=3
+        fake.nodes[3].update(AXParent=9,AXFocused='true',AXDefaultButton=5)
+        fake.nodes[4]['pid']=123
+        fake.nodes[9]={'AXRole':'AXSheet','AXDescription':'open','AXChildren':[3],'AXParent':2}
+        fake.nodes[8].update(AXChildren=[10])
+        fake.nodes[10]={'AXRole':'AXCell','AXSelected':'true','AXChildren':[11],'AXParent':8}
+        fake.nodes[11]={'AXRole':'AXList','AXDescription':'path','AXChildren':[12],'AXParent':10}
+        fake.nodes[12]={'AXRole':'AXStaticText','AXValue':'/tmp/generated.txt','AXParent':11}
+        fake.actions.update({5:['AXPress'],8:['AXPress'],10:['AXPress'],11:['AXConfirm']})
+        fake.nodes[2]['AXChildren']=list(range(20,620))+[9]
+        for element in range(20,620):
+            fake.nodes[element]={'AXRole':'AXStaticText','AXValue':'outer file','AXParent':2}
+        report=fake.run();focus=report['raw_host_focus']
+        self.assertEqual(focus['AXRole'],'AXSheet')
+        self.assertEqual(focus['action_names'],['AXConfirm'])
+        self.assertEqual([item['AXRole'] for item in focus['parents']],['AXSheet','AXWindow','AXApplication'])
+        self.assertEqual(focus['default_button']['AXRole'],'AXButton')
+        self.assertEqual(focus['default_button']['action_names'],['AXPress'])
+        for role in ('AXRow','AXCell','AXList'):
+            item=next(item for item in report['raw_panel_elements'] if item['AXRole']==role)
+            self.assertTrue(item['prioritized'])
+            self.assertEqual(item['element_pid'],123)
+            self.assertTrue(item['action_names'])
+            self.assertEqual(item['parents'][-1]['AXRole'],'AXApplication')
+        values=[item.get('AXValue') for item in report['raw_panel_elements']]
+        self.assertLess(values.index('/tmp/generated.txt'),values.index('outer file'))
+        self.assertEqual(report['raw_visited_nodes'],400)
+        self.assertTrue(report['raw_node_limit_reached'])
+        self.assertFalse(any(fake.references.values()))
+
+    def test_foreign_focused_sheet_and_default_button_are_never_prioritized(self):
+        """A copied host-focus reference cannot authorize following a foreign chooser or default button."""
+        for foreign in ('sheet','button','child'):
+            with self.subTest(foreign=foreign):
+                fake=FakeAX()
+                fake.nodes[1]['AXFocusedUIElement']=3
+                fake.nodes[3].update(AXDefaultButton=5)
+                fake.nodes[4]['pid']=123
+                element=3 if foreign=='sheet' else 5 if foreign=='button' else 8
+                fake.nodes[element]['pid']=456
+                fake.actions[5]=['AXPress']
+                report=fake.run()
+                self.assertNotIn(element,fake.action_reads)
+                if foreign=='sheet':
+                    self.assertEqual(report['raw_host_focus']['element_pid'],456)
+                    self.assertEqual(report['raw_host_focus']['scope_rejected'],'foreign_or_unverified_owner')
+                    self.assertNotIn('AXDefaultButton',[name for name,started in fake.reads])
+                elif foreign=='button':
+                    self.assertEqual(report['raw_host_focus']['default_button']['element_pid'],456)
+                    self.assertEqual(report['raw_host_focus']['default_button']['scope_rejected'],'foreign_or_unverified_owner')
+                else:
+                    self.assertFalse(any(item['AXRole']=='AXRow' for item in report['raw_panel_elements']))
+                self.assertFalse(any(fake.references.values()))
+
+    def test_focused_sheet_default_metadata_errors_still_balance_references(self):
+        """A decode failure inside the copied default button remains private and releases every reference."""
+        fake=FakeAX()
+        fake.nodes[1]['AXFocusedUIElement']=3
+        fake.nodes[3]['AXDefaultButton']=5
+        fake.nodes[5].update(AXPosition=(10,20),AXSize=(30,20))
+
+        def failing(*args):
+            """Fail only in the owned default button's metadata decoding, without any native mutation."""
+            raise ValueError('private-default-button-sentinel')
+
+        fake.computer._decode_pos_size=failing
+        report=fake.run()
+        self.assertEqual(report['raw_probe_error'],'ValueError')
+        self.assertNotIn('private-default-button-sentinel',str(report))
+        self.assertFalse(any(fake.references.values()))
 
     def test_action_metadata_is_capped_and_released_even_on_native_error(self):
         """Long advertised actions and failed copies cannot bloat diagnostics, mutate, or retain arrays."""
