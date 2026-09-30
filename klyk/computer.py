@@ -1698,6 +1698,211 @@ def ax_focus_save_field(pid: int) -> bool:
         return False
 
 
+def _ax_open_path_context(pid: int) -> tuple[int, int, int, int] | None:
+    """Retain a unique Go to Folder field inside the focused host's nested Open sheets."""
+    _check_stop()
+    app = _appserv.AXUIElementCreateApplication(pid)
+    if not app:
+        return None
+    owned = []
+    buttons = []
+    fields = []
+    try:
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS)
+        field = _ax_read_attr_ptr(app, b"AXFocusedUIElement")
+        if not field:
+            return None
+        owned.append(field)
+        if (_ax_str(field, b"AXRole") != "AXTextField"
+                or _ax_str(field, b"AXSubrole") == "AXSecureTextField"
+                or _ax_str(field, b"AXFocused").casefold() != "true"
+                or not _ax_matches_pid(field, pid)
+                or not _ax_attr_is_settable(field, b"AXValue")):
+            return None
+
+        # Native evidence on both supported SDKs exposes this exact parent
+        # chain; a document field or a search field in the outer panel fails it.
+        current = field
+        for role in ("AXSheet", "AXSheet", "AXWindow", "AXApplication"):
+            _check_stop()
+            current = _ax_read_attr_ptr(current, b"AXParent")
+            if not current:
+                return None
+            owned.append(current)
+            if _ax_str(current, b"AXRole") != role or not _ax_matches_pid(current, pid):
+                return None
+        chooser, panel = owned[1:3]
+        if (not _cf.CFEqual(ctypes.c_void_p(current), ctypes.c_void_p(app))
+                or (_ax_str(panel, b"AXDescription") or _ax_str(panel, b"AXTitle")).strip().casefold() not in ("open", "choose")):
+            return None
+
+        state = {"complete": True, "marker": 0}
+        seen = set()
+        deadline = time.monotonic() + 0.8
+
+        def walk(element: int, depth: int = 0) -> None:
+            """Prove one chooser prompt and editable field without walking its suggestion list."""
+            _check_stop()
+            if element in seen:
+                return
+            if depth > 10 or len(seen) >= 160 or time.monotonic() >= deadline:
+                state["complete"] = False
+                return
+            seen.add(element)
+            raw = _ax_read_multi(element, _AX_WALK_ATTRS)
+            if raw is None or len(raw) != 5:
+                for pointer in raw or ():
+                    if pointer:
+                        _cf.CFRelease(ctypes.c_void_p(pointer))
+                state["complete"] = False
+                return
+            try:
+                role, title, description, value = [(_cftype_to_str(p) if p else "") for p in raw[:4]]
+                if not role or role == "AXWebArea" or (depth and role in ("AXSheet", "AXDialog")):
+                    state["complete"] = False
+                    return
+                if role == "AXStaticText" and value.strip().rstrip(":").casefold() in ("go to folder", "go to the folder"):
+                    state["marker"] += 1
+                if role in ("AXTextField", "AXComboBox", "AXTextArea", "AXSearchField") and _ax_attr_is_settable(element, b"AXValue"):
+                    fields.append(_cf.CFRetain(ctypes.c_void_p(element)))
+                if role == "AXButton" and (title or description).strip().casefold() in ("go", "go to folder"):
+                    buttons.append(_cf.CFRetain(ctypes.c_void_p(element)))
+                # These are path suggestions, not the editable path or its
+                # confirmation control. Their size cannot manufacture uniqueness.
+                if role in ("AXTable", "AXOutline", "AXBrowser", "AXList"):
+                    return
+                children = raw[4]
+                if children:
+                    count = _cf.CFArrayGetCount(ctypes.c_void_p(children))
+                    if count > 80:
+                        state["complete"] = False
+                        return
+                    for index in range(count):
+                        if not state["complete"]:
+                            break
+                        child = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children), index)
+                        if child:
+                            walk(child, depth + 1)
+            finally:
+                for pointer in raw:
+                    if pointer:
+                        _cf.CFRelease(ctypes.c_void_p(pointer))
+
+        walk(chooser)
+        if (not state["complete"] or state["marker"] != 1 or len(fields) != 1
+                or not _cf.CFEqual(ctypes.c_void_p(fields[0]), ctypes.c_void_p(field))
+                or len(buttons) > 1):
+            return None
+        result = tuple(_cf.CFRetain(ctypes.c_void_p(pointer)) for pointer in (field, chooser, panel))
+        return (*result, _cf.CFRetain(ctypes.c_void_p(buttons[0])) if buttons else 0)
+    except RuntimeError:
+        raise
+    except Exception:
+        return None
+    finally:
+        for pointer in (*owned, *fields, *buttons, app):
+            _cf.CFRelease(ctypes.c_void_p(pointer))
+
+
+def _ax_panel_actions(element: int) -> set[str] | None:
+    """Read bounded action names before choosing a native panel confirmation path."""
+    _check_stop()
+    names = ctypes.c_void_p()
+    try:
+        status = _appserv.AXUIElementCopyActionNames(ctypes.c_void_p(element), ctypes.byref(names))
+        if status != 0 or not names.value:
+            return None
+        count = _cf.CFArrayGetCount(names)
+        if not 0 <= count <= 32:
+            return None
+        return {_cftype_to_str(_cf.CFArrayGetValueAtIndex(names, index)) for index in range(count)}
+    finally:
+        if names.value:
+            _cf.CFRelease(names)
+
+
+def ax_navigate_open_panel(pid: int, path: str) -> str | None:
+    """Set one proved Go to Folder field and confirm natively; unknown effects never permit fallback."""
+    _check_stop()
+    if not path or "\0" in path or len(path) > 16_384:
+        return None
+    context = _ax_open_path_context(pid)
+    if not context:
+        return None
+    field, chooser, panel, button = context
+    attempted = False
+    try:
+        target, action = 0, b""
+        for element in (field, chooser):
+            if "AXConfirm" in (_ax_panel_actions(element) or ()):
+                target, action = element, b"AXConfirm"
+                break
+        if not target and button and "AXPress" in (_ax_panel_actions(button) or ()):
+            target, action = button, b"AXPress"
+        if not target:
+            raise RuntimeError("The Go to Folder chooser has no accessible confirmation action; no path was typed.")
+
+        _check_stop()
+        attempted = True
+        if not _ax_set_value(field, path) or _ax_str(field, b"AXValue") != path:
+            raise RuntimeError("The Go to Folder path write could not be verified; inspect the dialog before continuing.")
+        refreshed = _ax_open_path_context(pid)
+        try:
+            if (not refreshed or not all(_cf.CFEqual(ctypes.c_void_p(old), ctypes.c_void_p(new))
+                                        for old, new in zip(context[:3], refreshed[:3]))
+                    or (action == b"AXPress" and (not refreshed[3]
+                        or not _cf.CFEqual(ctypes.c_void_p(button), ctypes.c_void_p(refreshed[3]))
+                        or _ax_str(button, b"AXRole") != "AXButton"
+                        or (_ax_str(button, b"AXTitle") or _ax_str(button, b"AXDescription")).strip().casefold() not in ("go", "go to folder")))
+                    or _ax_str(field, b"AXValue") != path
+                    or action.decode() not in (_ax_panel_actions(target) or ())):
+                raise RuntimeError("The Go to Folder target changed after the path write; inspect the dialog before continuing.")
+        finally:
+            for pointer in refreshed or ():
+                if pointer:
+                    _cf.CFRelease(ctypes.c_void_p(pointer))
+        if not _ax_perform_action(target, action):
+            raise RuntimeError("The Go to Folder confirmation could not be verified; inspect the dialog before continuing.")
+
+        # Prove closure from the retained outer panel's direct children. A
+        # partial generic screenshot/tree is never evidence of sheet absence.
+        deadline = time.monotonic() + 1.0
+        while time.monotonic() < deadline:
+            _check_stop()
+            children = _ax_read_attr_ptr(panel, b"AXChildren")
+            if children:
+                try:
+                    count = _cf.CFArrayGetCount(ctypes.c_void_p(children))
+                    closed = (0 <= count <= 200 and _ax_matches_pid(panel, pid)
+                              and _ax_str(panel, b"AXRole") == "AXSheet"
+                              and (_ax_str(panel, b"AXDescription") or _ax_str(panel, b"AXTitle")).strip().casefold() in ("open", "choose"))
+                    for index in range(count if closed else 0):
+                        _check_stop()
+                        if time.monotonic() >= deadline:
+                            closed = False
+                            break
+                        child = _cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children), index)
+                        role = _ax_str(child, b"AXRole") if child else ""
+                        if not role or role in ("AXSheet", "AXDialog"):
+                            closed = False
+                    if closed and time.monotonic() < deadline:
+                        return path
+                finally:
+                    _cf.CFRelease(ctypes.c_void_p(children))
+            time.sleep(0.05)
+        raise RuntimeError("The Go to Folder chooser did not close; inspect the dialog before continuing.")
+    except RuntimeError:
+        raise
+    except Exception:
+        if attempted:
+            raise RuntimeError("The Go to Folder navigation could not be verified; inspect the dialog before continuing.") from None
+        return None
+    finally:
+        for pointer in context:
+            if pointer:
+                _cf.CFRelease(ctypes.c_void_p(pointer))
+
+
 def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
     """Select a sidebar row only when its local URL proves the exact requested directory.
     Return None before writing if path evidence is absent; an attempted but

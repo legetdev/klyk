@@ -16,15 +16,38 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from klyk.client import KlykClient
-from live_smoke import text_payload
+from live_smoke import finalize_report, fixture_panel_diagnostic, stop_fixture_process, text_payload
 from release_check import fingerprint
+
+
+def electron_editor_ready(computer, pid, expected):
+    """Require the owned editor's focused native text value before replacing its contents."""
+    focus=computer.ax_focused_summary(pid).get('focused',{})
+    return focus.get('role') in ('AXTextArea','AXTextField') and focus.get('value')==expected
+
+
+def electron_fixture_diagnostic(computer, pid, document):
+    """Keep bounded read-only focus and file evidence from this disposable editor only."""
+    result={'scope':'owned disposable Electron fixture and generated document only'}
+    try:
+        with document.open('rb') as stream:
+            data=stream.read(8193)
+        result.update(saved_text=data[:8192].decode('utf-8',errors='replace'),
+                      saved_text_truncated=len(data)>8192)
+    except (OSError,UnicodeError) as error:
+        result['file_read_error']=type(error).__name__
+    try:
+        result['native']=fixture_panel_diagnostic(computer,pid)
+    except Exception as error:
+        result['native_probe_error']=type(error).__name__
+    return result
 
 
 def main():
     """Open one temporary Chrome window and an isolated VS Code profile, then clean up both."""
     parser=argparse.ArgumentParser();parser.add_argument('--output',default='.verification/desktop.json');args=parser.parse_args()
     work=ROOT/'.verification';work.mkdir(exist_ok=True)
-    state={};report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome=None;editor=None
+    state={};report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome=None;editor=None;document=None
     chrome_profile=tempfile.TemporaryDirectory(prefix='chrome-profile-',dir=work)
     def check(name, predicate, timeout=4):
         """Wait for an independent outcome without retrying an input action."""
@@ -121,29 +144,27 @@ def main():
             check('Electron document matches fixture before input',lambda:observed_fixture(c,'Klyk Electron Fixture',
                   editor_wid,('electron-fixture.txt',)),timeout=20)
             call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+1')
+            check('Electron editor focused before replacement',lambda:electron_editor_ready(
+                  computer,editor.pid,'Electron baseline'),timeout=10)
             call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+a')
             call(c,'type_text',app='Klyk Electron Fixture',window_id=editor_wid,text='Electron verified 🧭',mode='keys')
+            report['electron_after_typing']=computer.ax_focused_summary(editor.pid)
             call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+s')
             check('Electron editor saved exact Unicode text',lambda:document.read_text()=='Electron verified 🧭')
             call(c,'close_app',app='Klyk Electron Fixture')
             report['completed']=True
-    except Exception as exc:
-        report['error']=f'{type(exc).__name__}: {exc}';raise
+    except BaseException as exc:
+        report['error']=f'{type(exc).__name__}: {exc}'
+        if editor is not None and editor.poll() is None and document is not None:
+            report['electron_failure_diagnostic']=electron_fixture_diagnostic(computer,editor.pid,document)
+        raise
     finally:
-        (ROOT/args.output).write_text(json.dumps(report,indent=2))
-        if chrome is not None and chrome.poll() is None:
-            chrome.terminate()
-            try:chrome.wait(timeout=5)
-            except subprocess.TimeoutExpired:chrome.kill();chrome.wait()
-        if editor is not None and editor.poll() is None:
-            editor.terminate()
-            try:editor.wait(timeout=5)
-            except subprocess.TimeoutExpired:editor.kill();editor.wait()
-        server.shutdown();server.server_close()
-        chrome_profile.cleanup()
-        computer._restore_pasteboard(clipboard)
-        if previous is not None:previous.activateWithOptions_(0)
-        (ROOT/args.output).write_text(json.dumps(report,indent=2))
+        finalize_report(report,ROOT/args.output,(
+            lambda:stop_fixture_process(chrome),lambda:stop_fixture_process(editor),
+            server.shutdown,server.server_close,chrome_profile.cleanup,
+            lambda:computer._restore_pasteboard(clipboard),
+            lambda:previous.activateWithOptions_(0) if previous is not None else None,
+        ))
 
 
 if __name__=='__main__':main()

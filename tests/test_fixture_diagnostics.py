@@ -6,7 +6,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from live_smoke import fixture_panel_diagnostic
+from live_smoke import accurate_fixture_text, fixture_panel_diagnostic
 
 
 class FakeAX:
@@ -15,6 +15,7 @@ class FakeAX:
     def __init__(self, *, step=0):
         """Model a host sheet with a service-owned empty path field and one selected file row."""
         self.now=0.;self.step=step;self.reads=[];self.references=Counter();self.values={};self.next_pointer=1000
+        self.array_children={};self.actions={3:['AXConfirm'],4:['AXConfirm']};self.action_status=0
         self.nodes={
             1:{'AXRole':'AXApplication','AXWindows':[2],'AXFocusedUIElement':4},
             2:{'AXRole':'AXWindow','AXTitle':'Open','AXChildren':[3],'AXParent':1},
@@ -30,7 +31,8 @@ class FakeAX:
         }
         self.computer=SimpleNamespace(ax_snapshot=self.snapshot,ax_focused_summary=self.focus_summary,
             _appserv=SimpleNamespace(AXUIElementCreateApplication=self.application,
-                AXUIElementSetMessagingTimeout=self.messaging_timeout,AXUIElementGetPid=self.element_pid),
+                AXUIElementSetMessagingTimeout=self.messaging_timeout,AXUIElementGetPid=self.element_pid,
+                AXUIElementCopyActionNames=self.copy_actions),
             _cf=SimpleNamespace(CFRelease=self.release,CFArrayGetCount=self.array_count,
                 CFArrayGetValueAtIndex=self.array_item),_ax_read_attr_ptr=self.attribute,
             _ax_read_multi=self.attributes,_cftype_to_str=self.text,_decode_pos_size=self.geometry,
@@ -96,10 +98,21 @@ class FakeAX:
         self.record('is_settable')
         return attribute==b'AXValue'
 
+    def copy_actions(self, element, output):
+        """Copy advertised names with owned array callbacks, never perform an action."""
+        self.record('copy_action_names')
+        names=[self.value(name) for name in self.actions.get(element.value,[])]
+        array=self.value(names);self.array_children[array]=names
+        ctypes.cast(output,ctypes.POINTER(ctypes.c_void_p))[0]=array
+        return self.action_status
+
     def release(self, pointer):
         """Reject over-release and prove every copied native handle is balanced."""
         if self.references[pointer.value]<=0:raise AssertionError('over-release')
         self.references[pointer.value]-=1
+        if self.references[pointer.value]==0:
+            for child in self.array_children.pop(pointer.value,[]):
+                self.release(ctypes.c_void_p(child))
 
     def array_count(self, pointer):
         """Measure an inert copied descendant array."""
@@ -135,6 +148,8 @@ class FixtureDiagnosticTests(unittest.TestCase):
         self.assertEqual(focus['element_pid'],2144)
         self.assertEqual(focus['AXPlaceholderValue'],'/folder')
         self.assertEqual(focus['settable'],{'AXValue':True,'AXFocused':False})
+        self.assertEqual(focus['action_names'],['AXConfirm'])
+        self.assertEqual(focus['parents'][0]['action_names'],['AXConfirm'])
         self.assertEqual([parent['AXRole'] for parent in focus['parents']],['AXSheet','AXWindow','AXApplication'])
         row=next(element for element in report['raw_panel_elements'] if element['AXRole']=='AXRow')
         self.assertEqual((row['AXURL'],row['AXSelected']),('file:///tmp/generated.txt','true'))
@@ -170,6 +185,22 @@ class FixtureDiagnosticTests(unittest.TestCase):
         self.assertEqual(fake.run()['raw_visited_nodes'],0)
         self.assertEqual(fake.reads,[])
 
+    def test_action_metadata_is_capped_and_released_even_on_native_error(self):
+        """Long advertised actions and failed copies cannot bloat diagnostics, mutate, or retain arrays."""
+        fake=FakeAX();fake.nodes[4]['AXRole']='AXTextArea'
+        fake.actions[4]=['x'*500]*50
+        report=fake.run();focus=report['raw_host_focus']
+        self.assertEqual(focus['AXRole'],'AXTextArea')
+        self.assertEqual(len(focus['action_names']),16)
+        self.assertTrue(all(len(name)==128 for name in focus['action_names']))
+        self.assertTrue(focus['action_names_truncated'])
+        self.assertFalse(any(fake.references.values()))
+        fake=FakeAX();fake.action_status=-25204
+        focus=fake.run()['raw_host_focus']
+        self.assertEqual(focus['action_names_status'],-25204)
+        self.assertEqual(focus['action_names'],[])
+        self.assertFalse(any(fake.references.values()))
+
     def test_decode_failure_is_redacted_and_releases_all_copied_handles(self):
         """A failed decoder cannot leak exception contents, retain AX objects, or mask the original failure."""
         fake=FakeAX()
@@ -181,6 +212,50 @@ class FixtureDiagnosticTests(unittest.TestCase):
         self.assertEqual(report['raw_probe_error'],'ValueError')
         self.assertNotIn('private-fixture-diagnostic-sentinel',str(report))
         self.assertFalse(any(fake.references.values()))
+
+
+class AccurateOCRFixtureTests(unittest.TestCase):
+    """A positive tool invocation cannot qualify accurate OCR using failed, unrelated, or inconsistent data."""
+
+    def _result(self, text='Beta baseline'):
+        """Represent the successful real OS26 wire shape with independent fixture text."""
+        return {'ok':True,'via':'ocr','level':'accurate','count':1,
+                'observations':[{'text':text}],'full_text':text}
+
+    def test_real_positive_shape_matches_only_the_selected_fixture_text(self):
+        """Actual matching observations and reading-order text qualify; another sibling's text does not."""
+        result=self._result()
+        self.assertTrue(accurate_fixture_text(result,'Beta baseline'))
+        self.assertFalse(accurate_fixture_text(result,'Alpha baseline'))
+        self.assertFalse(accurate_fixture_text(self._result('Not Beta baseline'),'Beta baseline'))
+        self.assertFalse(accurate_fixture_text(self._result('Beta baseline changed'),'Beta baseline'))
+
+    def test_failed_or_wrong_mode_call_cannot_qualify_matching_cached_text(self):
+        """The observed OS27 failure and truthy status or wrong backend labels fail despite matching text."""
+        changes=({'ok':False,'error':'Text recognition could not complete: no native result'},
+                 {'ok':'true'},{'ok':1},{'via':'ax'},{'level':'fast'},
+                 {'error':False},{'error':{}},{'error':[]})
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertFalse(accurate_fixture_text({**self._result(),**change},'Beta baseline'))
+
+    def test_empty_malformed_or_inconsistent_observations_fail(self):
+        """Empty or malformed result bodies and invented counts never become successful coverage."""
+        changes=({'observations':[],'count':0},{'observations':None},{'observations':'Beta baseline'},
+                 {'observations':[{'text':123}]},{'count':True},{'count':2},{'count':1.0},
+                 {'full_text':None},{'full_text':['Beta baseline']})
+        for change in changes:
+            with self.subTest(change=change):
+                self.assertFalse(accurate_fixture_text({**self._result(),**change},'Beta baseline'))
+        for expected in ('',None,123):
+            self.assertFalse(accurate_fixture_text(self._result(),expected))
+        self.assertFalse(accurate_fixture_text(None,'Beta baseline'))
+
+    def test_full_text_and_observations_must_independently_match(self):
+        """A forged summary or unrelated observation list cannot substitute for actual recognized text."""
+        self.assertFalse(accurate_fixture_text({**self._result('Alpha baseline'),'full_text':'Beta baseline'},'Beta baseline'))
+        self.assertFalse(accurate_fixture_text({**self._result(),'full_text':'Alpha baseline'},'Beta baseline'))
+        self.assertFalse(accurate_fixture_text({**self._result(),'full_text':'Not Beta baseline'},'Beta baseline'))
 
 
 if __name__=='__main__':

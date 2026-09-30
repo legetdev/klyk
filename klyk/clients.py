@@ -10,9 +10,9 @@ Three on-disk shapes are handled:
               Windsurf, Continue, Cline, Gemini/Antigravity). Merged in place so
               the client's other settings are preserved.
   - "toml"  : a TOML file with `[mcp_servers.<name>]` tables (OpenAI Codex CLI).
-              stdlib can read TOML but not write it, so we append the table when
-              it's absent and fall back to a printed snippet when a differing
-              entry already exists (never clobber hand-edited TOML).
+              Append absent entries or migrate this interpreter's standard
+              launch with small, fully parsed edits. Customized commands need
+              manual editing; other settings and comments are preserved.
   - "opencode": OpenCode's global JSON/JSONC config, using `mcp.klyk` in V1
               or `mcp.servers.klyk` in V2. The installed CLI selects the schema;
               a span editor preserves comments and unrelated settings.
@@ -536,7 +536,7 @@ def current_entry(client: Client):
 def write_entry(client: Client) -> str:
     """Add/refresh klyk in this client's config. Returns a status word:
     "added" | "updated" | "unchanged". Raises ManualEditRequired when a TOML
-    file already has a differing entry (we won't risk clobbering it)."""
+    launch is customized or cannot be edited while preserving other settings."""
     if client.key == "antigravity":
         return _write_antigravity(client)
     if client.fmt == "toml":
@@ -644,30 +644,86 @@ def _write_json(client: Client) -> str:
     return "updated" if existing is not None else "added"
 
 
+def _checked_toml_edit(text: str, expected: dict, pattern: str, replacement) -> str | None:
+    """Accept a small edit only if native parsing proves the full expected result."""
+    for count, match in enumerate(re.finditer(pattern, text, re.MULTILINE)):
+        # Fake headers in multiline strings are harmless candidates, but a
+        # pathological file must not trigger unbounded repeated full parses.
+        if count >= 64:
+            break
+        candidate = text[:match.start()] + replacement(match) + text[match.end():]
+        try:
+            if tomllib.loads(candidate) == expected:
+                return candidate
+        except (tomllib.TOMLDecodeError, RecursionError):
+            continue
+    return None
+
+
 def _write_toml(client: Client) -> str:
-    """Append absent TOML entries and leave differing hand-edited tables intact."""
+    """Migrate known generated launches while preserving all unrelated TOML text."""
     original = jsonc.read_snapshot(client.path, missing_ok=True)
     data = tomllib.loads(original.text)
     existing = _toml_entry(data, client.path)
-    want_args = client.entry["args"]
     if existing is not None:
-        if (existing.get("command") == client.entry["command"] and existing.get("args") == want_args
-                and isinstance(existing.get("env"), dict) and "PYTHONPATH" in existing["env"]
-                and all(isinstance(value, str) for value in existing["env"].values())):
+        legacy_args = ["-m", "klyk.mcp_server"]
+        if (existing.get("command") != LAUNCH_ENTRY["command"]
+                or client.entry["command"] != LAUNCH_ENTRY["command"]
+                or client.entry["args"] != LAUNCH_ENTRY["args"]
+                or existing.get("args") not in (legacy_args, LAUNCH_ENTRY["args"])):
+            raise ManualEditRequired(
+                f"{client.path} already has a customized [mcp_servers.{SERVER_KEY}] launch; "
+                "edit it by hand to preserve your command and arguments.", snippet(client),
+            )
+    entry = _refreshed_entry(client, existing)
+    expected = {**data, "mcp_servers": {**data.get("mcp_servers", {}), SERVER_KEY: entry}}
+    updated = original.text
+    newline = "\r\n" if "\r\n" in updated else "\n"
+    if existing is not None:
+        if existing == entry:
             return "unchanged"
-        raise ManualEditRequired(
-            f"{client.path} already has a different [mcp_servers.{SERVER_KEY}] entry; "
-            "edit it by hand to avoid clobbering your TOML.",
-            snippet(client),
-        )
-    block = snippet(client)
-    if original.identity is not None:
-        prev = original.text
-        sep = "" if prev.endswith("\n\n") else ("\n" if prev.endswith("\n") else "\n\n")
-        jsonc.atomic_write(client.path, prev + sep + block, expected=original)
+        if existing["args"] == legacy_args:
+            intermediate = {**data, "mcp_servers": {**data["mcp_servers"],
+                            SERVER_KEY: {**existing, "args": entry["args"]}}}
+            # Insert only -P; even comments inside multiline arrays survive.
+            updated = _checked_toml_edit(updated, intermediate,
+                r'''^[ \t]*(?:args|"args"|'args')[ \t]*=[ \t]*\[''',
+                lambda match: match[0] + '"-P", ')
+        env = existing.get("env")
+        if updated is not None and env is not None and "PYTHONPATH" not in env:
+            section = rf"^[ \t]*\[mcp_servers\.{re.escape(SERVER_KEY)}"
+            section_end = r"\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)"
+
+            def add_line(match, key):
+                """Insert a key after its header without changing the header's comment."""
+                return match[0] + ("" if match[0].endswith("\n") else newline) + f'{key} = ""{newline}'
+
+            edits = (
+                (section + r"\.env" + section_end, lambda match: add_line(match, '"PYTHONPATH"')),
+                (r'''^[ \t]*(?:env|"env"|'env')[ \t]*=[ \t]*\{''',
+                 lambda match: match[0] + '"PYTHONPATH" = ""' + (", " if env else "")),
+                (section + section_end, lambda match: add_line(match, 'env.PYTHONPATH')),
+            )
+            for pattern, replacement in edits:
+                candidate = _checked_toml_edit(updated, expected, pattern, replacement)
+                if candidate is not None:
+                    updated = candidate
+                    break
+            else:
+                updated = None
+        block = f'[mcp_servers.{SERVER_KEY}.env]{newline}"PYTHONPATH" = ""{newline}' if env is None else None
     else:
-        jsonc.atomic_write(client.path, block, expected=original)
-    return "added"
+        block = snippet(client).replace("\n", newline)
+    if updated is not None and block is not None:
+        sep = "" if updated.endswith(newline * 2) or not updated else (newline if updated.endswith(newline) else newline * 2)
+        updated = _checked_toml_edit(updated, expected, r"\Z", lambda match: sep + block)
+    if updated is None:
+        raise ManualEditRequired(
+            f"{client.path}: the klyk TOML entry could not be refreshed without changing other settings; "
+            "edit it by hand.", snippet(client),
+        )
+    jsonc.atomic_write(client.path, updated, expected=original)
+    return "updated" if existing is not None else "added"
 
 
 def remove_entry(client: Client) -> bool:

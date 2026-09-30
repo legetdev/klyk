@@ -102,7 +102,8 @@ def validate_report(report, path, candidate):
     """Require fresh, completed evidence with real boolean assertions and readable names."""
     if not isinstance(report, dict) or report.get('fingerprint') != candidate:
         raise ValueError(f'Evidence is stale or malformed: {path}; rerun the applicable checks')
-    if report.get('completed') is not True or report.get('error') not in (None, ''):
+    if (report.get('completed') is not True or report.get('error') not in (None, '')
+            or report.get('cleanup_errors') not in (None, []) or report.get('report_error') not in (None, '')):
         raise ValueError(f'Candidate evidence is incomplete or failed: {path}')
     checks = report.get('checks')
     if not isinstance(checks, list) or not checks or any(

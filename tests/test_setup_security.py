@@ -8,13 +8,14 @@ import json
 import os
 import sys
 import tempfile
+import tomllib
 import types
 import unittest
 from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from klyk import cli, clients, doctor, updates
+from klyk import cli, clients, doctor, jsonc, updates
 
 
 class SetupSecurityTests(unittest.TestCase):
@@ -283,6 +284,203 @@ class SetupSecurityTests(unittest.TestCase):
                 check = doctor.check_mcp_client_entries()
                 self.assertEqual(check.status, "fail")
                 self.assertIn("Python imports", check.detail)
+
+
+class TomlMigrationTests(unittest.TestCase):
+    """Verify generated-launch repairs using only disposable Codex/Grok files."""
+
+    def _fixture(self, directory, key="codex", args=None, extras=""):
+        """Create a real temporary TOML document without launching any client."""
+        client = replace(clients.get(key), path=Path(directory) / f"{key}.toml")
+        source = (
+            '# Preserve the owner settings.\n'
+            '[features]\nactive = true\n\n'
+            '[mcp_servers.other]\ncommand = "keep"\n'
+            'args = ["-m", "klyk.mcp_server"] # another server is unrelated\n\n'
+            '[mcp_servers.klyk] # generated launch\n'
+            f'command = {json.dumps(clients.LAUNCH_ENTRY["command"])}\n'
+            f'args = {json.dumps(args or ["-m", "klyk.mcp_server"])} # preserve this comment\n'
+            + extras
+        )
+        client.path.write_bytes(source.encode())
+        return client, source
+
+    def _assert_migrated(self, client, original):
+        """Compare every parsed setting and verify an identical repeat is inert."""
+        expected = tomllib.loads(original)
+        entry = expected["mcp_servers"]["klyk"]
+        entry["args"] = ["-P", "-m", "klyk.mcp_server"]
+        entry["env"] = {"PYTHONPATH": "", **entry.get("env", {})}
+        self.assertEqual(clients.write_entry(client), "updated")
+        result = client.path.read_bytes()
+        self.assertEqual(tomllib.loads(result.decode()), expected)
+        with mock.patch.object(jsonc, "atomic_write") as write:
+            self.assertEqual(clients.write_entry(client), "unchanged")
+            write.assert_not_called()
+        self.assertEqual(client.path.read_bytes(), result)
+        return result.decode()
+
+    def test_generated_codex_and_grok_upgrade_preserves_symlink_mode_and_crlf(self):
+        """Both legacy args and partially hardened entries gain a safe import environment."""
+        for key in ("codex", "grok"):
+            for args in (["-m", "klyk.mcp_server"], ["-P", "-m", "klyk.mcp_server"]):
+                with self.subTest(key=key, args=args), tempfile.TemporaryDirectory() as directory:
+                    client, source = self._fixture(directory, key, args)
+                    source = source.replace("\n", "\r\n")
+                    client.path.write_bytes(source.encode())
+                    client.path.chmod(0o640)
+                    target = client.path
+                    link = target.with_name("linked.toml")
+                    link.symlink_to(target)
+                    client = replace(client, path=link)
+                    result = self._assert_migrated(client, source)
+                    self.assertTrue(link.is_symlink())
+                    self.assertEqual(target.stat().st_mode & 0o777, 0o640)
+                    self.assertEqual(result.count("\n"), result.count("\r\n"))
+                    self.assertIn('# another server is unrelated\r\n', result)
+                    self.assertIn('# preserve this comment\r\n', result)
+
+    def test_multiline_fake_headers_comments_and_custom_restrictions_survive(self):
+        """Native whole-file comparison rejects header lookalikes inside a string."""
+        with tempfile.TemporaryDirectory() as directory:
+            client, _ = self._fixture(directory)
+            fake = (
+                'notes = \'\'\'\n[mcp_servers.klyk]\n'
+                'args = ["-m", "klyk.mcp_server"]\n'
+                '[mcp_servers.klyk.env]\nKEEP = "fake"\n\'\'\'\n\n'
+            )
+            source = fake + (
+                '[mcp_servers.klyk] # real header\n'
+                f'command = {json.dumps(clients.LAUNCH_ENTRY["command"])}\n'
+                'args = [\n # module comment\n "-m", # flag comment\n'
+                ' "klyk.mcp_server", # server comment\n] # array comment\n'
+                'disabled = true\nstartup_timeout_sec = 90\ntool_timeout_sec = 120\n'
+                'enabled_tools = ["inspect", "click"]\n'
+                '[mcp_servers.klyk.env] # real env\n'
+                'KLYK_UPDATE_CHECK = "0" # explicit opt-out\nCUSTOM = "保持"\n'
+                '[mcp_servers.other]\ncommand = "keep"\n'
+            )
+            client.path.write_bytes(source.encode())
+            result = self._assert_migrated(client, source)
+            expected_text = source.replace('args = [\n', 'args = ["-P", \n', 1)
+            expected_text = expected_text.replace(
+                '[mcp_servers.klyk.env] # real env\n',
+                '[mcp_servers.klyk.env] # real env\n"PYTHONPATH" = ""\n', 1)
+            self.assertEqual(result, expected_text)
+
+    def test_inline_and_dotted_environment_settings_are_preserved(self):
+        """Known generated commands can retain inline, dotted and empty env tables."""
+        environments = (
+            'env = { KLYK_UPDATE_CHECK = "0", CUSTOM = "keep" } # inline note\n',
+            'env.KLYK_UPDATE_CHECK = "0" # dotted note\nenv.CUSTOM = "keep"\n',
+            'env = {} # empty inline note\n',
+        )
+        for environment in environments:
+            with self.subTest(environment=environment), tempfile.TemporaryDirectory() as directory:
+                client, source = self._fixture(directory, "grok", extras=environment + 'disabled = true\n')
+                result = self._assert_migrated(client, source)
+                for line in environment.splitlines():
+                    if "#" in line:
+                        self.assertIn(line.split("#", 1)[1], result)
+                self.assertTrue(clients.current_entry(client)["disabled"])
+
+    def test_explicit_owner_pythonpath_and_update_optout_remain_unchanged(self):
+        """Deliberate import overrides and privacy preferences survive a launch repair."""
+        for override in ("", "/owner/trusted"):
+            with self.subTest(override=override), tempfile.TemporaryDirectory() as directory:
+                env = ('[mcp_servers.klyk.env]\n'
+                       f'PYTHONPATH = {json.dumps(override)} # owner override\n'
+                       'KLYK_UPDATE_CHECK = "0"\n')
+                client, source = self._fixture(directory, extras=env)
+                result = self._assert_migrated(client, source)
+                self.assertTrue(result.endswith(env))
+                self.assertEqual(clients.current_entry(client)["env"]["PYTHONPATH"], override)
+
+    def test_differing_commands_or_custom_arguments_are_not_replaced(self):
+        """Only this exact interpreter and the two owned standard argument lists qualify."""
+        launches = (("python3", ["-m", "klyk.mcp_server"]),
+                    ("/different/venv/bin/python", ["-m", "klyk.mcp_server"]),
+                    (clients.LAUNCH_ENTRY["command"], ["-I", "-m", "klyk.mcp_server"]),
+                    (clients.LAUNCH_ENTRY["command"], ["-m", "klyk.mcp_server", "custom"]))
+        for command, args in launches:
+            with self.subTest(command=command, args=args), tempfile.TemporaryDirectory() as directory:
+                client, source = self._fixture(directory, args=args)
+                source = source.replace(json.dumps(clients.LAUNCH_ENTRY["command"]), json.dumps(command))
+                client.path.write_bytes(source.encode())
+                with mock.patch.object(jsonc, "atomic_write") as write:
+                    with self.assertRaises(clients.ManualEditRequired):
+                        clients.write_entry(client)
+                    write.assert_not_called()
+                self.assertEqual(client.path.read_bytes(), source.encode())
+
+    def test_malformed_or_unsupported_tables_are_not_clobbered(self):
+        """Malformed syntax and frozen inline tables require repair without a write."""
+        command = json.dumps(clients.LAUNCH_ENTRY["command"])
+        sources = (
+            '[mcp_servers.klyk]\ncommand = "first"\ncommand = "duplicate"\n',
+            f'[mcp_servers.klyk]\ncommand = {command}\nargs = ["-m", "klyk.mcp_server"]\nenv = 42\n',
+            f'[mcp_servers]\nklyk = {{command = {command}, args = ["-m", "klyk.mcp_server"]}}\n',
+            f'[mcp_servers.klyk]\ncommand = {command}\nargs = ["-m", "klyk.mcp_server"]\n[mcp_servers."klyk"."env"]\nCUSTOM = "keep"\n',
+            'mcp_servers = {other = {command = "keep"}}\n',
+        )
+        for source in sources:
+            with self.subTest(source=source[:40]), tempfile.TemporaryDirectory() as directory:
+                client = replace(clients.get("codex"), path=Path(directory) / "config.toml")
+                client.path.write_bytes(source.encode())
+                with mock.patch.object(jsonc, "atomic_write") as write:
+                    with self.assertRaises((tomllib.TOMLDecodeError, jsonc.ConfigFormatError, clients.ManualEditRequired)):
+                        clients.write_entry(client)
+                    write.assert_not_called()
+                self.assertEqual(client.path.read_bytes(), source.encode())
+
+    def test_migration_rejects_concurrent_editor_change_before_replace(self):
+        """A real file changed during tempfile flush remains the editor's version."""
+        with tempfile.TemporaryDirectory() as directory:
+            client, _ = self._fixture(directory)
+            external = '# changed by the owner\n[features]\nactive = false\n'
+            with mock.patch.object(jsonc.os, "fsync", side_effect=lambda fd: client.path.write_text(external)):
+                with self.assertRaises(jsonc.ConfigFormatError):
+                    clients.write_entry(client)
+            self.assertEqual(client.path.read_text(), external)
+            self.assertEqual(list(Path(directory).iterdir()), [client.path])
+
+    def test_failed_migration_replace_keeps_original_bytes(self):
+        """A disk replacement failure never leaves a partially updated launch."""
+        with tempfile.TemporaryDirectory() as directory:
+            client, source = self._fixture(directory, "grok")
+            with mock.patch.object(jsonc.os, "replace", side_effect=OSError("fixture replacement denied")):
+                with self.assertRaises(OSError):
+                    clients.write_entry(client)
+            self.assertEqual(client.path.read_bytes(), source.encode())
+            self.assertEqual(list(Path(directory).iterdir()), [client.path])
+
+    def test_many_string_lookalikes_stop_without_a_write(self):
+        """Bound repeated native parses when a string contains many fake argument keys."""
+        with tempfile.TemporaryDirectory() as directory:
+            client, source = self._fixture(directory)
+            source = 'notes = \'\'\'\n' + 'args = ["-m", "klyk.mcp_server"]\n' * 64 + "'''\n" + source
+            client.path.write_bytes(source.encode())
+            with mock.patch.object(jsonc, "atomic_write") as write:
+                with self.assertRaises(clients.ManualEditRequired):
+                    clients.write_entry(client)
+                write.assert_not_called()
+            self.assertEqual(client.path.read_bytes(), source.encode())
+
+    def test_existing_doctor_fix_repairs_generated_toml_in_a_fresh_invocation(self):
+        """The established repair command updates both adapters with native checks mocked."""
+        with tempfile.TemporaryDirectory() as directory:
+            codex, _ = self._fixture(directory, "codex")
+            grok, _ = self._fixture(directory, "grok")
+            with mock.patch.object(Path, "home", return_value=Path(directory)), \
+                 mock.patch.object(clients, "CLIENTS", {"codex": codex, "grok": grok}), \
+                 mock.patch.object(cli, "_persistent_install_required", return_value=True), \
+                 mock.patch.object(doctor, "run_all_checks", return_value=[doctor.CheckResult("fixture", "ok", "ready")]), \
+                 mock.patch.object(cli, "_open_settings") as settings, mock.patch("builtins.print"):
+                cli._doctor_fix()
+                self.assertEqual(doctor.check_mcp_client_entries().status, "ok")
+                settings.assert_not_called()
+            for client in (codex, grok):
+                self.assertEqual(clients.current_entry(client), client.entry)
 
 
 if __name__ == "__main__":

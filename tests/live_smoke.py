@@ -82,6 +82,20 @@ def fixture_input_unchanged(before, after):
     return all(field in before and field in after and before[field]==after[field] for field in fields)
 
 
+def accurate_fixture_text(result, expected):
+    """A positive accurate OCR call must independently recognize the selected fixture's real text."""
+    if not isinstance(result,dict) or not isinstance(expected,str) or not expected:
+        return False
+    observations=result.get('observations');full_text=result.get('full_text');count=result.get('count')
+    if (result.get('ok') is not True or result.get('error') not in (None,'') or result.get('via')!='ocr'
+            or result.get('level')!='accurate' or not isinstance(observations,list)
+            or type(count) is not int or not 0<count<=200 or count!=len(observations)
+            or not isinstance(full_text,str) or expected not in full_text.splitlines()):
+        return False
+    return all(isinstance(item,dict) and isinstance(item.get('text'),str) for item in observations) and any(
+        expected==item['text'] for item in observations)
+
+
 def fixture_panel_diagnostic(computer, pid):
     """Read only the generated fixture host after a refused open, without another dialog action."""
     import ctypes
@@ -103,8 +117,8 @@ def fixture_panel_diagnostic(computer, pid):
         result['focused_summary_error']=type(error).__name__
     attributes=(b'AXRole',b'AXTitle',b'AXDescription',b'AXPlaceholderValue',b'AXSubrole',
                 b'AXValue',b'AXFocused',b'AXURL',b'AXDocument',b'AXSelected',b'AXPosition',b'AXSize',b'AXChildren')
-    panel_roles={'AXSheet','AXDialog','AXTextField','AXComboBox','AXButton','AXStaticText','AXRow','AXCell'}
-    field_roles={'AXTextField','AXComboBox'}
+    panel_roles={'AXSheet','AXDialog','AXTextField','AXTextArea','AXComboBox','AXButton','AXStaticText','AXRow','AXCell'}
+    field_roles={'AXTextField','AXTextArea','AXComboBox'}
     seen=set();app=0;focused=0
 
     def release(values):
@@ -112,6 +126,29 @@ def fixture_panel_diagnostic(computer, pid):
         for value in values or ():
             if value:
                 computer._cf.CFRelease(ctypes.c_void_p(value))
+
+    def action_names(element):
+        """Read only advertised native actions, retaining at most 16 names before releasing the array."""
+        names=ctypes.c_void_p()
+        if time.monotonic()>=deadline:
+            return {'action_names_skipped':'deadline'}
+        try:
+            status=computer._appserv.AXUIElementCopyActionNames(ctypes.c_void_p(element),ctypes.byref(names))
+            output={'action_names_status':status,'action_names':[]}
+            if status==0 and names.value:
+                count=computer._cf.CFArrayGetCount(names)
+                for index in range(min(count,16)):
+                    if time.monotonic()>=deadline:
+                        break
+                    value=computer._cf.CFArrayGetValueAtIndex(names,index)
+                    if value:
+                        output['action_names'].append(computer._cftype_to_str(value)[:128])
+                output['action_names_truncated']=count>len(output['action_names'])
+            return output
+        except Exception as error:
+            return {'action_names_error':type(error).__name__}
+        finally:
+            release((names.value,))
 
     def parent_chain(element):
         """Read up to eight actual AXParent references, retaining no native references in evidence."""
@@ -122,8 +159,11 @@ def fixture_panel_diagnostic(computer, pid):
             while parent and len(chain)<8 and time.monotonic()<deadline:
                 raw=computer._ax_read_multi(parent,(b'AXRole',b'AXTitle',b'AXSubrole'))
                 try:
-                    chain.append({key:(computer._cftype_to_str(value)[:256] if value else None)
-                                  for key,value in zip(('AXRole','AXTitle','AXSubrole'),raw or ())})
+                    item={key:(computer._cftype_to_str(value)[:256] if value else None)
+                          for key,value in zip(('AXRole','AXTitle','AXSubrole'),raw or ())}
+                    if item.get('AXRole')=='AXSheet' and sum(parent.get('AXRole')=='AXSheet' for parent in chain)<2:
+                        item.update(action_names(parent))
+                    chain.append(item)
                 finally:
                     release(raw)
                 following=computer._ax_read_attr_ptr(parent,b'AXParent') if time.monotonic()<deadline else 0
@@ -146,6 +186,7 @@ def fixture_panel_diagnostic(computer, pid):
             status=computer._appserv.AXUIElementGetPid(ctypes.c_void_p(element),ctypes.byref(owner))
             item['element_pid']=owner.value if status==0 else None
         if item.get('AXRole') in field_roles:
+            item.update(action_names(element))
             item['settable']={}
             for attribute in (b'AXValue',b'AXFocused'):
                 if time.monotonic()<deadline:
@@ -214,6 +255,46 @@ def fixture_panel_diagnostic(computer, pid):
     return result
 
 
+
+def finalize_report(report, output, cleanup_steps):
+    """Publish passing fixture evidence only after every cleanup succeeds, retaining failed cleanup categories."""
+    completed=report.get('completed') is True and report.get('error') in (None,'')
+    report['completed']=False
+    failures=[]
+    try:
+        output.write_text(json.dumps(report,indent=2))
+    except BaseException as error:
+        report['report_error']=type(error).__name__;failures.append(error)
+    for cleanup in cleanup_steps:
+        try:
+            cleanup()
+        except BaseException as error:
+            report.setdefault('cleanup_errors',[]).append(type(error).__name__)
+            failures.append(error)
+    report['completed']=completed and not failures
+    try:
+        output.write_text(json.dumps(report,indent=2))
+    except BaseException as error:
+        report['completed']=False;report['report_error']=type(error).__name__
+        if failures:
+            raise failures[0] from error
+        raise
+    if failures:
+        raise failures[0]
+
+
+def stop_fixture_process(process):
+    """Reap only a suite-owned subprocess, escalating a bounded termination to a kill if necessary."""
+    if process is None:
+        return
+    if process.poll() is None:
+        process.terminate()
+    try:
+        process.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        process.kill();process.wait(timeout=5)
+
+
 def main():
     """Run only against a disposable fixture and preserve evidence even on failure."""
     parser=argparse.ArgumentParser();parser.add_argument('--output',default='.verification/live.json');args=parser.parse_args()
@@ -280,7 +361,7 @@ def main():
                 target=windows['windows'][0]
             observation=call(client,'inspect',detail='full',**({'window_id':target['window_id']} if compact else {}))
             call(client,'ax_snapshot')
-            call(client,'read_text',level='accurate')
+            accurate_text=call(client,'read_text',level='accurate',window_id=target['window_id'])
             # Resolve all control coordinates from this live observation.
             elements=observation['ax_elements']
             def element(label):
@@ -295,6 +376,9 @@ def main():
             label=next(e['label'] for e in elements if e.get('label','').startswith('Increment '))
             field_label=next(e['label'] for e in elements if e.get('label','').startswith('Input '))
             field_index=int(field_label.split()[-1]);button=point(label);field=point(field_label)
+            expected_accurate_text=current()['fields'][field_index]
+            report['accurate_ocr_expectation']={'window_id':target['window_id'],'field_index':field_index,
+                                               'text':expected_accurate_text,'matched':accurate_fixture_text(accurate_text,expected_accurate_text)}
             before=current()['clicks']
             call(client,'click_element',label=label,verify=True)
             check('semantic click changed native counter',current()['clicks']==before+1)
@@ -343,7 +427,7 @@ def main():
             match=call(client,'find_template',template_id=template['template_id'])
             check('template matches current native control',match.get('found'))
             visible=call(client,'wait_for_visual',template_id=template['template_id'],timeout=1)
-            check('visual readiness found',visible.get('found'))
+            check('visual readiness found',visible.get('found') is True and accurate_fixture_text(accurate_text,expected_accurate_text))
             screenshot=call(client,'screenshot',save_path=str(work/'fixture.png'))
             check('screenshot saved',Path(screenshot['saved_path']).is_file())
             call(client,'move_cursor',**button,dwell_seconds=.1)
@@ -468,16 +552,11 @@ def main():
             check('close_apps closed fixture',fixture.poll() is not None)
             check('all 48 tools exercised',set(report['tools'])=={c['tool'] for c in report['calls']})
             report['completed']=True
-    except Exception as exc:
+    except BaseException as exc:
         report['error']=f'{type(exc).__name__}: {exc}'
         raise
     finally:
-        out.write_text(json.dumps(report,indent=2))
-        if receiver is not None and receiver.poll() is None:
-            receiver.terminate();receiver.wait(timeout=5)
-        fixture.terminate()
-        try:fixture.wait(timeout=5)
-        except subprocess.TimeoutExpired: fixture.kill();fixture.wait()
+        finalize_report(report,out,(lambda:stop_fixture_process(receiver),lambda:stop_fixture_process(fixture)))
 
 
 if __name__=='__main__': main()

@@ -1371,9 +1371,11 @@ TOOLS = [
             "panel's current filename and directory and reports saved=null, verified=false. A supplied save path is checked "
             "for creation or a metadata change and a closed save/confirmation panel; unchanged "
             "existing files return saved=false. This does not verify file contents. "
-            "Open may use Go To Folder and reports input delivery, not independent "
-            "document verification. Inspect the dialog first and verify the resulting file/document"
-            " afterward."
+            "With path, Open validates the nested Go to Folder chooser, sets and reads its exact "
+            "path field through accessibility, and confirms chooser closure before Open or Choose. "
+            "Missing chooser evidence stops path input; unknown effects never use a keyboard fallback. "
+            "Open reports button delivery, not independent document verification. Inspect the "
+            "dialog first and verify the resulting file or document afterward."
         )
         ),
         inputSchema={
@@ -4686,17 +4688,9 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     "reason": "system_dialog_needs_foreground",
                     "suggestion": "Use autonomous mode to handle the visible dialog.",
                 }))]
-            # Bring the session app (and its modal save/open panel) truly
-            # frontmost before typing. A single activate+sleep is unreliable
-            # under focus contention — keys would then leak into the user's
-            # foreground app (only a stray final Return registering, saving with
-            # defaults). Poll until frontmost.
-            #
-            # Keys here are delivered GLOBALLY (no pid), NOT pid-targeted: the
-            # save/open panel is rendered by a separate process
-            # (com.apple.appkit.xpc.openAndSavePanelService), so a keystroke
-            # posted to the host app's pid lands in the document behind the panel,
-            # not the panel. Global HID events go to the key window — the panel.
+            # Establish the host before the Go to Folder shortcut. Path text
+            # and panel buttons use retained, scoped AX references instead of
+            # global typing that could reach a document after a focus change.
             frontmost = await _await_frontmost(session)
             if not frontmost:
                 return [types.TextContent(type="text", text=json.dumps({
@@ -4734,46 +4728,30 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 }))]
 
             elif action == "open":
-                loop = asyncio.get_event_loop()
                 if path:
                     await computer.press_key("Cmd+Shift+G", expected_frontmost_pid=session.pid)
-                    # Observe the focused path field before typing; a missing
-                    # sheet must never redirect path text into the document.
-                    field = None
+                    # Native ancestry and complete readback establish the exact
+                    # chooser. An empty initial value is valid; a focused
+                    # document field is never an eligible path-input fallback.
+                    navigated_path = None
                     deadline = time.monotonic() + 2.0
                     while time.monotonic() < deadline:
-                        snapshot = await loop.run_in_executor(
-                            None, lambda: computer.ax_snapshot(session.pid, max_results=400)
+                        navigated_path = await computer.run_input(
+                            lambda: computer.ax_navigate_open_panel(session.pid, path)
                         )
-                        fields = [e for e in snapshot if e.get("role") == "AXTextField" and e.get("focused")]
-                        if len(fields) == 1 and str(fields[0].get("value", "")).startswith(("/", "~")):
-                            field = fields[0]
+                        if navigated_path is not None:
                             break
-                        await asyncio.sleep(0.1)
-                    if field is None:
+                        remaining = deadline - time.monotonic()
+                        await asyncio.sleep(min(0.1, max(0.0, remaining)))
+                    if navigated_path is None:
                         return [types.TextContent(type="text", text=json.dumps({
                             "ok": False, "action": action,
-                            "error": "The focused Go to Folder path field was not observed; no path was typed.",
+                            "error": "A verified Go to Folder path field was not available; no path was written. Inspect the dialog before continuing.",
                         }))]
-                    await computer.press_key("Cmd+A", expected_frontmost_pid=session.pid)
-                    await computer.type_text_char_by_char(path, expected_frontmost_pid=session.pid)
-                    snapshot = await loop.run_in_executor(
-                        None, lambda: computer.ax_snapshot(session.pid, max_results=400)
-                    )
-                    if not any(e.get("focused") and e.get("value") == path for e in snapshot):
+                    if navigated_path != path:
                         return [types.TextContent(type="text", text=json.dumps({
                             "ok": False, "action": action,
-                            "error": "The dialog path did not match the requested text; nothing was opened.",
-                        }))]
-                    await computer.press_key("Return", expected_frontmost_pid=session.pid)
-                    await asyncio.sleep(0.5)
-                    snapshot = await loop.run_in_executor(
-                        None, lambda: computer.ax_snapshot(session.pid, max_results=400)
-                    )
-                    if any(e.get("focused") and e.get("value") == path for e in snapshot):
-                        return [types.TextContent(type="text", text=json.dumps({
-                            "ok": False, "action": action,
-                            "error": "The path chooser is still open; inspect the dialog before continuing.",
+                            "error": "The verified chooser path did not match the request; Open was not pressed. Inspect the dialog before continuing.",
                         }))]
                 pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose")))
                 await asyncio.sleep(0.3)

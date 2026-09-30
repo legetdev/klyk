@@ -74,6 +74,8 @@ klyk update
 
 It detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected client that shares that installation loads the new version on its next tool call. Clients using pinned, bundled, or separate klyk installations need their own update.
 
+**Existing 0.5.x setups:** After upgrading, run `klyk doctor --fix` as a new command from the same installation, then restart your AI clients when ready. This migrates generated launch settings to `-P -m klyk.mcp_server` and clears inherited `PYTHONPATH`, so workspace files cannot replace the installed package. An updater started on the old version does not apply this repair automatically. Explicit custom `PYTHONPATH` remains a trusted override; customized TOML commands or arguments are preserved and require manual editing.
+
 You never have to wonder whether you're behind, either:
 
 - **`klyk doctor`** includes a `klyk version` line — `0.2.0 (latest release)` or `0.2.0 → 0.3.0 available` with the exact command to run.

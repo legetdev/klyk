@@ -28,6 +28,7 @@ class ReleaseNameTests(unittest.TestCase):
                 main()
                 for changes in ({'fingerprint': 'old'}, {'completed': False}, {'scope': 'major'},
                                 {'rationale': ''}, {'checks': []}, {'error': 'failed'},
+                                {'cleanup_errors': ['KeyboardInterrupt']}, {'report_error': 'OSError'},
                                 {'checks': [{'name': 'migration', 'passed': False}]}):
                     with self.subTest(changes=changes):
                         path.write_text(json.dumps({**valid, **changes}))
@@ -105,7 +106,8 @@ class ReleaseNameTests(unittest.TestCase):
                         {'checks': [None]}, {'calls': [None]}, {'tools': {}},
                         {'environment': {}}, {'environment': {'mcp': '3.0.0'}},
                         {'environment': {'mcp': 2}}, {'environment': {'mcp': '2'}},
-                        {'error': 'native failure'}):
+                        {'error': 'native failure'}, {'cleanup_errors': ['ValueError']},
+                        {'cleanup_errors': False}, {'cleanup_errors': {}}, {'report_error': 'OSError'}):
             with self.subTest(changes=changes), self.assertRaises(ValueError):
                 self._run_reports([{**first, **changes}, second, desktop])
         for malformed in ([], None, True):
