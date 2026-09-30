@@ -3261,10 +3261,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
             if not args.get("confirm_destructive", False):
                 safe, reason = await _check_click_safety(session, args["x"], args["y"])
@@ -3326,10 +3326,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
             if not args.get("confirm_destructive", False):
                 safe, reason = await _check_click_safety(session, args["x"], args["y"])
@@ -3380,10 +3380,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
             if not args.get("confirm_destructive", False):
                 safe, reason = await _check_click_safety(session, args["x"], args["y"])
@@ -3423,10 +3423,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     "reason": "long_press_requires_visible_input",
                     "suggestion": "Use autonomous or humanoid mode for a visible press and hold.",
                 }))]
+            await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id)
             gate = await _ensure_key_delivery(session, "long_press", command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id)
             # Refresh the origin + bounds (the safety check below uses window
             # width/height) so a moved window doesn't leave stale coords — same
             # fix as click / ax_action.
@@ -3495,10 +3495,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
             for px, py in ((args["x1"], args["y1"]), (args["x2"], args["y2"])):
                 safe, reason = await _check_click_safety(session, px, py)
@@ -3657,10 +3657,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "drag_requires_visible_input",
                 }))]
+            await _focus_if_needed(session, filter_wid or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, filter_wid or session.window_id)
             for endpoint_session, resolved, query, index in (
                     (session, src, source_query, source_index), (target_session, tgt, target_query, target_index)):
                 safe, reason = await _check_semantic_drag_endpoint(
@@ -3834,16 +3834,18 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             total = len(sequence) * repeat
             if total > 1000:
                 raise ValueError(f"press_key: total presses {total} exceeds cap of 1000")
-            gate = await _ensure_key_delivery(
-                session, "press_key", _is_command_shortcut(sequence),
-            )
-            if gate is not None:
-                return [types.TextContent(type="text", text=json.dumps(gate))]
             focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id or None)
             if focus_status and focus_status.get("requires_foreground"):
                 # Background mode, target window isn't key — don't post keys to
                 # the wrong window. Surface the structured refusal instead.
                 return [types.TextContent(type="text", text=json.dumps(focus_status))]
+            # Raising the selected window can change activation. Establish it
+            # before the final readiness check, while retaining the native guard.
+            gate = await _ensure_key_delivery(
+                session, "press_key", _is_command_shortcut(sequence),
+            )
+            if gate is not None:
+                return [types.TextContent(type="text", text=json.dumps(gate))]
             frontmost_pid = session.pid if _is_command_shortcut(sequence) or _is_chromium_based(session) or session.mode == "humanoid" else None
             if total == 1:
                 await computer.press_key(sequence[0], session.pid, expected_frontmost_pid=frontmost_pid)
@@ -3864,16 +3866,18 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             duration = float(args.get("duration", 1.0))
             if duration < 0.05 or duration > 10.0:
                 raise ValueError("hold_key: duration must be between 0.05 and 10.0 seconds")
-            gate = await _ensure_key_delivery(
-                session, "hold_key", _is_command_shortcut([key]),
-            )
-            if gate is not None:
-                return [types.TextContent(type="text", text=json.dumps(gate))]
             focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id or None)
             if focus_status and focus_status.get("requires_foreground"):
                 # Background mode, target window isn't key — refuse rather than
                 # hold a key against the wrong window.
                 return [types.TextContent(type="text", text=json.dumps(focus_status))]
+            # Focus may change activation; only the subsequent readiness check
+            # can establish delivery before the held key's final native guard.
+            gate = await _ensure_key_delivery(
+                session, "hold_key", _is_command_shortcut([key]),
+            )
+            if gate is not None:
+                return [types.TextContent(type="text", text=json.dumps(gate))]
             try:
                 frontmost_pid = session.pid if _is_command_shortcut([key]) or _is_chromium_based(session) or session.mode == "humanoid" else None
                 await computer.hold_key(key, duration, session.pid, expected_frontmost_pid=frontmost_pid)
@@ -5261,10 +5265,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             allowed, reason = await _check_click_safety(session, args["x"], args["y"])
             if not allowed:
                 return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
+            await _focus_if_needed(session, window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id)
             await _refresh_window(session, window_id=window_id)
             allowed, reason = await _check_click_safety(session, args["x"], args["y"])
             if not allowed:

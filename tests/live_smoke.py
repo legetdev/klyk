@@ -256,6 +256,16 @@ def fixture_panel_diagnostic(computer, pid):
 
 
 
+
+def fixture_clipboard_items(snapshot):
+    """Unpack a stable typed snapshot; unknown or malformed captures must never clear the clipboard."""
+    if (not isinstance(snapshot,tuple) or len(snapshot)!=2 or not isinstance(snapshot[0],list)
+            or type(snapshot[1]) is not int):
+        return None
+    items,_change_count=snapshot
+    return items
+
+
 def finalize_report(report, output, cleanup_steps):
     """Publish passing fixture evidence only after every cleanup succeeds, retaining failed cleanup categories."""
     completed=report.get('completed') is True and report.get('error') in (None,'')
@@ -409,7 +419,9 @@ def main():
             check('paste input changed field',current()['fields'][field_index]=='Pasted value')
             # Preserve all original clipboard types around explicit clipboard tool tests.
             from klyk import computer
-            clipboard=computer._snapshot_pasteboard()
+            clipboard=fixture_clipboard_items(computer._snapshot_pasteboard())
+            if clipboard is None:
+                raise RuntimeError('The fixture clipboard could not be preserved; no clipboard test was started.')
             try:
                 call(client,'set_clipboard',text='Klyk clipboard fixture')
                 clip=call(client,'get_clipboard')

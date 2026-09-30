@@ -8,7 +8,7 @@ import tempfile
 import unittest
 from types import SimpleNamespace
 
-from live_smoke import ROOT, finalize_report, stop_fixture_process
+from live_smoke import ROOT, finalize_report, fixture_clipboard_items, stop_fixture_process
 
 
 class FixtureFinalizationTests(unittest.TestCase):
@@ -117,6 +117,64 @@ class FixtureFinalizationTests(unittest.TestCase):
                 self.assertEqual(len(tries),1)
                 self.assertTrue(any(isinstance(handler.type,ast.Name) and handler.type.id=='BaseException'
                                     for handler in tries[0].handlers))
+
+
+class FixtureClipboardCallerTests(unittest.TestCase):
+    """Execute actual fixture caller snippets with opaque items and no AppKit clipboard access."""
+
+    def _caller(self, filename, snapshot):
+        """Load only the actual capture, unknown-state guard, and restore expression from each suite."""
+        tree=ast.parse((ROOT/'tests'/filename).read_text())
+        main=next(node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=='main')
+        assignment=next(node for node in ast.walk(main) if isinstance(node,ast.Assign) and any(
+            isinstance(target,ast.Name) and target.id=='clipboard' for target in node.targets))
+        guard=next(node for node in ast.walk(main) if isinstance(node,ast.If)
+                   and isinstance(node.test,ast.Compare) and isinstance(node.test.left,ast.Name)
+                   and node.test.left.id=='clipboard' and any(isinstance(operation,ast.Is) for operation in node.test.ops))
+        self.assertLess(assignment.lineno,guard.lineno)
+        restored=[]
+        def restore(items):
+            """A native writeObjects caller requires item objects, never the snapshot's generation tuple."""
+            self.assertIsInstance(items,list);restored.append(items)
+        namespace={'computer':SimpleNamespace(_snapshot_pasteboard=lambda:snapshot,_restore_pasteboard=restore),
+                   'fixture_clipboard_items':fixture_clipboard_items}
+        snippet=ast.fix_missing_locations(ast.Module(body=[assignment,guard],type_ignores=[]))
+        restore_expression=next(node for node in ast.walk(main) if isinstance(node,ast.Call)
+                                and isinstance(node.func,ast.Attribute) and node.func.attr=='_restore_pasteboard')
+        return snippet,ast.fix_missing_locations(ast.Expression(restore_expression)),namespace,restored
+
+    def test_actual_native_and_desktop_callers_restore_only_typed_items(self):
+        """A nonempty or legitimately empty captured item list survives both real callers without its count."""
+        for filename in ('live_smoke.py','desktop_smoke.py'):
+            for items in ([],[object(),object()]):
+                with self.subTest(filename=filename,empty=not items):
+                    snippet,restore,namespace,restored=self._caller(filename,(items,7))
+                    exec(compile(snippet,'<fixture capture caller>','exec'),namespace)
+                    eval(compile(restore,'<fixture restore caller>','eval'),namespace)
+                    self.assertIs(namespace['clipboard'],items)
+                    self.assertEqual(len(restored),1);self.assertIs(restored[0],items)
+
+    def test_unknown_or_malformed_capture_stops_both_callers_before_restore(self):
+        """An unknown clipboard never becomes an empty list or a destructive clear in either fixture."""
+        snapshots=(None,[],[[],7],([object()],None),([object()],'7'),(None,7),([],True),([],7,'extra'))
+        for filename in ('live_smoke.py','desktop_smoke.py'):
+            for snapshot in snapshots:
+                with self.subTest(filename=filename,shape=type(snapshot).__name__):
+                    snippet,restore,namespace,restored=self._caller(filename,snapshot)
+                    with self.assertRaisesRegex(RuntimeError,'could not be preserved'):
+                        exec(compile(snippet,'<fixture capture caller>','exec'),namespace)
+                    self.assertIsNone(namespace['clipboard']);self.assertEqual(restored,[])
+
+    def test_desktop_cleanup_skips_unknown_clipboard_in_actual_finalizer_callback(self):
+        """The cleanup callback remains a no-op when startup rejected the clipboard snapshot."""
+        tree=ast.parse((ROOT/'tests/desktop_smoke.py').read_text());restored=[]
+        callback=next(node for node in ast.walk(tree) if isinstance(node,ast.Lambda) and any(
+            isinstance(call,ast.Call) and isinstance(call.func,ast.Attribute) and call.func.attr=='_restore_pasteboard'
+            for call in ast.walk(node)))
+        expression=ast.fix_missing_locations(ast.Expression(callback))
+        function=eval(compile(expression,'<fixture finalizer callback>','eval'),
+                      {'computer':SimpleNamespace(_restore_pasteboard=restored.append),'clipboard':None})
+        function();self.assertEqual(restored,[])
 
 
 if __name__=='__main__':

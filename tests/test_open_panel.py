@@ -132,6 +132,56 @@ class OpenPanelTests(unittest.TestCase):
         self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
         self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("AXConfirm", 5)])
 
+    def test_placeholder_and_suggestions_can_change_after_the_exact_write(self):
+        """Observed macOS placeholder removal cannot replace retained focus, ancestry or value proof."""
+        for confirmation, marker in ((action, marker) for action in ("field", "chooser", "button") for marker in ("missing", "path")):
+            with self.subTest(confirmation=confirmation, marker=marker):
+                ns, nodes, writes, references = open_namespace()
+                if confirmation != "field":
+                    nodes[5]["actions"] = []
+                    if confirmation == "chooser": nodes[4]["actions"] = ["AXConfirm"]
+                    else: nodes[4]["children"].append(9)
+                setter = ns["_ax_set_value"]
+
+                def set_value(element, value):
+                    """Replace or remove the prompt and populate suggestions when the field becomes nonempty."""
+                    setter(element, value)
+                    if marker == "missing": nodes[4]["children"].remove(6)
+                    else: nodes[6]["AXValue"] = value
+                    nodes[8]["children"] = [11] * 10_000
+                    return True
+
+                ns["_ax_set_value"] = set_value
+                self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
+                target = 5 if confirmation == "field" else 4 if confirmation == "chooser" else 9
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"),
+                                          ("AXPress" if confirmation == "button" else "AXConfirm", target)])
+
+    def test_replacement_field_or_sheet_after_write_is_never_confirmed(self):
+        """Matching roles, values and geometry cannot authorize a different retained field or sheet."""
+        for replaced in (5, 4, 3):
+            with self.subTest(replaced=replaced):
+                ns, nodes, writes, references = open_namespace()
+                setter = ns["_ax_set_value"]
+
+                def set_value(element, value):
+                    """Substitute a same-owner, same-content object while keeping the old references alive."""
+                    setter(element, value)
+                    nodes[12] = {**nodes[replaced]}
+                    if replaced == 5:
+                        nodes[1]["focused"] = 12
+                        nodes[4]["children"] = [12 if child == 5 else child for child in nodes[4]["children"]]
+                    else:
+                        nodes[5 if replaced == 4 else 4]["parent"] = 12
+                        parent = 3 if replaced == 4 else 2
+                        nodes[parent]["children"] = [12 if child == replaced else child for child in nodes[parent]["children"]]
+                    return True
+
+                ns["_ax_set_value"] = set_value
+                with self.assertRaisesRegex(RuntimeError, "target changed"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+
     def test_chooser_confirm_and_scoped_go_button_are_supported(self):
         """An advertised native chooser action or its sole Go button needs no global Return."""
         for button in (False, True):
@@ -154,6 +204,141 @@ class OpenPanelTests(unittest.TestCase):
                 nodes[11]["parent"] = parent
                 self.assertIsNone(self.run_helper(ns, references))
                 self.assertEqual(writes, [])
+
+    def test_foreign_chooser_descendants_cannot_authorize_a_path_write(self):
+        """A foreign prompt, auxiliary control or Go button cannot become trusted chooser evidence."""
+        for element in (6, 7, 8, 9):
+            with self.subTest(element=element):
+                ns, nodes, writes, references = open_namespace()
+                if element == 9:
+                    nodes[5]["actions"] = []
+                    nodes[4]["children"].append(9)
+                nodes[element]["pid"] = 456
+                self.assertIsNone(self.run_helper(ns, references))
+                self.assertEqual(writes, [])
+
+    def test_selected_owner_changes_during_action_read_block_first_write(self):
+        """Earlier scope identity cannot authorize a field write after native action metadata changes ownership."""
+        for element in (4, 5, 9):
+            with self.subTest(element=element):
+                ns, nodes, writes, references = open_namespace()
+                if element == 9:
+                    nodes[5]["actions"] = []
+                    nodes[4]["children"].append(9)
+                read = ns["_appserv"].AXUIElementCopyActionNames.side_effect
+
+                def actions(target, output):
+                    """Change the retained control's PID after the initial scope walk but before any write."""
+                    status = read(target, output)
+                    nodes[element]["pid"] = 456
+                    return status
+
+                ns["_appserv"].AXUIElementCopyActionNames.side_effect = actions
+                self.assertIsNone(self.run_helper(ns, references))
+                self.assertEqual(writes, [])
+
+    def test_foreign_owner_after_path_write_prevents_confirmation(self):
+        """A changed retained field, chooser, outer panel or Go-button owner blocks confirmation."""
+        for element in (3, 4, 5, 9):
+            with self.subTest(element=element):
+                ns, nodes, writes, references = open_namespace()
+                if element == 9:
+                    nodes[5]["actions"] = []
+                    nodes[4]["children"].append(9)
+                setter = ns["_ax_set_value"]
+
+                def set_value(target, value):
+                    """Keep stable pointers and labels while transferring a synthetic native element's PID."""
+                    setter(target, value)
+                    nodes[element]["pid"] = 456
+                    return True
+
+                ns["_ax_set_value"] = set_value
+                with self.assertRaisesRegex(RuntimeError, "target changed"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+
+    def test_confirmation_owner_is_rechecked_after_refreshed_action_read(self):
+        """A last action-name read cannot transfer the selected native confirmation target unnoticed."""
+        for element in (4, 5, 9):
+            with self.subTest(element=element):
+                ns, nodes, writes, references = open_namespace()
+                if element != 5:
+                    nodes[5]["actions"] = []
+                    if element == 4:
+                        nodes[4]["actions"] = ["AXConfirm"]
+                    else:
+                        nodes[4]["children"].append(9)
+                read = ns["_appserv"].AXUIElementCopyActionNames.side_effect
+
+                def actions(target, output):
+                    """Change ownership after refreshed ancestry and full path-value verification."""
+                    status = read(target, output)
+                    if writes:
+                        nodes[element]["pid"] = 456
+                    return status
+
+                ns["_appserv"].AXUIElementCopyActionNames.side_effect = actions
+                with self.assertRaisesRegex(RuntimeError, "target changed owner"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+
+    def test_scope_changes_during_initial_action_read_prevent_first_write(self):
+        """Action metadata cannot authorize writing into an unfocused or detached retained field."""
+        for failure in ("focus", "role", "parent"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+                read = ns["_appserv"].AXUIElementCopyActionNames.side_effect
+
+                def actions(target, output):
+                    """Invalidate the exact field immediately after reading its advertised confirmation."""
+                    status = read(target, output)
+                    if failure == "focus": nodes[5]["AXFocused"] = "false"
+                    elif failure == "role": nodes[5]["role"] = "AXTextArea"
+                    else: nodes[5]["parent"] = 2
+                    return status
+
+                ns["_appserv"].AXUIElementCopyActionNames.side_effect = actions
+                self.assertIsNone(self.run_helper(ns, references))
+                self.assertEqual(writes, [])
+
+    def test_scope_and_readback_are_checked_after_confirmation_action_metadata(self):
+        """Late action-name reads cannot change focus, ancestry or the full verified path unnoticed."""
+        for failure in ("focus", "role", "parent", "value"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+                read = ns["_appserv"].AXUIElementCopyActionNames.side_effect
+
+                def actions(target, output):
+                    """Change the selected field only after its first exact path write."""
+                    status = read(target, output)
+                    if writes:
+                        if failure == "focus": nodes[5]["AXFocused"] = "false"
+                        elif failure == "role": nodes[5]["role"] = "AXTextArea"
+                        elif failure == "parent": nodes[5]["parent"] = 2
+                        else: nodes[5]["AXValue"] = "/different-file.txt"
+                    return status
+
+                ns["_appserv"].AXUIElementCopyActionNames.side_effect = actions
+                with self.assertRaisesRegex(RuntimeError, "target changed"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+
+    def test_foreign_outer_panel_child_cannot_prove_chooser_closure(self):
+        """Unrelated child ownership is unknown closure evidence and cannot authorize final Open."""
+        ns, nodes, writes, references = open_namespace()
+        perform = ns["_ax_perform_action"]
+
+        def action(element, name):
+            """Detach the chooser but replace trusted outer-panel evidence with a foreign child."""
+            perform(element, name)
+            nodes[10]["pid"] = 456
+            return True
+
+        ns["_ax_perform_action"] = action
+        with self.assertRaisesRegex(RuntimeError, "did not close"):
+            self.run_helper(ns, references)
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("AXConfirm", 5)])
 
     def test_missing_or_ambiguous_chooser_evidence_refuses_before_write(self):
         """Foreign ownership, missing prompt, duplicate fields and truncated walks all fail closed."""
@@ -210,7 +395,7 @@ class OpenPanelTests(unittest.TestCase):
 
     def test_changed_go_button_after_write_is_never_pressed(self):
         """Retaining an old button cannot authorize a detached, replaced or relabeled action."""
-        for failure in ("detached", "replaced", "relabeled"):
+        for failure in ("detached", "replaced", "relabeled", "parent"):
             with self.subTest(failure=failure):
                 ns, nodes, writes, references = open_namespace()
                 nodes[5]["actions"] = []
@@ -221,6 +406,7 @@ class OpenPanelTests(unittest.TestCase):
                     """Change only the scoped confirmation control after the verified field write."""
                     setter(element, value)
                     if failure == "relabeled": nodes[9]["AXTitle"] = "Close"
+                    elif failure == "parent": nodes[9]["parent"] = 2
                     else:
                         nodes[4]["children"].remove(9)
                         if failure == "replaced":

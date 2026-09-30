@@ -16,7 +16,7 @@ import time
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from klyk.client import KlykClient
-from live_smoke import finalize_report, fixture_panel_diagnostic, stop_fixture_process, text_payload
+from live_smoke import finalize_report, fixture_clipboard_items, fixture_panel_diagnostic, stop_fixture_process, text_payload
 from release_check import fingerprint
 
 
@@ -43,11 +43,29 @@ def electron_fixture_diagnostic(computer, pid, document):
     return result
 
 
+def update_browser_state(state, payload, lock):
+    """Accept only newer bounded fixture events so delayed HTTP requests cannot overwrite evidence."""
+    if not isinstance(payload,dict):
+        return False
+    sequence=payload.get('sequence');count=payload.get('count');text=payload.get('text')
+    paste_events=payload.get('paste_events');paste_text=payload.get('paste_text')
+    if (type(sequence) is not int or not 1<=sequence<=1_000_000
+            or type(count) is not int or not 0<=count<=1_000_000
+            or type(paste_events) is not int or not 0<=paste_events<=1_000_000
+            or not isinstance(text,str) or len(text)>1024
+            or (paste_text is not None and (not isinstance(paste_text,str) or len(paste_text)>1024))):
+        return False
+    with lock:
+        if sequence>state.get('sequence',0):
+            state.update(sequence=sequence,count=count,text=text,paste_events=paste_events,paste_text=paste_text)
+    return True
+
+
 def main():
     """Open one temporary Chrome window and an isolated VS Code profile, then clean up both."""
     parser=argparse.ArgumentParser();parser.add_argument('--output',default='.verification/desktop.json');args=parser.parse_args()
     work=ROOT/'.verification';work.mkdir(exist_ok=True)
-    state={};report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome=None;editor=None;document=None
+    state={};state_lock=threading.Lock();report={'environment':{'mcp':version('mcp'),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip(),'apps':{name:plistlib.loads(Path('/Applications',name+'.app/Contents/Info.plist').read_bytes()).get('CFBundleShortVersionString') for name in ('Google Chrome','Visual Studio Code')}},'fingerprint':fingerprint(),'checks':[],'calls':[],'browser_state':state};chrome=None;editor=None;document=None
     chrome_profile=tempfile.TemporaryDirectory(prefix='chrome-profile-',dir=work)
     def check(name, predicate, timeout=4):
         """Wait for an independent outcome without retrying an input action."""
@@ -75,7 +93,16 @@ def main():
         def do_GET(self):
             self.send_response(200);self.send_header('Content-Type','text/html');self.end_headers();self.wfile.write((ROOT/'tests/browser_fixture.html').read_bytes())
         def do_POST(self):
-            data=json.loads(self.rfile.read(min(int(self.headers.get('Content-Length','0')),4096)));state.update(data)
+            """Read one bounded fixture event and keep the newest browser-observed state."""
+            try:
+                length=int(self.headers.get('Content-Length','0'))
+                if not 1<=length<=4096:
+                    self.send_response(413);self.end_headers();return
+                data=json.loads(self.rfile.read(length))
+                if not update_browser_state(state,data,state_lock):
+                    self.send_response(400);self.end_headers();return
+            except (ValueError,TypeError,RecursionError):
+                self.send_response(400);self.end_headers();return
             self.send_response(204);self.end_headers()
         def log_message(self,*args):
             """Keep HTTP noise and request data out of terminal logs."""
@@ -85,8 +112,10 @@ def main():
     from klyk import capture, computer
     from AppKit import NSWorkspace
     previous=NSWorkspace.sharedWorkspace().frontmostApplication()
-    clipboard=computer._snapshot_pasteboard()
+    clipboard=fixture_clipboard_items(computer._snapshot_pasteboard())
     try:
+        if clipboard is None:
+            raise RuntimeError('The fixture clipboard could not be preserved; no desktop input was started.')
         with KlykClient(timeout=45) as c:
             call(c,'take_control')
             url=f'http://127.0.0.1:{server.server_port}/'
@@ -162,7 +191,7 @@ def main():
         finalize_report(report,ROOT/args.output,(
             lambda:stop_fixture_process(chrome),lambda:stop_fixture_process(editor),
             server.shutdown,server.server_close,chrome_profile.cleanup,
-            lambda:computer._restore_pasteboard(clipboard),
+            lambda:computer._restore_pasteboard(clipboard) if clipboard is not None else None,
             lambda:previous.activateWithOptions_(0) if previous is not None else None,
         ))
 

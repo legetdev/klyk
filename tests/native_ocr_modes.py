@@ -43,6 +43,9 @@ def _cases():
     for revision in (1, 2):
         cases.append({"name": f"swift-accurate-revision-{revision}", "backend": "swift",
                       "level": 0, "thread": "main", "mode": "production", "revision": revision})
+    for level in (0, 1):
+        cases.append({"name": f"swift-{level}-modern", "backend": "swift",
+                      "level": level, "thread": "async", "mode": "modern"})
     return cases
 
 
@@ -332,7 +335,7 @@ def _prepare_swift(directory, timeout):
         remaining = deadline - time.monotonic()
         if remaining <= 0:
             raise TimeoutError("Swift compiler setup exhausted its total time bound.")
-        compiled = subprocess.run([compiler, "-sdk", sdk, str(source), "-module-cache-path", str(Path(directory) / "swift-cache"),
+        compiled = subprocess.run([compiler, "-sdk", sdk, "-swift-version", "6", str(source), "-module-cache-path", str(Path(directory) / "swift-cache"),
                                    "-o", str(binary)], capture_output=True, text=True, timeout=remaining)
         report.update({"completed": True, "child_exit_code": compiled.returncode,
                        "passed": compiled.returncode == 0 and binary.is_file(),
@@ -411,7 +414,7 @@ def main():
 
     started = time.monotonic()
     report = {"fingerprint": fingerprint(), "scope": "generated-only Python/Swift OCR configuration diagnostic",
-              "diagnostic_version": 2,
+              "diagnostic_version": 3,
               "environment": {"macos": platform.mac_ver()[0], "python": sys.version,
                               "mcp": version("mcp")},
               "synthetic_only": True, "desktop_capture_forbidden": True,

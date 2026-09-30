@@ -39,7 +39,8 @@ class NativeOcrModeTests(unittest.TestCase):
         self.assertEqual({(case["backend"], case.get("revision")) for case in cases if "revision" in case},
                          {(backend, revision) for backend in ("python_raw", "swift") for revision in (1, 2)})
         self.assertTrue(any(case["backend"] == "swift" and case["level"] == 1 for case in cases))
-        self.assertEqual(len(cases), 12)
+        self.assertEqual({case["level"] for case in cases if case.get("mode") == "modern"}, {0, 1})
+        self.assertEqual(len(cases), 14)
         self.assertEqual(len({case["name"] for case in cases}), len(cases))
         self.assertLessEqual(len(cases) * modes._TIMEOUT + modes._FIXTURE_TIMEOUT + modes._COMPILER_TIMEOUT,
                              modes._TOTAL_TIMEOUT)
@@ -171,6 +172,7 @@ class NativeOcrModeTests(unittest.TestCase):
         self.assertEqual(len(report["child_stderr"]), modes._LOG_LIMIT)
         self.assertEqual(run.call_args_list[-1].kwargs["timeout"], 26)
         self.assertEqual(run.call_args_list[-1].args[0][1:3], ["-sdk", "/test-owned/MacOSX.sdk"])
+        self.assertEqual(run.call_args_list[-1].args[0][3:5], ["-swift-version", "6"])
         self.assertEqual(report["sdk"], "/test-owned/MacOSX.sdk")
         self.assertEqual(str(binary), "/test-owned/native-ocr-reference")
 

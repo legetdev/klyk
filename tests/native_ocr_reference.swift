@@ -8,6 +8,11 @@ import CryptoKit
 
 let resultPrefix = "KLYK_NATIVE_OCR_MODE_RESULT "
 
+/// Read thread identity through the synchronous API before recording async request metadata.
+func threadMetadata() -> [String: Any] {
+    ["is_main": Thread.isMainThread]
+}
+
 /// Read scalar settings without warming supported-model queries before recognition.
 func settings(_ request: VNRecognizeTextRequest) -> [String: Any] {
     ["level": request.recognitionLevel.rawValue, "revision": request.revision,
@@ -32,7 +37,8 @@ func configureCPU(_ request: VNRecognizeTextRequest) throws {
 func errorDetail(_ error: Error) -> [String: Any] {
     let value = error as NSError
     return ["type": String(describing: type(of: error)), "domain": value.domain,
-            "code": value.code, "message": String(value.localizedDescription.prefix(2000))]
+            "code": value.code, "message": String(value.localizedDescription.prefix(2000)),
+            "description": String(String(describing: error).prefix(2000))]
 }
 
 /// Read supported models and devices only after the actual request has returned.
@@ -54,16 +60,75 @@ func metadata(_ request: VNRecognizeTextRequest) -> [String: Any] {
     return result
 }
 
+/// Inspect modern scalar settings without querying supported devices before recognition.
+@available(macOS 15, *)
+func modernSettings(_ request: RecognizeTextRequest) -> [String: Any] {
+    ["level": request.recognitionLevel == .fast ? 1 : 0, "revision": String(describing: request.revision),
+     "language_correction": request.usesLanguageCorrection,
+     "languages": request.recognitionLanguages.map { $0.minimalIdentifier },
+     "automatically_detects_language": request.automaticallyDetectsLanguage]
+}
+
+/// Isolate modern Vision's async API on the same private image without changing production.
+@available(macOS 15, *)
+@MainActor
+func modernReport(image: CGImage, level: UInt, initial: [String: Any]) async -> [String: Any] {
+    var report = initial
+    report["api"] = "RecognizeTextRequest"
+    var request = RecognizeTextRequest()
+    report["initial_request"] = modernSettings(request)
+    if level == 1 { request.recognitionLevel = .fast }
+    report["final_request"] = modernSettings(request)
+    let started = ProcessInfo.processInfo.systemUptime
+    do {
+        let results = try await request.perform(on: image)
+        report["native_success"] = true
+        report["native_error"] = NSNull()
+        report["native_results_nil"] = false
+        report["native_result_count"] = results.count
+        let observations: [[String: Any]] = results.prefix(10).compactMap { item in
+            guard let candidate = item.topCandidates(1).first else { return nil }
+            let box = item.boundingBox.cgRect
+            return ["text": String(candidate.string.prefix(2000)), "confidence": candidate.confidence,
+                    "x": Int((box.minX + box.width / 2) * 512),
+                    "y": Int((1 - box.minY - box.height / 2) * 256),
+                    "width": Int(box.width * 512), "height": Int(box.height * 256)]
+        }
+        report["observations"] = observations
+        report["passed"] = observations.contains {
+            ($0["text"] as? String)?.trimmingCharacters(in: .whitespacesAndNewlines).uppercased() == "HELLO"
+        }
+    } catch {
+        report["native_success"] = false
+        report["native_error"] = errorDetail(error)
+        report["native_results_nil"] = true
+        report["native_result_count"] = NSNull()
+    }
+    report["native_elapsed_seconds"] = ProcessInfo.processInfo.systemUptime - started
+    report["native_performed"] = true
+    report["completed"] = true
+    var after = modernSettings(request)
+    after["supported_languages"] = request.supportedRecognitionLanguages.prefix(100).map { $0.minimalIdentifier }
+    after["compute_stages"] = request.supportedComputeStageDevices.map { pair -> [String: Any] in
+        let (stage, devices) = pair
+        return ["stage": String(describing: stage), "supported_devices": devices.map { String(describing: $0) },
+                "assigned_device": request.computeDevice(for: stage).map { String(describing: $0) as Any } ?? NSNull()]
+    }
+    report["native_metadata_after_request"] = after
+    return report
+}
+
 /// Perform one bounded reference on the exact fixture, without any desktop or app APIs.
-func run() -> (Int32, [String: Any]) {
+@MainActor
+func run() async -> (Int32, [String: Any]) {
     var report: [String: Any] = ["completed": false, "passed": false, "native_performed": false,
                                "backend": "swift", "platform": ProcessInfo.processInfo.operatingSystemVersionString,
-                               "thread": ["is_main": Thread.isMainThread]]
+                               "thread": threadMetadata()]
     do {
         guard CommandLine.arguments.count == 6,
               let level = UInt(CommandLine.arguments[4]), (0...1).contains(level),
               let revision = UInt(CommandLine.arguments[5]), (0...3).contains(revision),
-              ["defaults", "production"].contains(CommandLine.arguments[3]) else {
+              ["defaults", "production", "modern"].contains(CommandLine.arguments[3]) else {
             throw NSError(domain: "KlykGeneratedDiagnostic", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "Invalid typed reference arguments."])
         }
@@ -85,6 +150,15 @@ func run() -> (Int32, [String: Any]) {
         report["image"] = ["width": image.width, "height": image.height,
                            "bits_per_component": image.bitsPerComponent, "bits_per_pixel": image.bitsPerPixel,
                            "alpha_info": image.alphaInfo.rawValue]
+        if CommandLine.arguments[3] == "modern" {
+            if #available(macOS 15, *) {
+                report = await modernReport(image: image, level: level, initial: report)
+                return (report["passed"] as? Bool == true ? 0 : 1, report)
+            }
+            throw NSError(domain: "KlykGeneratedDiagnostic", code: 4,
+                          userInfo: [NSLocalizedDescriptionKey: "The modern diagnostic requires macOS 15 or newer."])
+        }
+        report["api"] = "VNRecognizeTextRequest"
         let request = VNRecognizeTextRequest()
         report["initial_request"] = settings(request)
         if revision > 0 {
@@ -135,7 +209,7 @@ func run() -> (Int32, [String: Any]) {
     return (report["passed"] as? Bool == true ? 0 : 1, report)
 }
 
-let (exitCode, report) = run()
+let (exitCode, report) = await run()
 do {
     let data = try JSONSerialization.data(withJSONObject: report, options: [.sortedKeys])
     print(resultPrefix + String(decoding: data, as: UTF8.self))
