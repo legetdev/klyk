@@ -82,6 +82,138 @@ def fixture_input_unchanged(before, after):
     return all(field in before and field in after and before[field]==after[field] for field in fields)
 
 
+def fixture_panel_diagnostic(computer, pid):
+    """Read only the generated fixture host after a refused open, without another dialog action."""
+    import ctypes
+    started=time.monotonic();deadline=started+1.5
+    result={'host_pid':pid,'scope':'owned generated fixture host and its AX descendants only',
+            'max_elements':400,'traversal_budget_seconds':1.5,'elements':[],'raw_panel_elements':[]}
+    try:
+        elements=computer.ax_snapshot(pid,max_results=400,max_children_per_node=100,deadline_seconds=.65)
+        result['elements']=[{key:(value[:256] if isinstance(value,str) else value)
+                             for key,value in element.items()
+                             if key in ('role','label','value','focused','x','y','width','height')}
+                            for element in elements[:400]]
+    except Exception as error:
+        result['snapshot_error']=type(error).__name__
+    try:
+        if time.monotonic()<deadline:
+            result['focused_summary']=computer.ax_focused_summary(pid)
+    except Exception as error:
+        result['focused_summary_error']=type(error).__name__
+    attributes=(b'AXRole',b'AXTitle',b'AXDescription',b'AXPlaceholderValue',b'AXSubrole',
+                b'AXValue',b'AXFocused',b'AXURL',b'AXDocument',b'AXSelected',b'AXPosition',b'AXSize',b'AXChildren')
+    panel_roles={'AXSheet','AXDialog','AXTextField','AXComboBox','AXButton','AXStaticText','AXRow','AXCell'}
+    field_roles={'AXTextField','AXComboBox'}
+    seen=set();app=0;focused=0
+
+    def release(values):
+        """Balance every copied native attribute even if decoding or traversal fails."""
+        for value in values or ():
+            if value:
+                computer._cf.CFRelease(ctypes.c_void_p(value))
+
+    def parent_chain(element):
+        """Read up to eight actual AXParent references, retaining no native references in evidence."""
+        chain=[];parent=0
+        try:
+            if time.monotonic()<deadline:
+                parent=computer._ax_read_attr_ptr(element,b'AXParent')
+            while parent and len(chain)<8 and time.monotonic()<deadline:
+                raw=computer._ax_read_multi(parent,(b'AXRole',b'AXTitle',b'AXSubrole'))
+                try:
+                    chain.append({key:(computer._cftype_to_str(value)[:256] if value else None)
+                                  for key,value in zip(('AXRole','AXTitle','AXSubrole'),raw or ())})
+                finally:
+                    release(raw)
+                following=computer._ax_read_attr_ptr(parent,b'AXParent') if time.monotonic()<deadline else 0
+                computer._cf.CFRelease(ctypes.c_void_p(parent));parent=following
+        finally:
+            if parent:
+                computer._cf.CFRelease(ctypes.c_void_p(parent))
+        return chain
+
+    def describe(element, raw):
+        """Preserve empty raw attributes and read-only field metadata that public snapshots omit."""
+        item={key.decode():(computer._cftype_to_str(value)[:256] if value else None)
+              for key,value in zip(attributes[:10],raw[:10])}
+        geometry=computer._decode_pos_size(raw[10],raw[11]) if raw[10] and raw[11] else None
+        if geometry:
+            x,y,width,height=geometry
+            item.update(x=x+width/2,y=y+height/2,width=width,height=height)
+        if time.monotonic()<deadline:
+            owner=ctypes.c_int()
+            status=computer._appserv.AXUIElementGetPid(ctypes.c_void_p(element),ctypes.byref(owner))
+            item['element_pid']=owner.value if status==0 else None
+        if item.get('AXRole') in field_roles:
+            item['settable']={}
+            for attribute in (b'AXValue',b'AXFocused'):
+                if time.monotonic()<deadline:
+                    item['settable'][attribute.decode()]=computer._ax_attr_is_settable(element,attribute)
+            item['parents']=parent_chain(element)
+        return item
+
+    def walk(element, depth=0):
+        """Stay within the owned app tree, 400 nodes, depth 30, and the shared read deadline."""
+        if element in seen or len(seen)>=400 or depth>30 or time.monotonic()>=deadline:
+            return
+        seen.add(element)
+        raw=computer._ax_read_multi(element,attributes)
+        if not raw:
+            return
+        try:
+            role=computer._cftype_to_str(raw[0]) if raw[0] else ''
+            if role in panel_roles:
+                result['raw_panel_elements'].append(describe(element,raw))
+            children=raw[-1]
+            if children:
+                count=computer._cf.CFArrayGetCount(ctypes.c_void_p(children))
+                for index in range(min(count,400)):
+                    if len(seen)>=400 or time.monotonic()>=deadline:
+                        break
+                    child=computer._cf.CFArrayGetValueAtIndex(ctypes.c_void_p(children),index)
+                    if child:
+                        walk(child,depth+1)
+        finally:
+            release(raw)
+
+    try:
+        if time.monotonic()<deadline:
+            app=computer._appserv.AXUIElementCreateApplication(pid)
+            if app:
+                computer._appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app),.05)
+                focused=computer._ax_read_attr_ptr(app,b'AXFocusedUIElement')
+                if focused and time.monotonic()<deadline:
+                    raw=computer._ax_read_multi(focused,attributes)
+                    try:
+                        if raw:
+                            result['raw_host_focus']=describe(focused,raw)
+                    finally:
+                        release(raw)
+                windows=computer._ax_read_attr_ptr(app,b'AXWindows') if time.monotonic()<deadline else 0
+                try:
+                    if windows:
+                        count=computer._cf.CFArrayGetCount(ctypes.c_void_p(windows))
+                        for index in range(min(count,400)):
+                            if len(seen)>=400 or time.monotonic()>=deadline:
+                                break
+                            window=computer._cf.CFArrayGetValueAtIndex(ctypes.c_void_p(windows),index)
+                            if window:
+                                walk(window)
+                    else:
+                        walk(app)
+                finally:
+                    release((windows,))
+    except Exception as error:
+        result['raw_probe_error']=type(error).__name__
+    finally:
+        release((focused,app))
+    result['raw_visited_nodes']=len(seen)
+    result['elapsed_ms']=round((time.monotonic()-started)*1000)
+    result['deadline_reached']=time.monotonic()>=deadline
+    return result
+
+
 def main():
     """Run only against a disposable fixture and preserve evidence even on failure."""
     parser=argparse.ArgumentParser();parser.add_argument('--output',default='.verification/live.json');args=parser.parse_args()
@@ -252,7 +384,10 @@ def main():
             call(client,'click_menu',path=['File','Open Test File'])
             call(client,'wait_for',text='Open',timeout=3)
             opened=call(client,'handle_system_dialog',action='open',path=str(saved))
-            check('native open read exact saved contents',opened.get('ok') and settled(lambda:current()['opened']=='Klyk fixture saved'))
+            opened_verified=opened.get('ok') and settled(lambda:current()['opened']=='Klyk fixture saved')
+            if not opened_verified:
+                report['native_open_failure_diagnostic']=fixture_panel_diagnostic(computer,fixture.pid)
+            check('native open read exact saved contents',opened_verified)
             missing_before=current()
             missing=call(client,'handle_system_dialog',action='save')
             check('missing save panel sends no input',not missing.get('ok') and fixture_input_unchanged(missing_before,current()))

@@ -29,8 +29,12 @@ def main():
     def check(name, predicate, timeout=4):
         """Wait for an independent outcome without retrying an input action."""
         deadline=time.monotonic()+timeout
-        while not predicate() and time.monotonic()<deadline:time.sleep(.1)
-        ok=bool(predicate());report['checks'].append({'name':name,'passed':ok})
+        while True:
+            ok=bool(predicate())
+            remaining=deadline-time.monotonic()
+            if ok or remaining<=0:break
+            time.sleep(min(.1,remaining))
+        report['checks'].append({'name':name,'passed':ok})
         if not ok:raise AssertionError(name)
     def call(c,tool,app='Google Chrome',**args):
         """Record real MCP results without retaining image payloads."""
@@ -38,6 +42,11 @@ def main():
         report['calls'].append({'tool':tool,'app':app,'wall_ms':round((time.monotonic()-start)*1000),'result':data})
         print(tool,app,'ERROR' if data.get('error') else data.get('ok',True),flush=True)
         return data
+    def observed_fixture(c,app,wid,required):
+        """Read fresh evidence while a cold renderer loads; never repeat an input action."""
+        observation=call(c,'inspect',app=app,window_id=wid)
+        labels=json.dumps(observation)
+        return all(label in labels for label in required) and 'CLAUDE.md' not in labels
     class Handler(BaseHTTPRequestHandler):
         """Serve only a static fixture and collect its disposable event state."""
         def do_GET(self):
@@ -66,7 +75,7 @@ def main():
             if existing.returncode not in (0,1):raise RuntimeError('Chrome process isolation could not be checked')
             if existing.stdout.strip():raise RuntimeError('An existing Chrome process prevents isolated app-name targeting')
             chrome=subprocess.Popen([str(chrome_executable),'--user-data-dir='+chrome_profile.name,
-                                     '--no-first-run','--no-default-browser-check','--new-window',
+                                     '--no-first-run','--no-default-browser-check','--force-renderer-accessibility','--new-window',
                                      '--window-position=50,50','--window-size=900,650',url],
                                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['browser_pid']=chrome.pid
@@ -77,8 +86,8 @@ def main():
             windows=identity['windows']
             check('one isolated browser window identified',lambda:identity.get('pid')==chrome.pid and len(windows)==1)
             wid=windows[0]['window_id']
-            observation=call(c,'inspect',window_id=wid)
-            check('browser fixture observed',lambda:'Klyk Browser Fixture' in json.dumps(observation))
+            check('browser fixture observed',lambda:observed_fixture(c,'Google Chrome',wid,
+                  ('Klyk Browser Fixture','Increment browser','Fixture input')),timeout=20)
             call(c,'set_mode',mode='background')
             refused=call(c,'click',window_id=wid,x=400,y=300)
             check('background Chromium click refused',lambda:refused.get('requires_foreground') and state['count']==0)
@@ -102,18 +111,19 @@ def main():
             existing=subprocess.run(['pgrep','-f','^'+re.escape(str(executable))+'( |$)'],capture_output=True,text=True)
             if existing.returncode not in (0,1):raise RuntimeError('VS Code process isolation could not be checked')
             if existing.stdout.strip():raise RuntimeError('An existing VS Code process prevents isolated app-name targeting')
-            editor=subprocess.Popen([str(executable),'--user-data-dir',str(work/'vscode-profile'),'--extensions-dir',str(work/'vscode-extensions'),'--disable-extensions','--disable-workspace-trust','--skip-welcome','--skip-release-notes','--new-window',str(document)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            editor=subprocess.Popen([str(executable),'--user-data-dir',str(work/'vscode-profile'),'--extensions-dir',str(work/'vscode-extensions'),'--disable-extensions','--disable-workspace-trust','--force-renderer-accessibility','--skip-welcome','--skip-release-notes','--new-window',str(document)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['editor_pid']=editor.pid
             ready=capture.wait_for_window(editor.pid,timeout=20)
             check('isolated Electron window exists',lambda:ready is not None)
             identity=call(c,'list_windows',app='Klyk Electron Fixture',bundle_id='com.microsoft.VSCode')
             check('Electron PID matches isolated profile',lambda:identity.get('pid')==editor.pid)
-            observation=call(c,'inspect',app='Klyk Electron Fixture')
-            check('Electron document matches fixture before input',lambda:'electron-fixture.txt' in json.dumps(observation) and 'CLAUDE.md' not in json.dumps(observation))
-            call(c,'press_key',app='Klyk Electron Fixture',key='cmd+1')
-            call(c,'press_key',app='Klyk Electron Fixture',key='cmd+a')
-            call(c,'type_text',app='Klyk Electron Fixture',text='Electron verified 🧭',mode='keys')
-            call(c,'press_key',app='Klyk Electron Fixture',key='cmd+s')
+            editor_wid=identity['windows'][0]['window_id']
+            check('Electron document matches fixture before input',lambda:observed_fixture(c,'Klyk Electron Fixture',
+                  editor_wid,('electron-fixture.txt',)),timeout=20)
+            call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+1')
+            call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+a')
+            call(c,'type_text',app='Klyk Electron Fixture',window_id=editor_wid,text='Electron verified 🧭',mode='keys')
+            call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+s')
             check('Electron editor saved exact Unicode text',lambda:document.read_text()=='Electron verified 🧭')
             call(c,'close_app',app='Klyk Electron Fixture')
             report['completed']=True

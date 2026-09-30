@@ -61,6 +61,10 @@ jobs:
       - name: Recheck permissions with the fresh-installed interpreter before any UI
         if: env.FULL_SUITE == 'true'
         run: python -P -B tests/native_runner_probe.py --output .verification/installed-runner-probe.json
+      - name: Generated native OCR execution-mode diagnostic
+        if: env.FULL_SUITE == 'true'
+        continue-on-error: true
+        run: python -B tests/native_ocr_modes.py --output .verification/native-ocr-modes.json
       - name: Generated native image coordinate diagnostic
         if: env.FULL_SUITE == 'true'
         continue-on-error: true
@@ -220,7 +224,7 @@ jobs:
           identity = {'fingerprint': fingerprint(), 'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
                       'mcp': sdk, 'requested_mcp_major': os.environ['MCP_MAJOR'], 'macos': platform.mac_ver()[0],
                       'architecture': platform.machine(), 'runner_label': os.environ['KLYK_RUNNER_LABEL']}
-          for stem in ('runner-probe', 'installed-runner-probe', 'layout-probe', 'doctor', 'stdio', 'native-image', 'vscode-fixture', 'native', 'desktop', 'background'):
+          for stem in ('runner-probe', 'installed-runner-probe', 'layout-probe', 'doctor', 'stdio', 'native-image', 'native-ocr-modes', 'vscode-fixture', 'native', 'desktop', 'background'):
               path = pathlib.Path('.verification') / (stem + '.json')
               if not path.is_file(): continue
               raw = path.read_bytes()

@@ -70,6 +70,8 @@ class PrivateFileTests(unittest.TestCase):
             root = Path(directory)
             target = root / "target"
             target.mkdir(mode=0o755)
+            # Deliberately expose a chmod side effect even under a private caller umask.
+            target.chmod(0o755)
             link = root / "captures"
             link.symlink_to(target, target_is_directory=True)
             with patch.object(client, "_CAPTURE_DIR", link):
