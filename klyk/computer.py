@@ -1858,7 +1858,7 @@ def _ax_panel_actions(element: int) -> set[str] | None:
 
 
 def ax_navigate_open_panel(pid: int, path: str) -> str | None:
-    """Set one proved Go to Folder field and confirm natively; unknown effects never permit fallback."""
+    """Submit one retained Go to Folder path; unknown effects never permit another input attempt."""
     _check_stop()
     if not path or "\0" in path or len(path) > 16_384:
         return None
@@ -1868,13 +1868,18 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
     field, chooser, panel, button, window = context
     attempted = False
     try:
-        target, action = 0, b""
-        for element in (field, chooser):
-            if "AXConfirm" in (_ax_panel_actions(element) or ()):
-                target, action = element, b"AXConfirm"
-                break
+        field_actions = _ax_panel_actions(field)
+        chooser_actions = _ax_panel_actions(chooser)
+        target, action = (chooser, b"AXConfirm") if "AXConfirm" in (chooser_actions or ()) else (0, b"")
         if not target and button and "AXPress" in (_ax_panel_actions(button) or ()):
             target, action = button, b"AXPress"
+        keyboard = not target
+        if (keyboard and not button and chooser_actions == {"AXRaise"}
+                and field_actions is not None and "AXConfirm" in field_actions
+                and field_actions <= {"AXConfirm", "AXShowMenu"}):
+            # The standard field's AXConfirm accepts editing without closing
+            # its chooser. Choose one primary PID Return before the path write.
+            target, action = field, b"AXConfirm"
         if not target:
             raise RuntimeError("The Go to Folder chooser has no accessible confirmation action; no path was typed.")
 
@@ -1898,7 +1903,14 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
         attempted = True
         if not _ax_set_value(field, path) or _ax_str(field, b"AXValue") != path:
             raise RuntimeError("The Go to Folder path write could not be verified; inspect the dialog before continuing.")
-        if action.decode() not in (_ax_panel_actions(target) or ()):
+        if keyboard:
+            # Revalidate the retained target after the foreground lookup;
+            # that native read can observe an intervening focus or path change.
+            _check_frontmost(pid)
+        current_actions = _ax_panel_actions(target)
+        if (action.decode() not in (current_actions or ())
+                or (keyboard and (not current_actions <= {"AXConfirm", "AXShowMenu"}
+                    or _ax_panel_actions(chooser) != {"AXRaise"}))):
             raise RuntimeError("The Go to Folder target changed after the path write; inspect the dialog before continuing.")
         _check_stop()
         if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, window, button, target) if element):
@@ -1920,7 +1932,10 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
         _check_stop()
         if not all(_ax_matches_pid(element, pid) for element in (field, chooser, panel, window, button, target) if element):
             raise RuntimeError("The Go to Folder target changed owner after the path write; inspect the dialog before continuing.")
-        if not _ax_perform_action(target, action):
+        if keyboard:
+            _check_stop()
+            _press_key_sync(36, 0, pid)
+        elif not _ax_perform_action(target, action):
             raise RuntimeError("The Go to Folder confirmation could not be verified; inspect the dialog before continuing.")
 
         # Prove closure from the retained outer panel's direct children. A

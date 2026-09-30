@@ -178,6 +178,8 @@ def main():
             call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+a')
             call(c,'type_text',app='Klyk Electron Fixture',window_id=editor_wid,text='Electron verified 🧭',mode='keys')
             report['electron_after_typing']=computer.ax_focused_summary(editor.pid)
+            check('Electron exact Unicode text observed before saving',lambda:electron_editor_ready(
+                  computer,editor.pid,'Electron verified 🧭'),timeout=10)
             call(c,'press_key',app='Klyk Electron Fixture',window_id=editor_wid,key='cmd+s')
             check('Electron editor saved exact Unicode text',lambda:document.read_text()=='Electron verified 🧭')
             call(c,'close_app',app='Klyk Electron Fixture')

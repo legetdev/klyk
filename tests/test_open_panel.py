@@ -15,8 +15,8 @@ def open_namespace():
         1: {"role": "AXApplication", "children": [2], "focused": 5},
         2: {"role": "AXWindow", "parent": 1, "children": [3, 11]},
         3: {"role": "AXSheet", "parent": 2, "AXDescription": "open", "children": [4, 10]},
-        4: {"role": "AXSheet", "parent": 3, "children": [6, 7, 5, 8]},
-        5: {"role": "AXTextField", "parent": 4, "AXValue": "", "AXFocused": "true", "writable": True, "actions": ["AXConfirm"]},
+        4: {"role": "AXSheet", "parent": 3, "children": [6, 7, 5, 8], "actions": ["AXRaise"]},
+        5: {"role": "AXTextField", "parent": 4, "AXValue": "", "AXFocused": "true", "writable": True, "actions": ["AXConfirm", "AXShowMenu"]},
         6: {"role": "AXStaticText", "parent": 4, "AXValue": "Go to Folder"},
         7: {"role": "AXButton", "parent": 4, "AXTitle": "Close"},
         8: {"role": "AXTable", "parent": 4, "children": []},
@@ -95,6 +95,12 @@ def open_namespace():
         nodes[1]["focused"] = 0
         return True
 
+    def press_key(keycode, flags, pid):
+        """Record a PID-scoped primary Return without constructing or posting any native event."""
+        writes.append(("Return", keycode, flags, pid))
+        nodes[3]["children"].remove(4)
+        nodes[1]["focused"] = 0
+
     cf = MagicMock()
     cf.CFRetain.side_effect = lambda pointer: own(pointer.value)
     cf.CFRelease.side_effect = lambda pointer: references.subtract([pointer.value])
@@ -110,7 +116,10 @@ def open_namespace():
           "_cftype_to_str": lambda pointer: values[pointer],
           "_ax_matches_pid": lambda element, pid: nodes[element].get("pid", 123) == pid,
           "_ax_attr_is_settable": lambda element, name: nodes[element].get("writable", False),
-          "_ax_set_value": set_value, "_ax_perform_action": perform}
+          "_ax_set_value": set_value, "_ax_perform_action": perform,
+          "_check_frontmost": MagicMock(), "_press_key_sync": MagicMock(side_effect=press_key),
+          "_post": MagicMock(side_effect=AssertionError("Global input is forbidden in the fixture")),
+          "activate_app": MagicMock(side_effect=AssertionError("Activation is forbidden in the fixture"))}
     clock.sleep = sleep
     load_functions("computer.py", {"ax_navigate_open_panel"}, ns)
     return ns, nodes, writes, references
@@ -130,14 +139,18 @@ class OpenPanelTests(unittest.TestCase):
         """The actual macOS field needs chooser identity, not a preexisting slash-prefixed value."""
         ns, nodes, writes, references = open_namespace()
         self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
-        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("AXConfirm", 5)])
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, 123)])
+        ns["_check_frontmost"].assert_called_once_with(123)
+        ns["_press_key_sync"].assert_called_once_with(36, 0, 123)
+        ns["_post"].assert_not_called()
+        ns["activate_app"].assert_not_called()
 
     def test_placeholder_and_suggestions_can_change_after_the_exact_write(self):
         """Observed macOS placeholder removal cannot replace retained focus, ancestry or value proof."""
-        for confirmation, marker in ((action, marker) for action in ("field", "chooser", "button") for marker in ("missing", "path")):
+        for confirmation, marker in ((action, marker) for action in ("primary", "chooser", "button") for marker in ("missing", "path")):
             with self.subTest(confirmation=confirmation, marker=marker):
                 ns, nodes, writes, references = open_namespace()
-                if confirmation != "field":
+                if confirmation != "primary":
                     nodes[5]["actions"] = []
                     if confirmation == "chooser": nodes[4]["actions"] = ["AXConfirm"]
                     else: nodes[4]["children"].append(9)
@@ -153,9 +166,9 @@ class OpenPanelTests(unittest.TestCase):
 
                 ns["_ax_set_value"] = set_value
                 self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
-                target = 5 if confirmation == "field" else 4 if confirmation == "chooser" else 9
-                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"),
-                                          ("AXPress" if confirmation == "button" else "AXConfirm", target)])
+                effect = (("Return", 36, 0, 123) if confirmation == "primary"
+                          else ("AXConfirm", 4) if confirmation == "chooser" else ("AXPress", 9))
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), effect])
 
     def test_replacement_field_sheet_or_window_after_write_is_never_confirmed(self):
         """Matching roles, values and geometry cannot authorize a different retained field, sheet or window."""
@@ -194,6 +207,187 @@ class OpenPanelTests(unittest.TestCase):
                     nodes[4]["actions"] = ["AXConfirm"]
                 self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
                 self.assertEqual(writes[-1], ("AXPress", 9) if button else ("AXConfirm", 4))
+                ns["_press_key_sync"].assert_not_called()
+
+    def test_primary_return_requires_the_observed_action_shape(self):
+        """An unfamiliar field, chooser or unsupported Go button never receives a speculative path write."""
+        for failure in ("no_confirm", "extra_field_action", "empty_chooser", "extra_chooser_action", "unsupported_go"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+                if failure == "no_confirm": nodes[5]["actions"] = ["AXShowMenu"]
+                elif failure == "extra_field_action": nodes[5]["actions"].append("AXPress")
+                elif failure == "empty_chooser": nodes[4]["actions"] = []
+                elif failure == "extra_chooser_action": nodes[4]["actions"].append("AXShowMenu")
+                else:
+                    nodes[4]["children"].append(9)
+                    nodes[9]["actions"] = []
+                with self.assertRaisesRegex(RuntimeError, "no accessible confirmation action"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [])
+                ns["_press_key_sync"].assert_not_called()
+
+    def test_primary_return_rechecks_action_shape_after_the_path_write(self):
+        """New or missing actions cannot turn a selected primary event into a different submission route."""
+        for failure in ("no_confirm", "extra_field_action", "empty_chooser", "new_chooser_confirm", "extra_chooser_action"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+                setter = ns["_ax_set_value"]
+
+                def set_value(element, value):
+                    """Change native action metadata only after recording the one exact path write."""
+                    setter(element, value)
+                    if failure == "no_confirm": nodes[5]["actions"] = ["AXShowMenu"]
+                    elif failure == "extra_field_action": nodes[5]["actions"].append("AXPress")
+                    elif failure == "empty_chooser": nodes[4]["actions"] = []
+                    elif failure == "new_chooser_confirm": nodes[4]["actions"] = ["AXConfirm"]
+                    else: nodes[4]["actions"].append("AXShowMenu")
+                    return True
+
+                ns["_ax_set_value"] = set_value
+                with self.assertRaisesRegex(RuntimeError, "target changed"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+                ns["_press_key_sync"].assert_not_called()
+
+    def test_native_submission_precedes_primary_return_without_a_retry(self):
+        """Native chooser/Go actions remain canonical and failed or unclosed actions cannot trigger Return."""
+        for route in ("chooser", "button"):
+            for outcome in ("success", "failure", "exception", "unclosed"):
+                with self.subTest(route=route, outcome=outcome):
+                    ns, nodes, writes, references = open_namespace()
+                    nodes[4]["children"].append(9)
+                    if route == "chooser": nodes[4]["actions"] = ["AXConfirm"]
+
+                    def perform(element, action):
+                        """Record exactly one native attempt, including its uncertain-effect failures."""
+                        writes.append((action.decode(), element))
+                        if outcome == "exception": raise RuntimeError("native confirmation interrupted")
+                        if outcome == "success":
+                            nodes[3]["children"].remove(4)
+                            nodes[1]["focused"] = 0
+                        return outcome != "failure"
+
+                    ns["_ax_perform_action"] = perform
+                    if outcome == "success":
+                        self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
+                    else:
+                        with self.assertRaises(RuntimeError): self.run_helper(ns, references)
+                    effect = ("AXConfirm", 4) if route == "chooser" else ("AXPress", 9)
+                    self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), effect])
+                    ns["_press_key_sync"].assert_not_called()
+                    ns["_check_frontmost"].assert_not_called()
+
+    def test_primary_return_refuses_a_changed_foreground(self):
+        """An intervening foreground app change permits no key delivery or activation retry."""
+        ns, nodes, writes, references = open_namespace()
+        ns["_check_frontmost"].side_effect = RuntimeError("Foreground changed")
+        with self.assertRaisesRegex(RuntimeError, "Foreground changed"):
+            self.run_helper(ns, references)
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+        ns["_press_key_sync"].assert_not_called()
+        ns["activate_app"].assert_not_called()
+
+    def test_foreground_read_changes_are_revalidated_before_primary_return(self):
+        """The final exact proof must follow the native foreground read, including same-owner replacements."""
+        for failure in ("focus", "replacement_field", "value", "field_action", "chooser_action", "pid", "window"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+
+                def frontmost(pid):
+                    """Model a same-host mutation during the foreground lookup without any native call."""
+                    if failure == "focus": nodes[1]["focused"] = 11
+                    elif failure == "replacement_field":
+                        nodes[12] = {**nodes[5]}
+                        nodes[1]["focused"] = 12
+                        nodes[4]["children"] = [12 if child == 5 else child for child in nodes[4]["children"]]
+                    elif failure == "value": nodes[5]["AXValue"] = "/different-file.txt"
+                    elif failure == "field_action": nodes[5]["actions"].append("AXPress")
+                    elif failure == "chooser_action": nodes[4]["actions"] = ["AXConfirm"]
+                    elif failure == "pid": nodes[5]["pid"] = 456
+                    else:
+                        nodes[12] = {**nodes[2]}
+                        nodes[3]["parent"] = 12
+                        nodes[1]["children"] = [12]
+
+                ns["_check_frontmost"].side_effect = frontmost
+                with self.assertRaisesRegex(RuntimeError, "target changed"):
+                    self.run_helper(ns, references)
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+                ns["_press_key_sync"].assert_not_called()
+
+    def test_stop_after_foreground_lookup_prevents_primary_return(self):
+        """A stop or cancellation during the last external lookup blocks all new keydowns."""
+        ns, nodes, writes, references = open_namespace()
+        stopped = [False]
+
+        def frontmost(pid):
+            """Set only the inert stop flag while reporting the already-owned app."""
+            stopped[0] = True
+
+        def check_stop():
+            """Prevent any input after the modeled physical stop or request cancellation."""
+            if stopped[0]: raise RuntimeError("cancelled")
+
+        ns["_check_frontmost"].side_effect = frontmost
+        ns["_check_stop"] = check_stop
+        with self.assertRaisesRegex(RuntimeError, "cancelled"):
+            self.run_helper(ns, references)
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+        ns["_press_key_sync"].assert_not_called()
+
+    def test_unclosed_primary_chooser_never_receives_a_second_return(self):
+        """An acknowledged event with unproved closure is terminal, never another keyboard/native attempt."""
+        ns, nodes, writes, references = open_namespace()
+        ns["_press_key_sync"].side_effect = lambda keycode, flags, pid: writes.append(("Return", keycode, flags, pid))
+        ns["_ax_perform_action"] = MagicMock(side_effect=AssertionError("Native retry is forbidden"))
+        with self.assertRaisesRegex(RuntimeError, "did not close"):
+            self.run_helper(ns, references)
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, 123)])
+        ns["_press_key_sync"].assert_called_once_with(36, 0, 123)
+        ns["_ax_perform_action"].assert_not_called()
+
+    def test_primary_return_uses_balanced_extracted_key_cleanup(self):
+        """Actual key-pair functions release once through stop, cancellation and interrupted fake delivery."""
+        for failure in ("none", "stop", "cancel", "post_failure"):
+            with self.subTest(failure=failure):
+                ns, nodes, writes, references = open_namespace()
+                events = []
+                stopped = [False]
+                sleep = ns["time"].sleep
+
+                def check_stop():
+                    """Apply a fake latch without inspecting real permissions or ownership files."""
+                    if stopped[0]: raise RuntimeError("stopped")
+
+                def send_key(keycode, flags, down, pid):
+                    """Capture event arguments in memory; the source's mandatory key-up bypasses the stop latch."""
+                    events.append((down, keycode, flags, pid))
+                    if down:
+                        nodes[3]["children"].remove(4)
+                        nodes[1]["focused"] = 0
+                        if failure == "stop": stopped[0] = True
+                        if failure == "post_failure": raise RuntimeError("fake delivery interrupted")
+
+                def key_sleep(seconds):
+                    """Cancel only the inert key hold while retaining the source's finally cleanup."""
+                    if failure == "cancel" and seconds == .005: raise RuntimeError("cancelled")
+                    sleep(seconds)
+
+                ns["_check_stop"] = check_stop
+                ns["_send_key_event"] = send_key
+                ns["time"].sleep = key_sleep
+                # The event constructor/post functions remain absent: dependency
+                # extraction binds only the existing held registry and fake sender.
+                load_functions("computer.py", {"_press_key_sync"}, ns)
+                if failure == "none":
+                    self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
+                else:
+                    with self.assertRaises(RuntimeError): self.run_helper(ns, references)
+                self.assertEqual(events, [(True, 36, 0, 123), (False, 36, 0, 123)])
+                self.assertEqual(ns["_held_inputs"], {})
+                self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
+                ns["_post"].assert_not_called()
+                ns["activate_app"].assert_not_called()
 
     def test_document_or_outer_panel_field_is_never_written(self):
         """Focused document text beginning with '/' is not evidence of a Go to Folder chooser."""
@@ -327,6 +521,7 @@ class OpenPanelTests(unittest.TestCase):
     def test_foreign_outer_panel_child_cannot_prove_chooser_closure(self):
         """Unrelated child ownership is unknown closure evidence and cannot authorize final Open."""
         ns, nodes, writes, references = open_namespace()
+        nodes[4]["actions"] = ["AXConfirm"]
         perform = ns["_ax_perform_action"]
 
         def action(element, name):
@@ -338,7 +533,7 @@ class OpenPanelTests(unittest.TestCase):
         ns["_ax_perform_action"] = action
         with self.assertRaisesRegex(RuntimeError, "did not close"):
             self.run_helper(ns, references)
-        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("AXConfirm", 5)])
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("AXConfirm", 4)])
 
     def test_missing_or_ambiguous_chooser_evidence_refuses_before_write(self):
         """Foreign ownership, missing prompt, duplicate fields and truncated walks all fail closed."""
@@ -494,6 +689,7 @@ class OpenPanelTests(unittest.TestCase):
         for failure in ("commit", "closure", "missing_children", "wide_children"):
             with self.subTest(failure=failure):
                 ns, nodes, writes, references = open_namespace()
+                nodes[4]["actions"] = ["AXConfirm"]
 
                 def perform(element, action):
                     """Leave the chooser unresolved or make closure evidence unavailable."""
@@ -524,6 +720,7 @@ class OpenPanelTests(unittest.TestCase):
     def test_closure_child_reads_respect_the_shared_deadline(self):
         """Many individually slow native child reads cannot multiply the closure timeout."""
         ns, nodes, writes, references = open_namespace()
+        nodes[4]["actions"] = ["AXConfirm"]
         perform = ns["_ax_perform_action"]
         read = ns["_ax_str"]
 
