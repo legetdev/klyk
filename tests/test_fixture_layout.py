@@ -10,12 +10,14 @@ from live_smoke import compact_layout_matches, fixture_environment, fixture_inpu
 class FixtureLayoutTests(unittest.TestCase):
     """Preserve all native controls and separate drag surfaces on the smaller runner desktop."""
 
-    def _state(self, *, receiver=False, moved=False):
-        """Represent measured frame and content bounds rather than driver response success."""
+    def _state(self, *, receiver=False, moved=False, y=20, height=628, visible_frame=None):
+        """Represent independent native bounds and an explicit synthetic usable screen area."""
         second=120 if receiver else 560 if moved else 540
-        return {'layout':'compact','windows':[
-            {'title':title,'x':x,'y':20,'width':400,'height':628,'content_width':400,'content_height':600}
-            for title,x in (('Klyk Fixture A',120),('Klyk Fixture B',second))]}
+        visible=visible_frame or {'x':0,'y':0,'width':1024,'height':700}
+        return {'layout':'compact','requested_y':20,'windows':[
+            {'id':index+1,'title':title,'visible':True,'x':x,'y':y,'width':400,'height':height,
+             'content_width':400,'content_height':600,'screen_visible_frame':dict(visible)}
+            for index,(title,x) in enumerate((('Klyk Fixture A',120),('Klyk Fixture B',second)))]}
 
     def test_compact_layout_keeps_controls_and_separate_cross_app_targets(self):
         """The moved source and overlapping receiver fit 1024 by 700 without sharing pixels."""
@@ -41,6 +43,47 @@ class FixtureLayoutTests(unittest.TestCase):
         state=self._state();state['windows'][1]['title']='Klyk Fixture A'
         self.assertFalse(compact_layout_matches(state))
         self.assertFalse(compact_layout_matches({'layout':'compact','windows':[]}))
+
+    def test_actual_native_y_adjustment_is_bounded_and_aligned(self):
+        """Recorded y83/frame632 can qualify with a real usable area, without guessing a clamp inset."""
+        visible={'x':0,'y':80,'width':1024,'height':664}
+        initial=self._state(y=83,height=632,visible_frame=visible)
+        moved=self._state(moved=True,y=83,height=632,visible_frame=visible)
+        receiver=self._state(receiver=True,y=83,height=632,visible_frame=visible)
+        self.assertTrue(compact_layout_matches(initial))
+        self.assertTrue(compact_layout_matches(moved,moved=True,aligned_y=83))
+        self.assertTrue(compact_layout_matches(receiver,receiver=True,aligned_y=83))
+        self.assertFalse(compact_layout_matches(initial,aligned_y=20))
+        # Cocoa may add an inset; containment and observed alignment decide qualification.
+        self.assertTrue(compact_layout_matches(self._state(y=85,height=632,visible_frame=visible)))
+        receiver['windows'][0]['y']=receiver['windows'][1]['y']=84
+        self.assertFalse(compact_layout_matches(receiver,receiver=True,aligned_y=83))
+
+    def test_unsafe_native_visible_area_identity_or_content_never_qualifies(self):
+        """Refuse clipped frames, arbitrary surfaces, duplicate IDs, missing area, and unequal origins."""
+        visible={'x':0,'y':83,'width':1024,'height':661}
+        for changes in ({'y':80},{'y':115},{'content_width':399},{'content_height':599},
+                        {'visible':False},{'id':1},{'x':float('nan')},{'height':float('inf')}):
+            state=self._state(y=83,height=632,visible_frame=visible)
+            state['windows'][1].update(changes)
+            with self.subTest(changes=changes):
+                self.assertFalse(compact_layout_matches(state))
+        state=self._state(y=83,height=632,visible_frame=visible)
+        state['windows'][1]['y']=84
+        self.assertFalse(compact_layout_matches(state))
+        for changes in ({'height':610},{'width':900},{'height':float('inf')},{'x':float('nan')}):
+            state=self._state(y=83,height=632,visible_frame=visible)
+            for window in state['windows']:window['screen_visible_frame'].update(changes)
+            with self.subTest(visible_area=changes):
+                self.assertFalse(compact_layout_matches(state))
+        state=self._state(y=83,height=632,visible_frame=visible)
+        state['windows'][1].pop('screen_visible_frame')
+        self.assertFalse(compact_layout_matches(state))
+        state=self._state(y=83,height=632,visible_frame=visible)
+        state['windows'][1]['screen_visible_frame']['y']=84
+        self.assertFalse(compact_layout_matches(state))
+        state=self._state();state['requested_y']=160
+        self.assertFalse(compact_layout_matches(state))
 
     def test_compact_children_receive_exact_isolated_geometry_flags(self):
         """Inherited overlap/offset cannot displace the primary or receiver in compact mode."""

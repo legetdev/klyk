@@ -205,13 +205,18 @@ print('{{"id":'+str(request['id'])+',{body}}}',flush=True)
                 self.client(source).start()
 
     def test_excessively_nested_protocol_json_raises_plain_error(self):
-        """An invalid deeply nested wire record must never escape as a traceback."""
+        """Decoder recursion failures become plain errors across interpreter limits."""
         source = '''import sys
 sys.stdin.readline()
 print('[' * 2000 + '0' + ']' * 2000,flush=True)
 '''
-        with self.assertRaisesRegex(KlykError, "excessively nested JSON"):
+        # CPython's accepted JSON depth varies by build. Exercise the decoder's
+        # failure path deterministically while still reading the complete pipe record.
+        with mock.patch("klyk.client.json.loads", side_effect=RecursionError("synthetic decoder limit")) as decoder, \
+             self.assertRaisesRegex(KlykError, "excessively nested JSON") as captured:
             self.client(source).start()
+        decoder.assert_called_once_with('[' * 2000 + '0' + ']' * 2000 + '\n')
+        self.assertNotIn("synthetic decoder limit", str(captured.exception))
 
     def test_nonfinite_request_is_rejected_without_writing_to_server(self):
         """Do not send nonstandard JSON numbers into the protocol error path."""

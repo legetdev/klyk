@@ -66,9 +66,11 @@ jobs:
         continue-on-error: true
         run: python -B tests/native_image_smoke.py --output .verification/native-image.json
       - name: Require the existing native fixture layout before any desktop suite
+        id: layout_probe
         if: env.FULL_SUITE == 'true'
         run: python -P -B tests/native_runner_probe.py --full-layout --output .verification/layout-probe.json
       - name: Fresh-installed doctor and real stdio connection
+        id: installed_smoke
         if: env.FULL_SUITE == 'true'
         shell: bash
         run: |
@@ -133,6 +135,7 @@ jobs:
               (root / '.verification/stdio.json').write_text(json.dumps(report, indent=2))
           PY
       - name: Verify and provision the existing Microsoft Electron fixture target
+        id: vscode_fixture
         if: env.FULL_SUITE == 'true'
         shell: bash
         run: |
@@ -168,10 +171,18 @@ jobs:
         if: env.FULL_SUITE == 'true'
         run: python -B tests/live_smoke.py --output .verification/native.json
       - name: Existing Chrome and Electron suite with disposable profiles
-        if: env.FULL_SUITE == 'true'
+        # Independent suites retain diagnostics after a native assertion fails.
+        if: >-
+          ${{ !cancelled() && env.FULL_SUITE == 'true' &&
+              steps.layout_probe.outcome == 'success' &&
+              steps.installed_smoke.outcome == 'success' &&
+              steps.vscode_fixture.outcome == 'success' }}
         run: python -B tests/desktop_smoke.py --output .verification/desktop.json
       - name: Existing overlapping-window background safety suite
-        if: env.FULL_SUITE == 'true'
+        if: >-
+          ${{ !cancelled() && env.FULL_SUITE == 'true' &&
+              steps.layout_probe.outcome == 'success' &&
+              steps.installed_smoke.outcome == 'success' }}
         shell: bash
         run: |
           # Fetch only the immutable in-repository benchmark baseline needed by this suite.

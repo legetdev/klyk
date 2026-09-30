@@ -2,6 +2,7 @@
 import argparse
 import base64
 import json
+import math
 import os
 from pathlib import Path
 import plistlib
@@ -35,16 +36,35 @@ def fixture_environment(state_path, *, receiver=False):
     return environment
 
 
-def compact_layout_matches(state, *, receiver=False, moved=False):
-    """Validate independently reported native bounds and unchanged control content dimensions."""
+def compact_layout_matches(state, *, receiver=False, moved=False, aligned_y=None):
+    """Require the fixed real surfaces/content to fit their independently reported usable screen."""
     windows=state.get('windows',[])
     expected={'Klyk Fixture A':120,'Klyk Fixture B':120 if receiver else 560 if moved else 540}
-    return state.get('layout')=='compact' and len(windows)==2 and {w.get('title') for w in windows}==set(expected) and all(
-        abs(window['x']-expected[window['title']])<=1 and abs(window['y']-20)<=1
-        and abs(window['width']-400)<=1 and abs(window['content_width']-400)<=1
-        and abs(window['content_height']-600)<=1 and 600<=window['height']<=650
-        for window in windows)
-
+    if (state.get('layout')!='compact' or state.get('requested_y')!=20 or len(windows)!=2
+            or {window.get('title') for window in windows}!=set(expected)):
+        return False
+    identities=[window.get('id') for window in windows]
+    if any(type(identity) is not int or identity<=0 for identity in identities) or len(set(identities))!=2:
+        return False
+    observed_y=windows[0].get('y') if aligned_y is None else aligned_y
+    if not isinstance(observed_y,(int,float)) or isinstance(observed_y,bool) or not math.isfinite(observed_y):
+        return False
+    for window in windows:
+        visible=window.get('screen_visible_frame')
+        if not isinstance(visible,dict):
+            return False
+        values=[window.get(key) for key in ('x','y','width','height','content_width','content_height')]
+        values.extend(visible.get(key) for key in ('x','y','width','height'))
+        if not all(isinstance(value,(int,float)) and not isinstance(value,bool) and math.isfinite(value) for value in values):
+            return False
+        if not (window.get('visible') is True and abs(window['x']-expected[window['title']])<=1
+                and window['y']==observed_y and window['width']==window['content_width']==400
+                and window['content_height']==600 and 600<window['height']<=650
+                and visible['width']>0 and visible['height']>0
+                and visible['x']<=window['x'] and window['x']+window['width']<=visible['x']+visible['width']
+                and visible['y']<=window['y'] and window['y']+window['height']<=visible['y']+visible['height']):
+            return False
+    return windows[0]['screen_visible_frame']==windows[1]['screen_visible_frame']
 
 
 def held_key_released(before, after, *, key_code=124):
@@ -76,7 +96,9 @@ def main():
     compact=os.environ.get('KLYK_FIXTURE_COMPACT')=='1'
     fixture=subprocess.Popen([str(binary)],env=fixture_environment(state),stdout=subprocess.DEVNULL,stderr=subprocess.PIPE)
     report={'fingerprint':fingerprint(),'environment':{'mcp':version('mcp'),'numpy':version('numpy'),'klyk':__import__('klyk').__version__,'swift':subprocess.check_output(['xcrun','swiftc','--version'],text=True).strip(),'python':sys.version,'macos':subprocess.check_output(['sw_vers','-productVersion'],text=True).strip()},'calls':[],'checks':[],
-            'fixture_layout':{'mode':'compact' if compact else 'default','bounds_coordinates':'Cocoa frame/content points; bottom-left origin'}}
+            'fixture_layout':{'mode':'compact' if compact else 'default','requested_y':20 if compact else 160,
+                              'bounds_coordinates':'Cocoa frame/content points; bottom-left origin',
+                              'placement_contract':'fixed surfaces and full content; aligned actual frames contained in each native NSScreen.visibleFrame'}}
     def check(name,condition):
         """Record an independent observable check before raising on failure."""
         report['checks'].append({'name':name,'passed':bool(condition)})
@@ -218,7 +240,7 @@ def main():
             check('explicit window moved',any(w['window_id']==target['window_id'] and abs(w['x']-target['x']-20)<3 for w in moved['windows']))
             report['fixture_layout']['primary_after_move']=current()['windows']
             if compact:
-                check('compact selected native window stays on right',compact_layout_matches(current(),moved=True))
+                check('compact selected native window stays on right',compact_layout_matches(current(),moved=True,aligned_y=report['fixture_layout']['primary_initial'][0]['y']))
             call(client,'focus_window',window_id=target['window_id'])
             # Test the actual save sheet and verify a file independently of the tool result.
             saved=work/'saved-fixture.txt'
@@ -265,7 +287,7 @@ def main():
             check('receiver started',settled(lambda:receiver_state.exists()))
             report['fixture_layout']['receiver_initial']=json.loads(receiver_state.read_text())['windows']
             if compact:
-                check('compact receiver native bounds stay on left',compact_layout_matches(json.loads(receiver_state.read_text()),receiver=True))
+                check('compact receiver native bounds stay on left',compact_layout_matches(json.loads(receiver_state.read_text()),receiver=True,aligned_y=report['fixture_layout']['primary_after_move'][0]['y']))
             call(client,'list_windows',app='Klyk Receiver',bundle_id='org.klyk.regression.receiver',app_path=str(receiver_bundle))
             from klyk import capture
             import Quartz

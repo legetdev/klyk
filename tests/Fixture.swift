@@ -154,10 +154,20 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             if response == .OK,let url=panel.url { self.opened=(try? String(contentsOf:url,encoding:.utf8)) ?? "";self.writeState() }
         }
     }
-    // Atomically expose fixture state for independent assertions without inspecting private apps.
+    // Atomically expose fixture state and the native usable screen area without inspecting private apps.
     func writeState() {
-        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive, "layout":compactLayout ? "compact" : "default", "clicks":clicks,"opened":opened,"selections":selections,"input_events":inputEvents,
-            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["id":$0.windowNumber,"title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height,"content_width":$0.contentView?.bounds.width ?? 0,"content_height":$0.contentView?.bounds.height ?? 0]}]
+        let frames: [[String: Any]] = windows.map { window in
+            let visible = window.screen?.visibleFrame ?? .zero
+            return ["id":window.windowNumber,"title":window.title,"visible":window.isVisible,
+                "x":window.frame.origin.x,"y":window.frame.origin.y,"width":window.frame.width,"height":window.frame.height,
+                "content_width":window.contentView?.bounds.width ?? 0,"content_height":window.contentView?.bounds.height ?? 0,
+                "screen_visible_frame":["x":visible.origin.x,"y":visible.origin.y,"width":visible.width,"height":visible.height]]
+        }
+        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive,
+            "layout":compactLayout ? "compact" : "default", "requested_y":compactLayout ? 20 : 160,
+            "clicks":clicks,"opened":opened,"selections":selections,"input_events":inputEvents,
+            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())},
+            "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops,"windows":frames]
         if let encoded = try? JSONSerialization.data(withJSONObject:data,options:[.sortedKeys]) { try? encoded.write(to:URL(fileURLWithPath:statePath),options:.atomic) }
     }
 }
