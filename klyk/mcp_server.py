@@ -721,7 +721,10 @@ TOOLS = [
             "`target_app` — when set, the target label is resolved inside that app's AX tree "
             "(klyk launches it if not running). Cross-app drags always go through the visible "
             "cursor path (SkyLight is PID-scoped), so background refuses cross-app drags before "
-            "launching or activating a target. The drag still works invisibly within the source "
+            "launching or activating a target. Before a visible cross-app mouse-down, system-wide "
+            "hit tests must match both intended apps and selected windows; covered or unknown "
+            "endpoints refuse without input. Uncover the windows and inspect again. "
+            "The drag still works invisibly within the source "
             "app in autonomous/background mode.\n"
             "\n"
             "`hover_seconds` (default 0) holds the mouse at the target, still pressed, before "
@@ -3674,6 +3677,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             await computer.drag(
                 sx1, sy1, sx2, sy2, hover_target_seconds=hover_seconds,
                 button=button, modifiers=modifiers,
+                **({'visible_targets':(
+                    (session.pid, None if getattr(session, 'windowless', False) else int(session.window_id)),
+                    (target_session.pid, None if getattr(target_session, 'windowless', False) else int(target_session.window_id)),
+                )} if cross_app else {}),
             )
             result = {
                 "ok": True,

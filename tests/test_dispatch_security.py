@@ -513,9 +513,40 @@ class DispatchSecurityTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.assertTrue(result["cross_app"])
         self.s.computer.drag.assert_awaited_once_with(10, 10, 110, 120, hover_target_seconds=0.0,
-                                                    button="right", modifiers=["alt"])
+                                                    button="right", modifiers=["alt"],
+                                                    visible_targets=((123, 7), (345, None)))
         self.assertEqual([c.kwargs for c in self.s.get_or_create_session.await_args_list],
                          [{}, {"allow_launch": False}, {"allow_launch": False}])
+
+    async def test_regular_cross_app_dispatch_reaches_visible_owner_guard_before_down(self):
+        """Exercise the actual native drag coroutine after source focus with a covered destination."""
+        from test_input_cleanup import load_functions
+        from test_input_security import core_namespace
+        target=SimpleNamespace(app='Receiver',pid=345,window_id=8,width=100,height=80,
+                               win_x=100,win_y=0,windowless=False,process_identity='receiver-token')
+        self.s.get_or_create_session=AsyncMock(return_value=(target,False))
+        self.s._resolve_label_in_window=AsyncMock(side_effect=[
+            {'ok':True,'via':'ax','elem':{'label':'A','x':10,'y':10,'width':20,'height':20}},
+            {'ok':True,'via':'ax','elem':{'label':'B','x':110,'y':10,'width':20,'height':20}},
+        ])
+        ns,events=core_namespace();hits=[]
+
+        def visible_hit(x,y,pid,window_id):
+            """A source activation cannot turn app-scoped destination evidence into visible ownership."""
+            self.s._focus_if_needed.assert_awaited_once()
+            self.s._ensure_key_delivery.assert_awaited_once()
+            hits.append((x,y,pid,window_id))
+            return pid==123
+
+        ns['ax_visible_target_at']=visible_hit
+        load_functions('computer.py',{'drag'},ns)
+        self.s.computer.drag=ns['drag']
+        result=payload(await self.s.call_tool('drag_to_element',{
+            'app':'Fixture','source_label':'A','target_label':'B','target_app':'Receiver',
+        }))
+        self.assertFalse(result['ok']);self.assertIn('No drag was sent',result['error'])
+        self.assertEqual(hits,[(10.0,10.0,123,7),(110.0,10.0,345,8)])
+        self.assertEqual(events,[]);self.assertEqual(ns['_held_inputs'],{})
 
     async def test_windowless_unknown_empty_changed_rect_and_process_refuse(self):
         """Windowless support never turns missing evidence into permission for a desktop drag."""

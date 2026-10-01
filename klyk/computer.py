@@ -2706,6 +2706,35 @@ def _ax_exact_window(pid: int, window_id: int) -> int:
     return _ax_window_for_cg_id(pid, window_id, win['x'], win['y'], win['width'], win['height'])
 
 
+def ax_visible_target_at(x: float, y: float, expected_pid: int, window_id: int | None = None) -> bool:
+    """Match the actual system-wide hit to the intended PID and exact window without input."""
+    _check_stop()
+    if (type(expected_pid) is not int or expected_pid <= 0
+            or (window_id is not None and (type(window_id) is not int or window_id <= 0))):
+        return False
+    element = _ax_element_at(x, y)
+    if not element:
+        return False
+    window = owner = 0
+    try:
+        if not _ax_matches_pid(element, expected_pid):
+            return False
+        if window_id is None:
+            return True  # Windowless targets still require their separate label/geometry/identity proof.
+        window = _ax_exact_window(expected_pid, window_id)
+        if not window:
+            return False
+        if _ax_str_attr(element, b'AXRole') == 'AXWindow':
+            return bool(_cf.CFEqual(ctypes.c_void_p(element), ctypes.c_void_p(window)))
+        owner = _ax_read_attr_ptr(element, b'AXWindow')
+        return bool(owner and _ax_matches_pid(owner, expected_pid)
+                    and _cf.CFEqual(ctypes.c_void_p(owner), ctypes.c_void_p(window)))
+    finally:
+        for reference in (owner, window, element):
+            if reference:
+                _cf.CFRelease(ctypes.c_void_p(reference))
+
+
 def _ax_element_at(x: float, y: float, expected_pid: int | None = None,
                    window_id: int | None = None, expected_label: str | None = None) -> int:
     """Resolve within the requested window, including when another window covers it.
@@ -3700,6 +3729,7 @@ async def drag(
     *,
     button: str = "left",
     modifiers: list[str] | None = None,
+    visible_targets: tuple[tuple[int, int | None], tuple[int, int | None]] | None = None,
 ) -> None:
     """
     Drag from (x1, y1) to (x2, y2) with smooth intermediate events.
@@ -3722,6 +3752,18 @@ async def drag(
         else:
             raise ValueError("Drag button must be left or right; no input was sent.")
         flags = _modifier_flags(modifiers)
+
+        if visible_targets is not None:
+            if len(visible_targets) != 2:
+                raise ValueError('A visible drag requires both endpoint identities; no drag was sent.')
+            def verify_visible_targets():
+                """Refuse covered or unknown endpoint owners while the input lock is held."""
+                for name, point, target in zip(('source', 'destination'), (src, dst), visible_targets):
+                    if not ax_visible_target_at(point.x, point.y, target[0], target[1]):
+                        raise RuntimeError(f'Drag {name} is covered or its visible window cannot be verified; '
+                                           'uncover the intended windows and inspect them again. No drag was sent.')
+            await run_input(verify_visible_targets)
+            _check_stop()
 
         last_point = [src]
         token = ("mouse", None, btn)

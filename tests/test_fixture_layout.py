@@ -114,6 +114,45 @@ class FixtureLayoutTests(unittest.TestCase):
                 self.assertFalse(eval(expression,bindings))
                 receiver['windows'][1]=original
 
+    def test_file_panel_shift_restores_both_source_windows_before_receiver(self):
+        """Execute the actual inert placement block so activation cannot cover the later receiver."""
+        tree=ast.parse(Path(__file__).with_name('live_smoke.py').read_text())
+        block=next(node for node in ast.walk(tree) if isinstance(node,ast.If)
+                   and any(isinstance(child,ast.Constant)
+                           and child.value=='compact source windows stay on right after file panels'
+                           for child in ast.walk(node)))
+        state=self._state(moved=True,y=83,height=632,
+                          visible_frame={'x':0,'y':60,'width':1024,'height':677})
+        state['windows'][1]['x']=384
+        self.assertFalse(compact_layout_matches(state,source_on_right=True))
+        observed=[{'window_id':2,'x':384,'y':53,'width':400,'height':632},
+                  {'window_id':1,'x':120,'y':53,'width':400,'height':632}]
+        calls=[];report={'fixture_layout':{}}
+
+        def call(_client,tool,**arguments):
+            """Apply only inert window geometry while recording exact selected-window ordering."""
+            calls.append((tool,arguments))
+            if tool=='list_windows':return {'windows':observed}
+            self.assertEqual(tool,'set_window_bounds')
+            self.assertEqual({key:arguments[key] for key in ('x','y','width','height')},
+                             {'x':560,'y':53,'width':400,'height':632})
+            state['windows'][arguments['window_id']-1]['x']=arguments['x']
+
+        bindings={'compact':True,'call':call,'client':None,'target':{'window_id':2},
+                  'report':report,'current':lambda:state,'compact_layout_matches':compact_layout_matches,
+                  'check':lambda _name,condition:self.assertTrue(condition)}
+        exec(compile(ast.Module(body=[block],type_ignores=[]),'inert_source_placement','exec'),bindings)
+        self.assertEqual([arguments['window_id'] for tool,arguments in calls if tool=='set_window_bounds'],[1,2])
+        self.assertEqual(report['fixture_layout']['primary_before_receiver'],state['windows'])
+        self.assertTrue(compact_layout_matches(state,source_on_right=True))
+        for window in state['windows']:self.assertGreater(window['x'],120+400)
+        for changes in ({'x':120},{'x':384},{'id':1},{'content_height':599},{'y':59}):
+            with self.subTest(changes=changes):
+                original=dict(state['windows'][1]);state['windows'][1].update(changes)
+                self.assertFalse(compact_layout_matches(state,source_on_right=True))
+                state['windows'][1]=original
+        self.assertFalse(compact_layout_matches(state,receiver=True,source_on_right=True))
+
     def test_compact_children_receive_exact_isolated_geometry_flags(self):
         """Inherited overlap/offset cannot displace the primary or receiver in compact mode."""
         with patch.dict(os.environ,{'KLYK_FIXTURE_COMPACT':'1','KLYK_FIXTURE_OFFSET':'999','KLYK_FIXTURE_OVERLAP':'1'}):

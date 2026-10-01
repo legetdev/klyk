@@ -36,10 +36,13 @@ def fixture_environment(state_path, *, receiver=False):
     return environment
 
 
-def compact_layout_matches(state, *, receiver=False, moved=False, aligned_y=None):
+def compact_layout_matches(state, *, receiver=False, moved=False, source_on_right=False, aligned_y=None):
     """Require the fixed real surfaces/content to fit their independently reported usable screen."""
     windows=state.get('windows',[])
-    expected={'Klyk Fixture A':120,'Klyk Fixture B':120 if receiver else 560 if moved else 540}
+    if receiver and source_on_right:
+        return False
+    expected={'Klyk Fixture A':560 if source_on_right else 120,
+              'Klyk Fixture B':120 if receiver else 560 if moved or source_on_right else 540}
     if (state.get('layout')!='compact' or state.get('requested_y')!=20 or len(windows)!=2
             or {window.get('title') for window in windows}!=set(expected)):
         return False
@@ -575,6 +578,15 @@ def main():
             call(client,'get_logs');call(client,'get_escalation_log');call(client,'list_sessions');call(client,'resume')
             verdict=call(client,'verdict',test_description='Fixture actions independently verified')
             check('verdict discloses unverified evidence','UNVERIFIED' in verdict.get('instruction',''))
+            if compact:
+                # File sheets can move their parent; keep every source-app window clear of the receiver.
+                drag_windows=call(client,'list_windows')['windows']
+                for window in sorted(drag_windows,key=lambda window:window['window_id']==target['window_id']):
+                    call(client,'set_window_bounds',window_id=window['window_id'],x=560,y=window['y'],
+                         width=window['width'],height=window['height'])
+                report['fixture_layout']['primary_before_receiver']=current()['windows']
+                check('compact source windows stay on right after file panels',
+                      compact_layout_matches(current(),source_on_right=True))
             # Cross-app delivery and invisible background behavior use a second
             # instance with its own bundle identity and independent state file.
             receiver_bundle=work/'Receiver.app';receiver_binary=receiver_bundle/'Contents/MacOS/Receiver'
@@ -600,6 +612,24 @@ def main():
             refused=call(client,'long_press',**button,duration=.1)
             check('background visible input refused',refused.get('requires_foreground'))
             call(client,'set_mode',mode='autonomous')
+            if compact:
+                # Prove actual occlusion refuses before input, then restore the valid separate surfaces.
+                cover_window=next(window for window in call(client,'list_windows')['windows']
+                                  if window['window_id']==target['window_id'])
+                call(client,'set_window_bounds',window_id=target['window_id'],x=120,y=cover_window['y'],
+                     width=cover_window['width'],height=cover_window['height'])
+                call(client,'focus_window',window_id=target['window_id'])
+                source_before=current();receiver_before=json.loads(receiver_state.read_text())
+                covered=call(client,'drag_to_element',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
+                check('covered cross-app drag refuses without native input',covered.get('ok') is False
+                      and 'Drag destination' in covered.get('error','')
+                      and fixture_input_unchanged(source_before,current())
+                      and fixture_input_unchanged(receiver_before,json.loads(receiver_state.read_text())))
+                call(client,'set_window_bounds',window_id=target['window_id'],x=560,y=cover_window['y'],
+                     width=cover_window['width'],height=cover_window['height'])
+                report['fixture_layout']['primary_after_covered_drag']=current()['windows']
+                check('compact source windows restored after covered drag',
+                      compact_layout_matches(current(),source_on_right=True))
             dropped=call(client,'drag_to_element',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
             check('cross-app drop independently received',dropped.get('ok') and settled(lambda:'Klyk drag payload' in json.loads(receiver_state.read_text())['drops']))
             # A second real MCP connection can take control; blocked clients must
