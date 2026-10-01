@@ -95,8 +95,8 @@ def open_namespace():
         nodes[1]["focused"] = 0
         return True
 
-    def press_key(keycode, flags, pid):
-        """Record a PID-scoped primary Return without constructing or posting any native event."""
+    def press_key(keycode, flags, pid=None):
+        """Record the primary foreground Return without constructing or posting any native event."""
         writes.append(("Return", keycode, flags, pid))
         nodes[3]["children"].remove(4)
         nodes[1]["focused"] = 0
@@ -139,9 +139,9 @@ class OpenPanelTests(unittest.TestCase):
         """The actual macOS field needs chooser identity, not a preexisting slash-prefixed value."""
         ns, nodes, writes, references = open_namespace()
         self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
-        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, 123)])
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, None)])
         ns["_check_frontmost"].assert_called_once_with(123)
-        ns["_press_key_sync"].assert_called_once_with(36, 0, 123)
+        ns["_press_key_sync"].assert_called_once_with(36, 0)
         ns["_post"].assert_not_called()
         ns["activate_app"].assert_not_called()
 
@@ -166,7 +166,7 @@ class OpenPanelTests(unittest.TestCase):
 
                 ns["_ax_set_value"] = set_value
                 self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
-                effect = (("Return", 36, 0, 123) if confirmation == "primary"
+                effect = (("Return", 36, 0, None) if confirmation == "primary"
                           else ("AXConfirm", 4) if confirmation == "chooser" else ("AXPress", 9))
                 self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), effect])
 
@@ -338,12 +338,12 @@ class OpenPanelTests(unittest.TestCase):
     def test_unclosed_primary_chooser_never_receives_a_second_return(self):
         """An acknowledged event with unproved closure is terminal, never another keyboard/native attempt."""
         ns, nodes, writes, references = open_namespace()
-        ns["_press_key_sync"].side_effect = lambda keycode, flags, pid: writes.append(("Return", keycode, flags, pid))
+        ns["_press_key_sync"].side_effect = lambda keycode, flags, pid=None: writes.append(("Return", keycode, flags, pid))
         ns["_ax_perform_action"] = MagicMock(side_effect=AssertionError("Native retry is forbidden"))
         with self.assertRaisesRegex(RuntimeError, "did not close"):
             self.run_helper(ns, references)
-        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, 123)])
-        ns["_press_key_sync"].assert_called_once_with(36, 0, 123)
+        self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt"), ("Return", 36, 0, None)])
+        ns["_press_key_sync"].assert_called_once_with(36, 0)
         ns["_ax_perform_action"].assert_not_called()
 
     def test_primary_return_uses_balanced_extracted_key_cleanup(self):
@@ -383,7 +383,7 @@ class OpenPanelTests(unittest.TestCase):
                     self.assertEqual(self.run_helper(ns, references), "/tmp/requested-file.txt")
                 else:
                     with self.assertRaises(RuntimeError): self.run_helper(ns, references)
-                self.assertEqual(events, [(True, 36, 0, 123), (False, 36, 0, 123)])
+                self.assertEqual(events, [(True, 36, 0, None), (False, 36, 0, None)])
                 self.assertEqual(ns["_held_inputs"], {})
                 self.assertEqual(writes, [("value", 5, "/tmp/requested-file.txt")])
                 ns["_post"].assert_not_called()

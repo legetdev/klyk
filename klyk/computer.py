@@ -1878,7 +1878,8 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
                 and field_actions is not None and "AXConfirm" in field_actions
                 and field_actions <= {"AXConfirm", "AXShowMenu"}):
             # The standard field's AXConfirm accepts editing without closing
-            # its chooser. Choose one primary PID Return before the path write.
+            # its chooser. Choose one primary foreground Return before the path
+            # write: host-PID delivery reaches the app without submitting this sheet.
             target, action = field, b"AXConfirm"
         if not target:
             raise RuntimeError("The Go to Folder chooser has no accessible confirmation action; no path was typed.")
@@ -1934,7 +1935,7 @@ def ax_navigate_open_panel(pid: int, path: str) -> str | None:
             raise RuntimeError("The Go to Folder target changed owner after the path write; inspect the dialog before continuing.")
         if keyboard:
             _check_stop()
-            _press_key_sync(36, 0, pid)
+            _press_key_sync(36, 0)
         elif not _ax_perform_action(target, action):
             raise RuntimeError("The Go to Folder confirmation could not be verified; inspect the dialog before continuing.")
 
