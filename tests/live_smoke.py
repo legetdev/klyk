@@ -586,7 +586,7 @@ def main():
             check('receiver started',settled(lambda:receiver_state.exists()))
             report['fixture_layout']['receiver_initial']=json.loads(receiver_state.read_text())['windows']
             if compact:
-                check('compact receiver native bounds stay on left',compact_layout_matches(json.loads(receiver_state.read_text()),receiver=True,aligned_y=report['fixture_layout']['primary_after_move'][0]['y']))
+                check('compact receiver native bounds stay on left',compact_layout_matches(json.loads(receiver_state.read_text()),receiver=True))
             call(client,'list_windows',app='Klyk Receiver',bundle_id='org.klyk.regression.receiver',app_path=str(receiver_bundle))
             from klyk import capture
             import Quartz

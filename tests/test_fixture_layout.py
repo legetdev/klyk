@@ -1,6 +1,10 @@
 """Check compact fixture geometry and process environments without constructing native windows."""
 
+import ast
+import json
 import os
+from pathlib import Path
+from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
@@ -84,6 +88,31 @@ class FixtureLayoutTests(unittest.TestCase):
         self.assertFalse(compact_layout_matches(state))
         state=self._state();state['requested_y']=160
         self.assertFalse(compact_layout_matches(state))
+
+    def test_receiver_check_uses_its_own_current_screen_frame(self):
+        """A changed usable screen between launches cannot impose the primary's historical y on the receiver."""
+        tree=ast.parse(Path(__file__).with_name('live_smoke.py').read_text())
+        check=next(node for node in ast.walk(tree) if isinstance(node,ast.Call)
+                   and isinstance(node.func,ast.Name) and node.func.id=='check'
+                   and node.args and isinstance(node.args[0],ast.Constant)
+                   and node.args[0].value=='compact receiver native bounds stay on left')
+        primary=self._state(moved=True,y=83,height=632,
+                            visible_frame={'x':0,'y':63,'width':1024,'height':674})
+        receiver=self._state(receiver=True,y=80,height=632,
+                             visible_frame={'x':0,'y':60,'width':1024,'height':677})
+        self.assertTrue(compact_layout_matches(primary,moved=True,aligned_y=83))
+        self.assertFalse(compact_layout_matches(receiver,receiver=True,aligned_y=83))
+        expression=compile(ast.Expression(check.args[1]),'inert_receiver_layout','eval')
+        bindings={'compact_layout_matches':compact_layout_matches,'json':json,
+                  'receiver_state':SimpleNamespace(read_text=lambda:json.dumps(receiver)),
+                  'report':{'fixture_layout':{'primary_after_move':primary['windows']}}}
+        self.assertTrue(eval(expression,bindings))
+        for changes in ({'y':79},{'y':59},{'x':540},{'content_height':599},{'id':1}):
+            with self.subTest(changes=changes):
+                original=dict(receiver['windows'][1])
+                receiver['windows'][1].update(changes)
+                self.assertFalse(eval(expression,bindings))
+                receiver['windows'][1]=original
 
     def test_compact_children_receive_exact_isolated_geometry_flags(self):
         """Inherited overlap/offset cannot displace the primary or receiver in compact mode."""
