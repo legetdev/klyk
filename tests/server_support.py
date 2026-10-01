@@ -7,6 +7,7 @@ import ast
 import asyncio
 import base64
 from collections import deque
+from contextvars import ContextVar
 import difflib
 import json
 import logging
@@ -17,7 +18,7 @@ import traceback
 import types as python_types
 import unicodedata
 import uuid
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import jsonschema
 from mcp import types
@@ -36,6 +37,10 @@ def load_server():
     for name in ('computer', 'capture', 'skylight', 'ownership', 'registry', 'activity',
                  'window_labels', 'reporter_mod', 'ocr', 'matcher', '_ui'):
         setattr(module, name, MagicMock())
+    async def run_input(function):
+        """Execute the controlled native boundary without spawning a desktop worker."""
+        return function()
+    module.computer.run_input = AsyncMock(side_effect=run_input)
     module._BROWSER_INTERACTIVE_ROLES = set()
     module._INTERACTIVE_ROLES = set()
     module.is_browser = lambda app: False
@@ -44,8 +49,8 @@ def load_server():
     names = {'_HYPHEN_VARIANTS', '_SERVER_INSTRUCTIONS', '_APP_PARAM', '_APP_LAUNCH_PARAMS', '_CONFIRM_DESTRUCTIVE',
              '_WINDOW_ID_PARAM', '_VERIFY_PARAM', 'TOOLS', '_last_response_time', '_call_depth',
              '_HINT_HISTORY_CAP', '_call_history', '_BATCHABLE_ACTIONS', '_OBSERVATION_TOOLS',
-             '_POST_ACTION_SETTLE_MS', '_PASSIVE_SETTLE_MS', '_last_action_mutated',
-             '_OWNERSHIP_EXEMPT', '_chromium_based_cache'}
+             '_POST_ACTION_SETTLE_MS',
+             '_OWNERSHIP_EXEMPT', '_chromium_based_cache', '_call_lock', '_call_context'}
     nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

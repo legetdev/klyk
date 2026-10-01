@@ -6,15 +6,15 @@ import ctypes
 import os
 import signal
 import subprocess
+import sys
 import time
 
 # Chromium-family browsers. When Klyk launches one of these, it appends
 # --force-renderer-accessibility so the AX tree exposes web content
 # (buttons, links, fields inside pages) — not just the chrome around tabs.
 # Only takes effect when Klyk launches the browser cold; if the user
-# already has it running, the flag is a no-op until they restart. The
-# `was_already_running` return from launch_native_app surfaces this so
-# callers can warn the agent that AX is likely empty for web content.
+# already has it running, attachment preserves that configuration. Inspection
+# reports the AX content actually available instead of assuming it is empty.
 CHROMIUM_BROWSERS = {
     "Google Chrome", "Google Chrome Canary", "Google Chrome Beta", "Google Chrome Dev",
     "Chromium", "Brave Browser", "Microsoft Edge", "Arc", "Vivaldi", "Opera",
@@ -132,69 +132,49 @@ def probe_web_ax_alive(pid: int) -> bool:
 
 
 def _validate_app_identifier(value: str, field: str) -> None:
-    """
-    Reject control characters and AppleScript-quote-breaking characters in
-    values that will be interpolated into an osascript string. Defense in
-    depth alongside _as_quote(): even if escaping ever regresses, control
-    characters (newline / CR / NUL) and embedded double-quote / backslash
-    chains can't slip into the AppleScript layer.
-    """
+    """Reject empty, excessive or control-containing application identifiers."""
     if not value or len(value) > 256:
         raise ValueError(f"{field} must be 1–256 chars (got {len(value)}).")
     if any(ch in value for ch in ('\n', '\r', '\0')):
         raise ValueError(f"{field} contains control characters: {value!r}")
 
 
-def _as_quote(value: str) -> str:
-    """
-    Escape a string for safe interpolation inside double-quoted AppleScript.
-    Inside AS double-quoted literals the only meta-characters are `\\` and
-    `\"`. Escape both. Together with `_validate_app_identifier`, this closes
-    the AppleScript-injection surface in the PID-lookup path.
-    """
-    return value.replace('\\', '\\\\').replace('"', '\\"')
-
-
 def _quick_pid_for_app(bundle_id: str | None, app_name: str | None) -> int | None:
-    """Single-attempt PID lookup, ~50 ms. Returns None if app isn't running."""
-    try:
-        if bundle_id:
-            _validate_app_identifier(bundle_id, "bundle_id")
-            script = (
-                f'tell application "System Events" to '
-                f'get unix id of first process whose bundle identifier is "{_as_quote(bundle_id)}"'
-            )
-        elif app_name:
-            _validate_app_identifier(app_name, "app_name")
-            script = (
-                f'tell application "System Events" to '
-                f'get unix id of first process whose name is "{_as_quote(app_name)}"'
-            )
-        else:
-            return None
-        result = subprocess.run(
-            ["osascript", "-e", script],
-            capture_output=True, text=True, timeout=2,
-        )
-        if result.returncode == 0 and result.stdout.strip().isdigit():
-            return int(result.stdout.strip())
-    except (subprocess.TimeoutExpired, ValueError, OSError):
+    """Query native running apps; an uncertain lookup must never relaunch an existing app."""
+    if not bundle_id and not app_name:
         return None
-    return None
+    _validate_app_identifier(bundle_id or app_name, "bundle_id" if bundle_id else "app_name")
+    try:
+        from AppKit import NSRunningApplication, NSWorkspace
+        if bundle_id:
+            apps = NSRunningApplication.runningApplicationsWithBundleIdentifier_(bundle_id)
+        else:
+            name = app_name.casefold().removesuffix(".app")
+            apps = [app for app in NSWorkspace.sharedWorkspace().runningApplications()
+                    if str(app.localizedName() or "").casefold() == name
+                    or (app.bundleURL() is not None and
+                        str(app.bundleURL().lastPathComponent()).casefold().removesuffix(".app") == name)]
+        pids = {int(app.processIdentifier()) for app in apps
+                if not app.isTerminated() and int(app.processIdentifier()) > 0}
+    except Exception as error:
+        raise RuntimeError('Could not check running applications; app identity is unknown. Inspect the target before retrying.') from error
+    if len(pids) > 1:
+        raise RuntimeError('More than one running application matches; use a unique app name or bundle identifier.')
+    return next(iter(pids), None)
 
 
 def launch_native_app(
     app_name: str | None = None,
     bundle_id: str | None = None,
+    *,
+    check_stop=None,
 ) -> tuple[int, bool]:
     """
     Launch a native macOS app. Returns (pid, was_already_running).
 
-    was_already_running=True means the app was running before Klyk called
-    `open -a`, so the --force-renderer-accessibility flag for Chromium browsers
-    was silently ignored. In practice Chromium's lazy a11y still enables on
-    first external query (klyk auto-retries the inspect AX walk if it comes
-    back empty on a browser), so the agent rarely sees an empty tree.
+    Attach to a running app without opening or activating it. Cold Chromium
+    launches request renderer accessibility; already-running browsers retain
+    their current configuration and inspection reports the observed AX state.
     """
     prior_pid = _quick_pid_for_app(bundle_id, app_name)
     was_already_running = prior_pid is not None
@@ -203,18 +183,20 @@ def launch_native_app(
         # Electron apps launched with an isolated user-data directory).
         return prior_pid, True
 
+    if check_stop is not None:
+        check_stop()
     if bundle_id:
-        subprocess.Popen(["open", "-b", bundle_id])
+        subprocess.Popen(["/usr/bin/open", "-b", bundle_id])
     elif app_name:
-        cmd = ["open", "-a", app_name]
+        cmd = ["/usr/bin/open", "-a", app_name]
         if app_name in CHROMIUM_BROWSERS and not was_already_running:
             cmd += ["--args", "--force-renderer-accessibility"]
         subprocess.Popen(cmd)
     else:
         raise ValueError("Either app_name or bundle_id must be provided")
 
-    # Give a cold launch time to register before querying System Events.
-    time.sleep(1.0)
+    # Return as soon as native process registration is visible; session creation
+    # independently waits for a window instead of imposing a blind launch delay.
     pid = _find_pid_for_app(bundle_id=bundle_id, app_name=app_name)
     return pid, False
 
@@ -222,14 +204,14 @@ def launch_native_app(
 def start_native_log_stream(pid: int) -> subprocess.Popen:
     """Start a log stream watcher for a native app's unified log output. Returns the Popen."""
     return subprocess.Popen(
-        ["log", "stream", "--predicate", f"processID == {pid}",
+        ["/usr/bin/log", "stream", "--predicate", f"processID == {pid}",
          "--level", "default", "--style", "compact"],
         stdout=subprocess.PIPE,
         stderr=subprocess.DEVNULL,
     )
 
 
-def launch_electron_app(app_path: str) -> tuple[int, subprocess.Popen]:
+def launch_electron_app(app_path: str, *, check_stop=None) -> tuple[int, subprocess.Popen]:
     """
     Launch an Electron .app bundle.
     Returns (pid, proc) where proc.stderr is a pipe for log capture.
@@ -237,6 +219,8 @@ def launch_electron_app(app_path: str) -> tuple[int, subprocess.Popen]:
     if not os.path.exists(app_path):
         raise FileNotFoundError(f"App not found: {app_path}")
     executable = _find_app_executable(app_path)
+    if check_stop is not None:
+        check_stop()
     proc = subprocess.Popen([executable], stderr=subprocess.PIPE)
     time.sleep(1.5)
     return proc.pid, proc
@@ -247,32 +231,16 @@ def _find_pid_for_app(
     app_name: str | None,
     timeout: float = 10.0,
 ) -> int:
-    """Find PID of a running app by bundle ID or name via osascript."""
-    import time as _time
-    deadline = _time.time() + timeout
-    while _time.time() < deadline:
-        try:
-            if bundle_id:
-                _validate_app_identifier(bundle_id, "bundle_id")
-                script = (
-                    f'tell application "System Events" to '
-                    f'get unix id of first process whose bundle identifier is "{_as_quote(bundle_id)}"'
-                )
-            else:
-                _validate_app_identifier(app_name or "", "app_name")
-                script = (
-                    f'tell application "System Events" to '
-                    f'get unix id of first process whose name is "{_as_quote(app_name or "")}"'
-                )
-            result = subprocess.run(
-                ["osascript", "-e", script],
-                capture_output=True, text=True, timeout=5,
-            )
-            if result.returncode == 0 and result.stdout.strip().isdigit():
-                return int(result.stdout.strip())
-        except (subprocess.TimeoutExpired, ValueError):
-            pass
-        _time.sleep(0.5)
+    """Wait only for native process registration, preserving lookup errors and ambiguity."""
+    deadline = time.monotonic() + max(0.0, timeout)
+    while True:
+        pid = _quick_pid_for_app(bundle_id, app_name)
+        if pid is not None:
+            return pid
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            break
+        time.sleep(min(0.1, remaining))
     raise RuntimeError(
         f"Could not find PID for app (bundle_id={bundle_id!r}, name={app_name!r}). "
         "Likely causes: app isn't installed in /Applications, the bundle id is "
@@ -307,7 +275,99 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
-def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
+class _ProcessInfo(ctypes.Structure):
+    """Public macOS proc_bsdinfo layout, including microsecond process start identity."""
+
+    _fields_ = [(name, ctypes.c_uint32) for name in (
+        "flags", "status", "xstatus", "pid", "ppid", "uid", "gid", "ruid", "rgid", "svuid", "svgid", "reserved")]
+    _fields_ += [("comm", ctypes.c_char * 16), ("name", ctypes.c_char * 32)]
+    _fields_ += [(name, ctypes.c_uint32) for name in ("nfiles", "pgid", "jobc", "tdev", "tpgid")]
+    _fields_ += [("nice", ctypes.c_int32), ("start_sec", ctypes.c_uint64), ("start_usec", ctypes.c_uint64)]
+
+
+def _process_argv(pid: int) -> list[str] | None:
+    """Read exact kernel argv boundaries without returning any process environment values."""
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sysctl.restype = ctypes.c_int
+    libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid.
+    length = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(length), None, 0) != 0 or not 5 <= length.value <= 1024 * 1024:
+        return None
+    data = ctypes.create_string_buffer(length.value)
+    if libc.sysctl(mib, 3, data, ctypes.byref(length), None, 0) != 0:
+        return None
+    raw = data.raw[:length.value]
+    argc = int.from_bytes(raw[:4], sys.byteorder, signed=True)
+    path_end = raw.find(b"\0", 4)
+    if not 1 <= argc <= 4096 or path_end < 0:
+        return None
+    offset = path_end + 1
+    # The executable path is followed by padding before the argv[0] string.
+    while offset < len(raw) and raw[offset] == 0:
+        offset += 1
+    arguments = []
+    for _ in range(argc):
+        end = raw.find(b"\0", offset)
+        if end < 0:
+            return None
+        arguments.append(raw[offset:end].decode("utf-8", "strict"))
+        offset = end + 1
+    return arguments
+
+
+def process_identity(pid: int, *, include_command: bool = False) -> dict | None:
+    """Read a process start token without activating apps; optional command data stays internal."""
+    if sys.platform != "darwin" or not isinstance(pid, int) or pid <= 1:
+        return None
+    try:
+        libproc = ctypes.CDLL("/usr/lib/libproc.dylib")
+        libproc.proc_pidinfo.restype = ctypes.c_int
+        libproc.proc_pidinfo.argtypes = [ctypes.c_int, ctypes.c_int, ctypes.c_uint64, ctypes.c_void_p, ctypes.c_int]
+        info = _ProcessInfo()
+        if libproc.proc_pidinfo(pid, 3, 0, ctypes.byref(info), ctypes.sizeof(info)) != ctypes.sizeof(info):
+            return None
+        if info.pid != pid or not info.start_sec:
+            return None
+        identity = {"pid": pid, "uid": int(info.uid), "started": (int(info.start_sec), int(info.start_usec))}
+        if include_command:
+            libproc.proc_pidpath.restype = ctypes.c_int
+            libproc.proc_pidpath.argtypes = [ctypes.c_int, ctypes.c_void_p, ctypes.c_uint32]
+            path = ctypes.create_string_buffer(4096)
+            if libproc.proc_pidpath(pid, path, len(path)) <= 0:
+                return None
+            arguments = _process_argv(pid)
+            if arguments is None:
+                return None
+            identity["executable"] = path.value.decode("utf-8", "strict")
+            identity["argv"] = arguments
+            # The command must belong to the same process observed before the read.
+            current = process_identity(pid)
+            if current != {key: identity[key] for key in ("pid", "uid", "started")}:
+                return None
+        return identity
+    except (OSError, ValueError, UnicodeError, AttributeError):
+        return None
+
+
+def _same_process(pid: int, expected_identity: dict) -> bool:
+    """Compare the stable token rather than trusting a PID that the OS may have reused."""
+    current = process_identity(pid)
+    return bool(current and all(current.get(key) == expected_identity.get(key) for key in ("pid", "uid", "started")))
+
+
+def _process_status(pid: int, expected_identity: dict) -> str:
+    """Separate a vanished original process from a failed identity lookup."""
+    current = process_identity(pid)
+    if current is None:
+        return "unknown" if pid_alive(pid) else "gone"
+    if all(current.get(key) == expected_identity.get(key) for key in ("pid", "uid", "started")):
+        return "same"
+    return "gone"
+
+
+def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dict | None = None) -> bool:
     """
     Best-effort terminate. Sends SIGTERM, polls up to `term_timeout` seconds,
     escalates to SIGKILL if still alive, then verifies. Returns True iff the
@@ -318,6 +378,12 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
     """
     if not pid or pid <= 1:
         return False
+    expected_identity = expected_identity or process_identity(pid)
+    if expected_identity is None:
+        return not pid_alive(pid)
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -329,6 +395,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
 
     deadline = time.monotonic() + term_timeout
     while time.monotonic() < deadline:
+        status = _process_status(pid, expected_identity)
+        if status != "same":
+            return status == "gone"  # Never signal a replacement or an unknown process.
         try:
             os.kill(pid, 0)
         except ProcessLookupError:
@@ -338,6 +407,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
         time.sleep(0.1)
 
     # SIGTERM ignored — escalate.
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:
@@ -347,6 +419,9 @@ def terminate_pid(pid: int, term_timeout: float = 3.0) -> bool:
 
     # Final verification.
     time.sleep(0.2)
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
     try:
         os.kill(pid, 0)
     except ProcessLookupError:

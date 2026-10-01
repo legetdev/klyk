@@ -241,12 +241,8 @@ def _stamp_mouse_event(
     ev_p = c_void_p(ev)
     _stamp_routing(ev, pid, window_id)
     _cg.CGEventSetDoubleValueField(ev_p, _FIELD_EVENT_PRESSURE, c_double(1.0 if is_down else 0.0))
-    if click_state != 1:
-        # Default click_state on a freshly-created event is 1; only stamp
-        # when the caller wants 2 (double) or higher.
-        _cg.CGEventSetIntegerValueField(ev_p, _FIELD_MOUSE_EVENT_CLICK_STATE, c_int64(click_state))
-    if modifier_flags:
-        _cg.CGEventSetFlags(ev_p, c_uint64(modifier_flags))
+    _cg.CGEventSetIntegerValueField(ev_p, _FIELD_MOUSE_EVENT_CLICK_STATE, c_int64(click_state))
+    _cg.CGEventSetFlags(ev_p, c_uint64(modifier_flags))
     # Window-local point via the private SkyLight stamper. Top-left origin —
     # klyk's convention everywhere else. The NSView callback re-reports it
     # in bottom-left coords but the routing layer interprets top-left.
@@ -277,8 +273,27 @@ def _post_event(pid: int, ev: int) -> None:
 
 
 def _release(ev: int) -> None:
+    """Balance the caller's retained native event after every delivery outcome."""
     if ev:
         _cf.CFRelease(c_void_p(ev))
+
+
+def _check_stop() -> None:
+    """Share the input worker's cancellation and physical-stop checkpoints."""
+    from .computer import _check_stop as check
+    check()
+
+
+def _begin_input(token, press, release) -> None:
+    """Register invisible button release in the same exit cleanup registry as visible input."""
+    from .computer import _begin_input as begin
+    begin(token, press, release)
+
+
+def _finish_input(token) -> None:
+    """Release an invisible button exactly once, including after worker cancellation."""
+    from .computer import _finish_input as finish
+    finish(token)
 
 
 def _post_stamped_pair(
@@ -299,11 +314,16 @@ def _post_stamped_pair(
     ev_down = _cg.CGEventCreateMouseEvent(None, down_type, placeholder, btn_index)
     ev_up   = _cg.CGEventCreateMouseEvent(None, up_type,   placeholder, btn_index)
     try:
+        if not ev_down or not ev_up:
+            raise RuntimeError("Invisible mouse events could not be created; no click was sent.")
         _stamp_mouse_event(ev_down, pid, window_id, True,  x, y, modifier_flags, click_state)
         _stamp_mouse_event(ev_up,   pid, window_id, False, x, y, modifier_flags, click_state)
-        _post_event(pid, ev_down)
-        time.sleep(0.005)
-        _post_event(pid, ev_up)
+        token = ("skylight", pid, window_id, btn_index)
+        _begin_input(token, lambda: _post_event(pid, ev_down), lambda: _post_event(pid, ev_up))
+        try:
+            time.sleep(0.005)
+        finally:
+            _finish_input(token)
     finally:
         _release(ev_down)
         _release(ev_up)
@@ -359,6 +379,7 @@ def make_window_key(pid: int, window_id: int) -> bool:
     """
     if not _KEYWIN_AVAILABLE:
         return False
+    _check_stop()
     try:
         psn = _PSN()
         if _as.GetProcessForPID(int(pid), ctypes.byref(psn)) != 0:
@@ -372,6 +393,7 @@ def make_window_key(pid: int, window_id: int) -> bool:
         for i in range(0x20, 0x30):
             b[i] = 0xff
         b[0x08] = 0x01
+        _check_stop()
         _sl.SLPSPostEventRecordTo(ctypes.byref(psn), b)
         b[0x08] = 0x02
         _sl.SLPSPostEventRecordTo(ctypes.byref(psn), b)
@@ -497,9 +519,14 @@ def self_test(timeout: float = 0.6) -> bool:
         import os as _os
         from AppKit import (
             NSApplication, NSWindow, NSBackingStoreBuffered,
-            NSApplicationActivationPolicyAccessory, NSMakeRect,
+            NSMakeRect,
         )
         from Foundation import NSTimer
+        from .ui_thread import ui
+        # Doctor also calls this without the MCP bootstrap. Both paths must
+        # finish AppKit launch without activating before creating the sink.
+        if not ui.install_on_main_thread():
+            raise RuntimeError("Background AppKit initialization is unavailable")
         _build_selftest_classes()
     except Exception as e:
         # No AppKit / harness can't be built → verdict unknown (fail open)
@@ -512,10 +539,6 @@ def self_test(timeout: float = 0.6) -> bool:
     win = None
     try:
         app = NSApplication.sharedApplication()
-        try:
-            app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
-        except Exception:
-            pass
         # Parked far off any display so it is never visible, yet still gets a
         # real CG window number under app.run() and receives the stamped click
         # (both verified empirically). No flash, no focus change at startup.
@@ -592,6 +615,7 @@ def post_mouse_click(
     """
     if not _AVAILABLE:
         return False
+    _check_stop()
     if primer_first:
         _post_stamped_pair(pid, window_id, -1.0, -1.0, button, modifier_flags)
         time.sleep(0.05)
@@ -621,6 +645,7 @@ def post_double_click(
     """
     if not _AVAILABLE:
         return False
+    _check_stop()
     if primer_first:
         _post_stamped_pair(pid, window_id, -1.0, -1.0, "left", modifier_flags)
         time.sleep(0.05)
@@ -657,6 +682,7 @@ def post_triple_click(
     """
     if not _AVAILABLE:
         return False
+    _check_stop()
     if primer_first:
         _post_stamped_pair(pid, window_id, -1.0, -1.0, "left", modifier_flags)
         time.sleep(0.05)
@@ -698,8 +724,8 @@ def post_drag(
 
     Returns True on success, False if SkyLight wasn't available.
     """
-    if check_stop is not None:
-        check_stop()
+    check_stop = check_stop or _check_stop
+    check_stop()
     if not _AVAILABLE:
         return False
     if primer_first:
@@ -709,11 +735,29 @@ def post_drag(
     down_type, up_type, drag_type, btn_index = _button_event_types(button)
     placeholder = CGPoint(0.0, 0.0)
 
+    # Release where the last event actually landed; cancelled drags must not
+    # jump to their intended destination and complete an unintended drop.
+    last_point = [float(x1), float(y1)]
+
+    def release_button():
+        """Construct a final up event using the last delivered point and original flags."""
+        ev_up = _cg.CGEventCreateMouseEvent(None, up_type, placeholder, btn_index)
+        try:
+            if not ev_up:
+                raise RuntimeError("Invisible mouse release could not be created.")
+            _stamp_mouse_event(ev_up, pid, window_id, False, *last_point, modifier_flags)
+            _post_event(pid, ev_up)
+        finally:
+            _release(ev_up)
+
+    token = ("skylight", pid, window_id, btn_index)
     # Mouse-down at start.
     ev_down = _cg.CGEventCreateMouseEvent(None, down_type, placeholder, btn_index)
     try:
+        if not ev_down:
+            raise RuntimeError("Invisible mouse event could not be created; no drag was sent.")
         _stamp_mouse_event(ev_down, pid, window_id, True, float(x1), float(y1), modifier_flags)
-        _post_event(pid, ev_down)
+        _begin_input(token, lambda: _post_event(pid, ev_down), release_button)
     finally:
         _release(ev_down)
     try:
@@ -721,17 +765,19 @@ def post_drag(
 
         # Interpolated drag events.
         for i in range(1, steps + 1):
-            if check_stop is not None:
-                check_stop()
+            check_stop()
             t = i / steps
             px = x1 + (x2 - x1) * t
             py = y1 + (y2 - y1) * t
             ev_drag = _cg.CGEventCreateMouseEvent(None, drag_type, placeholder, btn_index)
             try:
+                if not ev_drag:
+                    raise RuntimeError("Invisible drag event could not be created; drag was interrupted.")
                 # Pressure stays 1.0 throughout the drag — release is on the
                 # final mouse-up event, not the last dragged.
                 _stamp_mouse_event(ev_drag, pid, window_id, True, float(px), float(py), modifier_flags)
                 _post_event(pid, ev_drag)
+                last_point[:] = [float(px), float(py)]
             finally:
                 _release(ev_drag)
             time.sleep(step_delay)
@@ -739,13 +785,7 @@ def post_drag(
         time.sleep(0.02)
 
     finally:
-        # Mouse-up at destination.
-        ev_up = _cg.CGEventCreateMouseEvent(None, up_type, placeholder, btn_index)
-        try:
-            _stamp_mouse_event(ev_up, pid, window_id, False, float(x2), float(y2), modifier_flags)
-            _post_event(pid, ev_up)
-        finally:
-            _release(ev_up)
+        _finish_input(token)
     return True
 
 
@@ -775,6 +815,7 @@ def post_scroll(
     """
     if not _AVAILABLE:
         return False
+    _check_stop()
 
     if direction in ("up", "down"):
         wheel1 = int(amount) if direction == "up" else -int(amount)
@@ -783,8 +824,7 @@ def post_scroll(
             return False
         try:
             _stamp_routing(ev, pid, window_id)
-            if modifier_flags:
-                _cg.CGEventSetFlags(c_void_p(ev), c_uint64(modifier_flags))
+            _cg.CGEventSetFlags(c_void_p(ev), c_uint64(modifier_flags))
             _sl.SLEventSetWindowLocation(c_void_p(ev), CGPoint(float(x_window), float(y_window)))
             _post_event(pid, ev)
         finally:
@@ -801,8 +841,7 @@ def post_scroll(
         try:
             _cg.CGEventSetIntegerValueField(c_void_p(ev), _FIELD_SCROLL_DELTA_AXIS_2, c_int64(delta))
             _stamp_routing(ev, pid, window_id)
-            if modifier_flags:
-                _cg.CGEventSetFlags(c_void_p(ev), c_uint64(modifier_flags))
+            _cg.CGEventSetFlags(c_void_p(ev), c_uint64(modifier_flags))
             _sl.SLEventSetWindowLocation(c_void_p(ev), CGPoint(float(x_window), float(y_window)))
             _post_event(pid, ev)
         finally:

@@ -7,15 +7,75 @@ writes, and byte-preserving edits outside the requested object property.
 from __future__ import annotations
 
 import json
+import math
 import os
 import stat
 import tempfile
 from dataclasses import dataclass, field
 from pathlib import Path
 
+_MAX_CONFIG_BYTES = 8 * 1024 * 1024
+_MAX_CONFIG_TOKENS = 100_000
+_MAX_CONFIG_DEPTH = 128
+
 
 class ConfigFormatError(ValueError):
     """Raised when a JSONC document cannot be parsed or safely edited."""
+
+
+@dataclass(frozen=True)
+class FileSnapshot:
+    """Exact text and file identity used to refuse stale configuration edits."""
+
+    text: str
+    target: Path
+    identity: tuple | None
+
+
+def _file_identity(info) -> tuple:
+    """Include replacement, content and permission changes in an edit snapshot."""
+    return (info.st_dev, info.st_ino, info.st_uid, info.st_mode, info.st_size,
+            info.st_mtime_ns, info.st_ctime_ns)
+
+
+def _resolved_target(path: Path) -> Path:
+    """Honor intentional dotfile symlinks, while refusing broken final links."""
+    if path.is_symlink() and not path.exists():
+        raise ConfigFormatError(f"{path}: broken symlink")
+    return path.resolve()
+
+
+def read_snapshot(path: Path, *, missing_ok: bool = False) -> FileSnapshot:
+    """Read a bounded owned regular file without blocking on FIFOs or devices."""
+    target = _resolved_target(path)
+    try:
+        fd = os.open(target, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+    except FileNotFoundError:
+        if missing_ok:
+            return FileSnapshot("", target, None)
+        raise
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid():
+            raise ConfigFormatError(f"{path}: expected a regular file owned by this user")
+        if info.st_size > _MAX_CONFIG_BYTES:
+            raise ConfigFormatError(f"{path}: configuration exceeds the 8 MiB limit")
+        data = bytearray()
+        while len(data) <= _MAX_CONFIG_BYTES:
+            chunk = os.read(fd, min(65536, _MAX_CONFIG_BYTES + 1 - len(data)))
+            if not chunk:
+                break
+            data.extend(chunk)
+        if len(data) > _MAX_CONFIG_BYTES:
+            raise ConfigFormatError(f"{path}: configuration exceeds the 8 MiB limit")
+        identity = _file_identity(info)
+        if (_file_identity(os.fstat(fd)) != identity
+                or _resolved_target(path) != target
+                or _file_identity(target.stat(follow_symlinks=False)) != identity):
+            raise ConfigFormatError(f"{path}: configuration changed while it was being read; retry")
+        return FileSnapshot(data.decode("utf-8"), target, identity)
+    finally:
+        os.close(fd)
 
 
 def _reject_non_json_constant(value: str) -> None:
@@ -67,8 +127,11 @@ def _tokens(text: str) -> list[_Token]:
     """Tokenize JSON with comments and trailing commas without losing offsets."""
     result: list[_Token] = []
     i = 0
+    depth = 0
     punctuation = {"{", "}", "[", "]", ":", ","}
     while i < len(text):
+        if len(result) >= _MAX_CONFIG_TOKENS:
+            raise ConfigFormatError("configuration contains too many JSONC tokens")
         ch = text[i]
         if ch.isspace() or (ch == "\ufeff" and i == 0):
             i += 1
@@ -84,6 +147,12 @@ def _tokens(text: str) -> list[_Token]:
             i = end + 2
             continue
         if ch in punctuation:
+            if ch in ("{", "["):
+                depth += 1
+                if depth > _MAX_CONFIG_DEPTH:
+                    raise ConfigFormatError("configuration is nested too deeply")
+            elif ch in ("}", "]"):
+                depth -= 1
             result.append(_Token(ch, i, i + 1, ch))
             i += 1
             continue
@@ -121,7 +190,10 @@ def _tokens(text: str) -> list[_Token]:
         try:
             value = json.loads(raw, parse_constant=_reject_non_json_constant)
         except ValueError as exc:
-            raise ConfigFormatError(f"invalid value at character {start}: {raw!r}") from exc
+            # Malformed config tokens can themselves be credentials.
+            raise ConfigFormatError(f"invalid value at character {start}") from exc
+        if isinstance(value, float) and not math.isfinite(value):
+            raise ConfigFormatError(f"non-finite number at character {start}")
         result.append(_Token("literal", start, i, value))
     return result
 
@@ -231,7 +303,9 @@ def parse_object(text: str, path: Path) -> _Node:
     """Parse a config and require an object root before any edit."""
     try:
         root = _Parser(text).parse()
-    except ConfigFormatError as exc:
+    except (ConfigFormatError, RecursionError) as exc:
+        if isinstance(exc, RecursionError):
+            raise ConfigFormatError(f"{path}: configuration is nested too deeply") from None
         raise ConfigFormatError(f"{path}: {exc}") from exc
     if root.kind != "object":
         raise ConfigFormatError(f"{path}: the root value must be an object")
@@ -335,15 +409,18 @@ def _remove_property(text: str, obj: _Node, index: int) -> str:
     return text
 
 
-def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
-    """Set one `mcp.<server>` entry while preserving every unrelated byte."""
+def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict,
+                  *, native_v2: bool = False) -> str:
+    """Set one V1 or native V2 MCP entry, preserving every unrelated byte."""
     root = parse_object(text, path)
     if root.end == 0:
         newline = "\r\n" if "\r\n" in text else "\n"
         prefix = text
         if prefix and not prefix.endswith(("\n", "\r")):
             prefix += newline
-        document = json.dumps({"mcp": {server_key: entry}}, indent=2, ensure_ascii=False)
+        servers = {server_key: entry}
+        document = json.dumps({"mcp": {"servers": servers} if native_v2 else servers},
+                              indent=2, ensure_ascii=False)
         return prefix + document + newline
     mcp_matches = _properties(root, "mcp")
     if len(mcp_matches) > 1:
@@ -351,11 +428,26 @@ def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
             f"{path}: duplicate top-level 'mcp' keys; remove the duplicate before retrying"
         )
     if not mcp_matches:
-        return _insert_property(text, root, root, "mcp", {server_key: entry}, "")
+        servers = {server_key: entry}
+        return _insert_property(text, root, root, "mcp",
+                                {"servers": servers} if native_v2 else servers, "")
     mcp_prop = mcp_matches[0]
     mcp = mcp_prop.value
     if mcp.kind != "object":
         raise ConfigFormatError(f"{path}: top-level 'mcp' must be an object")
+    parent_indent = _line_indent(text, mcp_prop.key_token.start)
+    if native_v2:
+        containers = _properties(mcp, "servers")
+        if len(containers) > 1:
+            raise ConfigFormatError(f"{path}: duplicate 'mcp.servers' keys; remove the duplicate before retrying")
+        if not containers:
+            return _insert_property(text, root, mcp, "servers", {server_key: entry}, parent_indent)
+        if containers[0].value.kind != "object":
+            raise ConfigFormatError(f"{path}: 'mcp.servers' must be an object")
+        if isinstance(containers[0].value.to_python().get("type"), str):
+            raise ConfigFormatError(f"{path}: migrate the legacy server named 'servers' before adding native V2 servers")
+        parent_indent = _line_indent(text, containers[0].key_token.start)
+        mcp = containers[0].value
 
     had_duplicates = False
     while len(_properties(mcp, server_key)) > 1:
@@ -364,6 +456,8 @@ def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
         text = _remove_property(text, mcp, mcp.properties.index(duplicate))
         root = parse_object(text, path)
         mcp = _properties(root, "mcp")[0].value
+        if native_v2:
+            mcp = _properties(mcp, "servers")[0].value
     matches = _properties(mcp, server_key)
     if matches:
         prop = matches[0]
@@ -373,12 +467,12 @@ def set_mcp_entry(text: str, path: Path, server_key: str, entry: dict) -> str:
         newline = "\r\n" if "\r\n" in text else "\n"
         rendered = _format_value(entry, indent, newline)
         return text[:prop.value.start] + rendered + text[prop.value.end:]
-    parent_indent = _line_indent(text, mcp_prop.key_token.start)
     return _insert_property(text, root, mcp, server_key, entry, parent_indent)
 
 
-def remove_mcp_entry(text: str, path: Path, server_key: str) -> tuple[str, bool]:
-    """Remove every occurrence of one server from a JSONC MCP map."""
+def remove_mcp_entry(text: str, path: Path, server_key: str,
+                     *, native_v2: bool = False) -> tuple[str, bool]:
+    """Remove every occurrence of one server from a V1 or native V2 MCP map."""
     changed = False
     while True:
         root = parse_object(text, path)
@@ -392,6 +486,15 @@ def remove_mcp_entry(text: str, path: Path, server_key: str) -> tuple[str, bool]
         mcp = mcp_matches[0].value
         if mcp.kind != "object":
             raise ConfigFormatError(f"{path}: top-level 'mcp' must be an object")
+        if native_v2:
+            containers = _properties(mcp, "servers")
+            if len(containers) > 1:
+                raise ConfigFormatError(f"{path}: duplicate 'mcp.servers' keys; remove the duplicate before retrying")
+            if not containers:
+                return text, changed
+            mcp = containers[0].value
+            if mcp.kind != "object":
+                raise ConfigFormatError(f"{path}: 'mcp.servers' must be an object")
         matches = _properties(mcp, server_key)
         if not matches:
             return text, changed
@@ -399,26 +502,29 @@ def remove_mcp_entry(text: str, path: Path, server_key: str) -> tuple[str, bool]
         changed = True
 
 
-def atomic_write(path: Path, text: str) -> None:
-    """Atomically replace a config while preserving its existing file mode."""
-    if path.is_symlink():
-        try:
-            target = path.resolve(strict=True)
-        except FileNotFoundError as exc:
-            raise ConfigFormatError(f"{path}: refusing to replace a broken symlink") from exc
-        atomic_write(target, text)
-        return
-    path.parent.mkdir(parents=True, exist_ok=True)
-    mode = stat.S_IMODE(path.stat().st_mode) if path.exists() else 0o600
-    fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.", dir=path.parent)
+def atomic_write(path: Path, text: str, *, expected: FileSnapshot | None = None) -> None:
+    """Replace an owned config atomically; reject edits made since its snapshot."""
+    if len(text.encode("utf-8")) > _MAX_CONFIG_BYTES:
+        raise ConfigFormatError(f"{path}: updated configuration exceeds the 8 MiB limit")
+    original = read_snapshot(path, missing_ok=True)
+    target = original.target
+    if expected is not None and original != expected:
+        raise ConfigFormatError(f"{path}: configuration changed outside klyk; retry without overwriting it")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    mode = stat.S_IMODE(original.identity[3]) if original.identity else 0o600
+    fd, temporary = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     try:
         with os.fdopen(fd, "w", encoding="utf-8", newline="") as handle:
             handle.write(text)
             handle.flush()
             os.fsync(handle.fileno())
         os.chmod(temporary, mode)
-        os.replace(temporary, path)
-        directory = os.open(path.parent, os.O_RDONLY)
+        # Check after the temporary file has been flushed, immediately before
+        # replacement. A concurrent editor's newer content must be retained.
+        if read_snapshot(path, missing_ok=True) != original:
+            raise ConfigFormatError(f"{path}: configuration changed outside klyk; retry without overwriting it")
+        os.replace(temporary, target)
+        directory = os.open(target.parent, os.O_RDONLY)
         try:
             os.fsync(directory)
         finally:
@@ -432,8 +538,5 @@ def atomic_write(path: Path, text: str) -> None:
 
 
 def read_exact(path: Path) -> str:
-    """Read text without Python normalizing CRLF line endings."""
-    if path.is_symlink() and not path.exists():
-        raise ConfigFormatError(f"{path}: broken symlink")
-    with open(path, encoding="utf-8", newline="") as handle:
-        return handle.read()
+    """Read bounded config text without normalizing CRLF or following unsafe files."""
+    return read_snapshot(path).text

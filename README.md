@@ -13,7 +13,7 @@
 > **This is powerful, and it is dangerous.** Be clear-eyed about what that means:
 >
 > - **It can take real, irreversible actions.** A click is a click. klyk can press *Buy*, *Send*, *Confirm Transfer*, *Delete*, or *Sign* just as you could. Klyk enforces checks such as target-window bounds, ownership, duplicate-label rejection, and its emergency latch, while confirmation guidance and a bounds override remain agent-cooperative and do not establish user approval. There is no sandbox and no spending limit.
-> - **It runs with your full user privileges.** Anything you can do on your Mac, klyk can do. It does not isolate itself or drop privileges.
+> - **It runs under your user account.** Klyk inherits the permissions granted to its host process. It does not isolate itself or drop privileges.
 > - **It is a prompt-injection target.** If the agent driving klyk also reads untrusted content — a web page, an email, a document — a malicious instruction hidden there can become real clicks and keystrokes on your machine. "Reads the web" + "controls the Mac" is the high-risk combination. Run klyk only with an agent and a workflow you trust.
 > - **It relies on an undocumented Apple API.** Invisible native input uses Apple's private SkyLight framework. Apple does not support or guarantee it; a macOS update can change or break it without notice, and the affected actions may fall back to visible input or require activation.
 >
@@ -29,15 +29,15 @@
 
 ## The problem
 
-AI assistants are increasingly asked to test, validate, or operate desktop apps end-to-end. Today they can't. Existing automation tools either require deep app instrumentation (XCUITest, Appium) or simulate user input at a layer too brittle to be trusted (pixel-only click frameworks, headless DOM scrapers). The result: agents that can write apps faster than ever, but can't verify they actually work.
+Agents operating desktop apps need to see the correct window, send input to the intended control, and check what actually changed. Klyk provides these capabilities for visible macOS interfaces and cross-app workflows through a local MCP connection.
 
-Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, real composited screenshots — and a clean MCP interface to drive it. Native input attempts to stay invisible by default, with the activation and visible-input cases described above. The agent observes, decides, acts, verifies.
+Klyk closes that gap. It gives an AI agent the same input channel a human has — real cursor moves via Apple's CoreGraphics API, real keystrokes posted to the HID event tap, window-only screenshots — and a clean MCP interface to drive it. Native input attempts to stay invisible by default, with the activation and visible-input cases described above. The agent observes, decides, acts, verifies.
 
 ## What it does
 
 ```
 > screenshot the app, then click "Sign in"
-[ inspect returns a CoreGraphics screenshot plus a bounded AX element list ]
+[ inspect returns a fresh window screenshot plus a bounded AX element list ]
 [ click_element finds "Sign in" via accessibility, then on-device OCR if needed ]
 [ Klyk performs an AX action or sends input using the app and session delivery mode ]
 ```
@@ -73,6 +73,8 @@ klyk update
 ```
 
 It detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected client that shares that installation loads the new version on its next tool call. Clients using pinned, bundled, or separate klyk installations need their own update.
+
+**Existing 0.5.x setups:** After upgrading, run `klyk doctor --fix` as a new command from the same installation, then restart your AI clients when ready. This migrates generated launch settings to `-P -m klyk.mcp_server` and clears inherited `PYTHONPATH`, so workspace files cannot replace the installed package. An updater started on the old version does not apply this repair automatically. Explicit custom `PYTHONPATH` remains a trusted override; customized TOML commands or arguments are preserved and require manual editing.
 
 You never have to wonder whether you're behind, either:
 
@@ -118,7 +120,7 @@ Klyk writes OpenCode's global local-MCP entry, so it is available in every works
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 
 ```json
-{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-m", "klyk.mcp_server"] } } }
+{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "" } } } }
 ```
 
 Permissions, control ownership, and `klyk doctor` work identically regardless of which client launches klyk.
@@ -147,7 +149,7 @@ echo '{"tool":"screen_info","args":{}}' | klyk-call --batch   # many calls, one 
 
 **Control ownership:** a dead driver is reclaimed automatically. Taking over from a live driver requires user authorization. A standalone `klyk-call --tool take_control` ends with that invocation, so it cannot grant control to later shell commands. Use a persistent native MCP connection for interactive workflows.
 
-**Vision over the shell.** When a tool returns a screenshot (`screenshot`, `inspect`, `verdict`, image-producing `run` steps), `klyk-call` writes the PNG to `~/.klyk/captures/` and returns its `saved_path` instead of dumping base64 — so the agent *views* the capture with its own image reader (Claude Code's file read, Gemini's `@path`, etc.) and keeps the same observe→act→verify loop the native MCP transport has, with no context-flooding payload. The cache keeps the most recent 20 captures.
+**Vision over the shell.** When a tool returns a screenshot (`screenshot`, `inspect`, `verdict`, image-producing `run` steps), `klyk-call` writes the PNG to `~/.klyk/captures/` and returns its `saved_path` instead of dumping base64 — so the agent *views* the capture with its own image reader (Claude Code's file read, Gemini's `@path`, etc.) and keeps the same observe→act→verify loop the native MCP transport has, with no context-flooding payload. The cache keeps up to 20 captures and protects files returned by the current call. A response containing more than 20 images, or an image that cannot be saved, retains those images inline with `save_error` instead of returning missing file paths.
 
 ## Quick example
 
@@ -184,7 +186,7 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 | `mcp_server.py` | MCP server, tool definitions, dispatch |
 | `session.py` | Per-app session registry, auto-launch, template cache |
 | `computer.py` | CoreGraphics input synthesis (click, drag, keyboard, scroll, AX) |
-| `capture.py` | CoreGraphics screenshot capture (in-memory primary, screencapture fallback) |
+| `capture.py`, `window_capture.py` | ScreenCaptureKit window screenshots, bounded capture-plan cache, scoped compatibility fallbacks |
 | `launcher.py` | App launch with browser-aware AX flag injection |
 | `ocr.py` | Apple Vision OCR (two-pass: fast then accurate) |
 | `matcher.py` | Pure-NumPy template matching (FFT + integral-image NCC) with template cache support |

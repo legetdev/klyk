@@ -4,8 +4,9 @@ No internal AI calls — the agent calling this tool already has vision and reas
 """
 
 from __future__ import annotations
-import os
 from typing import TYPE_CHECKING
+
+from .grader import ui_pass_threshold
 
 if TYPE_CHECKING:
     from .session import Session
@@ -33,12 +34,12 @@ def generate_verdict(session: "Session", test_description: str) -> dict:
         win_y=session.win_y,
     )
 
-    threshold = float(os.getenv("KLYK_UI_PASS_THRESHOLD", "7.0"))
+    threshold, warning = ui_pass_threshold()
     # Cap the log payload so a chatty app can't blow the verdict token budget
     # (the final screenshot already costs a lot); most-recent lines are kept.
     logs = session.log_buffer.to_dict(max_chars=12000)
 
-    return {
+    result = {
         "screenshot": screenshot_b64,
         "width": w,
         "height": h,
@@ -56,3 +57,6 @@ def generate_verdict(session: "Session", test_description: str) -> dict:
 
         ),
     }
+    if warning:
+        result["configuration_warning"] = warning
+    return result

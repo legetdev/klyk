@@ -81,6 +81,7 @@ class UIThread:
             from AppKit import (
                 NSApplication,
                 NSApplicationActivationPolicyAccessory,
+                NSApplicationActivationPolicyProhibited,
             )
             from Foundation import NSTimer, NSRunLoop
         except Exception as e:
@@ -91,9 +92,14 @@ class UIThread:
 
         try:
             self._app = NSApplication.sharedApplication()
-            # Accessory: no Dock icon, no app menu. klyk's only AppKit
-            # surface is the menu-bar status item.
-            self._app.setActivationPolicy_(NSApplicationActivationPolicyAccessory)
+            # NSApp.run() normally finishes launching and can activate even an
+            # accessory process. Complete that phase while activation is forbidden,
+            # then permit the menu item and off-screen input-test window.
+            if not self._app.setActivationPolicy_(NSApplicationActivationPolicyProhibited):
+                raise RuntimeError("Could not suppress startup activation")
+            self._app.finishLaunching()
+            if not self._app.setActivationPolicy_(NSApplicationActivationPolicyAccessory):
+                raise RuntimeError("Could not enable background menu UI")
 
             def _drain(_timer):
                 while True:

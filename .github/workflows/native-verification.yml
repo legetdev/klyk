@@ -1,0 +1,241 @@
+name: Opt-in remote native verification
+on:
+  push:
+    branches: [codex/security-deep-candidate]
+    paths:
+      - .github/workflows/native-verification.yml
+      - tests/native_runner_probe.py
+  pull_request:
+    types: [opened, synchronize, labeled]
+  workflow_dispatch:
+    inputs:
+      full_suite:
+        description: Run the existing native and Chrome/Electron suites after permission preflight
+        type: boolean
+        default: false
+permissions:
+  contents: read
+concurrency:
+  group: native-verification-${{ github.event.pull_request.number || github.ref }}-${{ github.event_name }}
+  cancel-in-progress: false
+jobs:
+  native:
+    # Standard public-repository runners are free; never select a paid/larger runner.
+    if: >-
+      github.repository == 'legetdev/klyk' && github.event.repository.private == false &&
+      (github.event_name != 'pull_request' ||
+       (github.event.pull_request.head.repo.full_name == github.repository &&
+        contains(github.event.pull_request.labels.*.name, 'native-verification')))
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 35
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-26, xcode-27]
+        mcp: ${{ fromJSON((github.event_name == 'pull_request' || inputs.full_suite) && '[1,2]' || '[2]') }}
+    env:
+      KLYK_UPDATE_CHECK: '0'
+      KLYK_RUNNER_LABEL: ${{ matrix.os }}
+      KLYK_FIXTURE_COMPACT: ${{ (github.event_name == 'pull_request' || inputs.full_suite) && '1' || '0' }}
+      MCP_MAJOR: ${{ matrix.mcp }}
+      MCP_SPEC: ${{ matrix.mcp == 1 && 'mcp>=1.28.1,<2' || 'mcp>=2,<3' }}
+      FULL_SUITE: ${{ github.event_name == 'pull_request' || inputs.full_suite }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: '3.14'
+      - name: Read existing runner permissions and desktop dimensions
+        shell: bash
+        run: |
+          python -P -B tests/native_runner_probe.py
+      - name: Fresh install of the candidate and selected supported MCP SDK
+        if: env.FULL_SUITE == 'true'
+        shell: bash
+        run: |
+          python -m venv "$RUNNER_TEMP/klyk-native-venv"
+          "$RUNNER_TEMP/klyk-native-venv/bin/python" -m pip install . "$MCP_SPEC"
+          printf '%s\n' "$RUNNER_TEMP/klyk-native-venv/bin" >> "$GITHUB_PATH"
+      - name: Recheck permissions with the fresh-installed interpreter before any UI
+        if: env.FULL_SUITE == 'true'
+        run: python -P -B tests/native_runner_probe.py --output .verification/installed-runner-probe.json
+      - name: Generated native OCR execution-mode diagnostic
+        if: env.FULL_SUITE == 'true'
+        continue-on-error: true
+        run: python -B tests/native_ocr_modes.py --output .verification/native-ocr-modes.json
+      - name: Generated native image coordinate diagnostic
+        if: env.FULL_SUITE == 'true'
+        continue-on-error: true
+        run: python -B tests/native_image_smoke.py --output .verification/native-image.json
+      - name: Require the existing native fixture layout before any desktop suite
+        id: layout_probe
+        if: env.FULL_SUITE == 'true'
+        run: python -P -B tests/native_runner_probe.py --full-layout --output .verification/layout-probe.json
+      - name: Fresh-installed doctor and real stdio connection
+        id: installed_smoke
+        if: env.FULL_SUITE == 'true'
+        shell: bash
+        run: |
+          python -P -B - <<'PY'
+          # Check the installed distribution from outside the source checkout.
+          import importlib.metadata, json, os, pathlib, platform, subprocess, sys
+          root = pathlib.Path.cwd()
+          sys.path.insert(0, str(root / 'tests'))
+          from release_check import fingerprint
+          import klyk
+          if not pathlib.Path(klyk.__file__).resolve().is_relative_to(pathlib.Path(sys.prefix).resolve()):
+              raise SystemExit('The smoke check must use the fresh-installed candidate distribution.')
+          environment = {'mcp': importlib.metadata.version('mcp'), 'python': sys.version,
+                         'macos': platform.mac_ver()[0], 'architecture': platform.machine(),
+                         'klyk': klyk.__version__, 'installed_path': klyk.__file__}
+          result = subprocess.run([sys.executable, '-P', '-m', 'klyk.cli', 'doctor', '--json'],
+                                  cwd=os.environ['RUNNER_TEMP'], capture_output=True, text=True, timeout=60)
+          report = {'fingerprint': fingerprint(), 'environment': environment,
+                    'scope': 'fresh-installed doctor', 'completed': result.returncode == 0,
+                    'exit_code': result.returncode}
+          try:
+              report['doctor'] = json.loads(result.stdout)
+          except ValueError:
+              report['error'] = 'Doctor returned no valid JSON report'
+          (root / '.verification/doctor.json').write_text(json.dumps(report, indent=2))
+          if not report['completed'] or report.get('error'):
+              raise SystemExit('Fresh-installed doctor failed; see the retained fixture evidence.')
+          os.chdir(os.environ['RUNNER_TEMP'])
+          from klyk.client import KlykClient
+          from release_check import expected_tools
+          import jsonschema
+          report = {'fingerprint': fingerprint(), 'environment': environment,
+                    'scope': 'fresh-installed real stdio connection', 'desktop_acceptance': False,
+                    'completed': False, 'checks': []}
+          try:
+              with KlykClient(timeout=30) as client:
+                  child = client._proc
+                  tools = client.list_tools()
+                  names = [tool['name'] for tool in tools]
+                  discovered = len(names) == len(set(names)) and set(names) == expected_tools()
+                  report['checks'].append({'name': 'installed server discovered all declared tools', 'passed': discovered})
+                  if not discovered: raise AssertionError('installed tool discovery')
+                  for tool in tools:
+                      schema = tool['inputSchema']
+                      jsonschema.validators.validator_for(schema).check_schema(schema)
+                  report['checks'].append({'name': 'installed real SDK schemas validate', 'passed': True})
+                  wire = client.call('screen_info', {})
+                  text = next(block['text'] for block in reversed(wire.get('content', [])) if block.get('type') == 'text')
+                  screen = json.loads(text)
+                  dimensions = screen.get('main', {})
+                  valid = dimensions.get('width', 0) > 0 and dimensions.get('height', 0) > 0
+                  report['checks'].append({'name': 'installed metadata-only screen query succeeded', 'passed': valid})
+                  if not valid: raise AssertionError('installed screen metadata')
+              closed = child.poll() is not None and all(pipe.closed for pipe in (child.stdin, child.stdout, child.stderr))
+              report['checks'].append({'name': 'installed stdio child and pipes reaped', 'passed': closed})
+              if not closed: raise AssertionError('installed child cleanup')
+              report['completed'] = True
+          except Exception as error:
+              report['error'] = f'{type(error).__name__}: {error}'
+              raise
+          finally:
+              (root / '.verification/stdio.json').write_text(json.dumps(report, indent=2))
+          PY
+      - name: Verify and provision the existing Microsoft Electron fixture target
+        id: vscode_fixture
+        if: env.FULL_SUITE == 'true'
+        shell: bash
+        run: |
+          app='/Applications/Visual Studio Code.app'
+          [[ ! -e "$app" ]] || { printf '%s\n' 'An unexpected VS Code installation prevents isolated provisioning.' >&2; exit 1; }
+          fixture_dir="$(mktemp -d "$RUNNER_TEMP/klyk-vscode.XXXXXX")"
+          archive="$fixture_dir/vscode.zip"
+          curl --fail --location --proto '=https' --tlsv1.2 --max-time 180 --max-filesize 524288000 \
+            'https://vscode.download.prss.microsoft.com/dbazure/download/stable/07f806f999227108933c2e30515b26eecc1fda74/VSCode-darwin-arm64.zip' \
+            --output "$archive"
+          printf '%s  %s\n' '86a64f1cc9f4e0b5fc44969530994742f4bd61e7b98d9637238c5e24b26593b0' "$archive" | shasum -a 256 -c -
+          ditto -x -k "$archive" "$fixture_dir/extracted"
+          source_app="$fixture_dir/extracted/Visual Studio Code.app"
+          codesign --verify --deep --strict "$source_app"
+          codesign -d --verbose=4 "$source_app" 2> "$fixture_dir/signature.txt"
+          python -P -B - "$source_app" "$fixture_dir/signature.txt" <<'PY'
+          # Verify the official bundle identity before copying it into the disposable VM.
+          import json, pathlib, plistlib, sys
+          app = pathlib.Path(sys.argv[1])
+          signature = pathlib.Path(sys.argv[2]).read_text().splitlines()
+          required = {'TeamIdentifier=UBF8T346G9', 'Identifier=com.microsoft.VSCode'}
+          if not required <= set(signature): raise SystemExit('Unexpected Microsoft fixture signing identity')
+          info = plistlib.loads((app / 'Contents/Info.plist').read_bytes())
+          if info.get('CFBundleShortVersionString') != '1.140.0': raise SystemExit('Unexpected Microsoft fixture version')
+          report = {'version': info['CFBundleShortVersionString'], 'bundle_id': info['CFBundleIdentifier'],
+                    'team_identifier': 'UBF8T346G9', 'sha256': '86a64f1cc9f4e0b5fc44969530994742f4bd61e7b98d9637238c5e24b26593b0',
+                    'signature_verified': True, 'archive_hash_verified': True}
+          pathlib.Path('.verification/vscode-fixture.json').write_text(json.dumps(report, indent=2))
+          PY
+          spctl --assess --type execute --verbose=2 "$source_app"
+          sudo -n ditto "$source_app" "$app"
+      - name: Existing native suite with independent AppKit outcomes
+        if: env.FULL_SUITE == 'true'
+        run: python -B tests/live_smoke.py --output .verification/native.json
+      - name: Existing Chrome and Electron suite with disposable profiles
+        # Independent suites retain diagnostics after a native assertion fails.
+        if: >-
+          ${{ !cancelled() && env.FULL_SUITE == 'true' &&
+              steps.layout_probe.outcome == 'success' &&
+              steps.installed_smoke.outcome == 'success' &&
+              steps.vscode_fixture.outcome == 'success' }}
+        run: python -B tests/desktop_smoke.py --output .verification/desktop.json
+      - name: Existing overlapping-window background safety suite
+        if: >-
+          ${{ !cancelled() && env.FULL_SUITE == 'true' &&
+              steps.layout_probe.outcome == 'success' &&
+              steps.installed_smoke.outcome == 'success' }}
+        shell: bash
+        run: |
+          # Fetch only the immutable in-repository benchmark baseline needed by this suite.
+          git fetch --no-tags --depth=1 origin 355b32fea8a847680e4e65540cd4bb598a9f1411
+          python -B tests/background_smoke.py --output .verification/background.json
+      - name: Validate exact source, real assertions, SDK, and full tool coverage
+        if: env.FULL_SUITE == 'true'
+        shell: bash
+        run: |
+          python -P -B - <<'PY'
+          # Validate each real report; parent integration aggregates both MCP majors.
+          import json, pathlib, sys
+          sys.path.insert(0, str(pathlib.Path.cwd() / 'tests'))
+          from release_check import fingerprint, validate_report, validate_full_report
+          for name, native in [('native', True), ('desktop', False)]:
+              path = pathlib.Path('.verification') / (name + '.json')
+              report = json.loads(path.read_text())
+              checks = validate_report(report, str(path), fingerprint())
+              validate_full_report(report, str(path), checks, native=native)
+          path = pathlib.Path('.verification/background.json')
+          # Background-only outcomes supplement full acceptance without replacing native or desktop coverage.
+          validate_report(json.loads(path.read_text()), str(path), fingerprint())
+          PY
+      - name: Preserve bounded fixture evidence in ordinary logs without paid artifact storage
+        if: always()
+        shell: bash
+        run: |
+          python -P -B - <<'PY'
+          # Emit only these exact fixture reports; never retain profiles, screenshots or application logs.
+          import base64, gzip, hashlib, importlib.metadata, json, os, pathlib, platform, subprocess, sys
+          sys.path.insert(0, str(pathlib.Path.cwd() / 'tests'))
+          from release_check import fingerprint
+          try: sdk = importlib.metadata.version('mcp')
+          except importlib.metadata.PackageNotFoundError: sdk = None
+          identity = {'fingerprint': fingerprint(), 'source_commit': subprocess.check_output(['git', 'rev-parse', 'HEAD'], text=True).strip(),
+                      'mcp': sdk, 'requested_mcp_major': os.environ['MCP_MAJOR'], 'macos': platform.mac_ver()[0],
+                      'architecture': platform.machine(), 'runner_label': os.environ['KLYK_RUNNER_LABEL']}
+          for stem in ('runner-probe', 'installed-runner-probe', 'layout-probe', 'doctor', 'stdio', 'native-image', 'native-ocr-modes', 'vscode-fixture', 'native', 'desktop', 'background'):
+              path = pathlib.Path('.verification') / (stem + '.json')
+              if not path.is_file(): continue
+              raw = path.read_bytes()
+              if not 0 < len(raw) <= 2_000_000: raise ValueError('Fixture report exceeds the 2 MB evidence limit')
+              json.loads(raw)
+              encoded = base64.b64encode(gzip.compress(raw, mtime=0)).decode('ascii')
+              name = f"{stem}-{identity['runner_label']}-mcp{identity['requested_mcp_major']}.json"
+              chunks = [encoded[offset:offset + 4096] for offset in range(0, len(encoded), 4096)]
+              if len(chunks) > 660: raise ValueError('Compressed fixture evidence exceeds its chunk limit')
+              manifest = {**identity, 'name': name, 'sha256': hashlib.sha256(raw).hexdigest(), 'raw_bytes': len(raw), 'chunks': len(chunks)}
+              print('KLYK_EVIDENCE_MANIFEST ' + json.dumps(manifest, separators=(',', ':')), flush=True)
+              for index, chunk in enumerate(chunks):
+                  print(f'KLYK_EVIDENCE_CHUNK {name} {index} {chunk}', flush=True)
+          PY

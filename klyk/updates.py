@@ -6,13 +6,13 @@ doctor, and the menu-bar all read the same state and can never disagree:
 
   - check():   cached, at-most-once-a-day, offline-safe lookup of the latest
                klyk release on PyPI (package metadata only — nothing about
-               the user or their screen is ever sent). Never raises, never
-               blocks longer than the socket timeout, logs every outcome.
+               the user or their screen is ever sent). Never raises; uses a short
+               socket timeout and bounded metadata read budget.
                Disabled entirely with KLYK_UPDATE_CHECK=0.
   - status():  the last known answer, read from the shared cache file with
                no network I/O — cheap enough for the menu-bar rebuild.
   - install_method() / upgrade_command(): how this klyk was installed
-               (pipx / uv tool / pip / editable), derived from the
+               (pipx / uv tool / uvx / pip / editable), derived from the
                interpreter + package paths — so `klyk update` runs the ONE
                correct upgrade command for every install style.
 
@@ -30,6 +30,8 @@ import json
 import logging
 import math
 import os
+import re
+import stat
 import sys
 import threading
 import tempfile
@@ -37,19 +39,23 @@ import time
 import urllib.request
 from pathlib import Path
 
+from .private_files import private_directory
+
 from . import __version__
 
 log = logging.getLogger("klyk.updates")
 
 _CACHE_PATH = Path.home() / ".klyk" / "update_check.json"
 _TTL_S = 24 * 3600           # re-ask PyPI at most once per day
-_FETCH_TIMEOUT_S = 3.0       # hard cap on the network wait
+_FETCH_TIMEOUT_S = 3.0       # per-socket timeout and metadata read budget
 _PYPI_URL = "https://pypi.org/pypi/klyk/json"
+_MAX_CACHE_BYTES = 16 * 1024
+_MAX_METADATA_BYTES = 1024 * 1024
 
-# In-process memoization of the cache file (mtime-keyed) so status() is a
+# In-process memoization on file identity so status() is a
 # stat() in the common case — safe to call from the throttled menu rebuild.
 _memo_lock = threading.Lock()
-_memo_mtime: float | None = None
+_memo_mtime: tuple | None = None
 _memo_data: dict | None = None
 
 
@@ -64,10 +70,10 @@ def _parse(version: str) -> tuple[int, ...] | None:
     """Tolerant numeric parse of an X.Y.Z version. Returns None when a part
     isn't numeric (pre-releases etc.) — callers then compare conservatively
     (no update signalled on an unparseable pair)."""
-    try:
-        return tuple(int(p) for p in version.strip().split("."))
-    except (ValueError, AttributeError):
+    if (not isinstance(version, str) or len(version) > 64
+            or not re.fullmatch(r"[0-9]+(?:\.[0-9]+){1,3}", version)):
         return None
+    return tuple(int(p) for p in version.split("."))
 
 
 def _is_newer(latest: str, installed: str) -> bool:
@@ -82,31 +88,52 @@ def _is_newer(latest: str, installed: str) -> bool:
 
 
 def _read_cache() -> dict | None:
-    """Read the cache file, memoized on mtime. Returns None when absent or
-    unreadable (a corrupt cache heals itself on the next check())."""
+    """Read bounded regular cache metadata, memoized on its complete file identity."""
     global _memo_mtime, _memo_data
     try:
-        mtime = _CACHE_PATH.stat().st_mtime
+        info = _CACHE_PATH.stat(follow_symlinks=False)
+        if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+                or info.st_size > _MAX_CACHE_BYTES):
+            return None
+        signature = (info.st_dev, info.st_ino, info.st_size,
+                     info.st_mtime_ns, info.st_ctime_ns)
     except OSError:
         return None
     with _memo_lock:
-        if _memo_mtime == mtime and _memo_data is not None:
+        if _memo_mtime == signature and _memo_data is not None:
             return _memo_data
+    fd = None
     try:
-        data = json.loads(_CACHE_PATH.read_text())
+        fd = os.open(_CACHE_PATH, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
+        opened = os.fstat(fd)
+        if (not stat.S_ISREG(opened.st_mode) or opened.st_uid != os.getuid()
+                or opened.st_size > _MAX_CACHE_BYTES
+                or (opened.st_dev, opened.st_ino, opened.st_size,
+                    opened.st_mtime_ns, opened.st_ctime_ns) != signature):
+            return None
+        raw = os.read(fd, _MAX_CACHE_BYTES + 1)
+        after = os.fstat(fd)
+        if (len(raw) > _MAX_CACHE_BYTES
+                or (after.st_dev, after.st_ino, after.st_size,
+                    after.st_mtime_ns, after.st_ctime_ns) != signature):
+            return None
+        data = json.loads(raw)
         if not isinstance(data, dict):
             raise ValueError("cache is not a JSON object")
         checked_at = data.get("checked_at")
         if (isinstance(checked_at, bool) or not isinstance(checked_at, (int, float))
-                or not math.isfinite(checked_at) or checked_at < 0):
+                or not 0 <= checked_at <= 253402300799 or not math.isfinite(checked_at)):
             raise ValueError("cache checked_at must be a finite nonnegative timestamp")
-        if data.get("latest") is not None and not isinstance(data["latest"], str):
+        if data.get("latest") is not None and _parse(data["latest"]) is None:
             raise ValueError("cache latest must be a version string or null")
-    except (OSError, ValueError) as e:
-        log.warning("update cache %s unreadable (%s) — will refetch", _CACHE_PATH, e)
+    except (OSError, ValueError, RecursionError) as e:
+        log.warning("update cache %s unreadable (%s) — will refetch", _CACHE_PATH, type(e).__name__)
         return None
+    finally:
+        if fd is not None:
+            os.close(fd)
     with _memo_lock:
-        _memo_mtime, _memo_data = mtime, data
+        _memo_mtime, _memo_data = signature, data
     return data
 
 
@@ -116,7 +143,10 @@ def _write_cache(latest: str | None) -> None:
     data = {"checked_at": time.time(), "latest": latest}
     tmp = None
     try:
-        _CACHE_PATH.parent.mkdir(parents=True, exist_ok=True)
+        if _CACHE_PATH.parent == Path.home() / ".klyk":
+            private_directory(_CACHE_PATH.parent)
+        else:
+            _CACHE_PATH.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
         # Each process owns its temporary file; concurrent servers cannot
         # truncate or rename one another's pending cache writes.
         with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8",
@@ -134,20 +164,42 @@ def _write_cache(latest: str | None) -> None:
                 pass
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Keep the metadata request on its fixed HTTPS PyPI endpoint."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        """Treat redirects as an unavailable check instead of changing trust domains."""
+        return None
+
+
 def _fetch_latest() -> str | None:
-    """Ask PyPI for the newest published klyk version. Never raises."""
+    """Read bounded metadata from PyPI under a short socket and read-time budget."""
     try:
         req = urllib.request.Request(
             _PYPI_URL, headers={"User-Agent": f"klyk/{__version__} update-check"},
         )
-        with urllib.request.urlopen(req, timeout=_FETCH_TIMEOUT_S) as resp:
-            latest = json.load(resp).get("info", {}).get("version")
-        if isinstance(latest, str) and latest:
+        deadline = time.monotonic() + _FETCH_TIMEOUT_S
+        opener = urllib.request.build_opener(_NoRedirect())
+        with opener.open(req, timeout=_FETCH_TIMEOUT_S) as resp:
+            raw = bytearray()
+            while len(raw) <= _MAX_METADATA_BYTES:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError("metadata read budget exceeded")
+                chunk = resp.read1(min(65536, _MAX_METADATA_BYTES + 1 - len(raw)))
+                if not chunk:
+                    break
+                raw.extend(chunk)
+            if len(raw) > _MAX_METADATA_BYTES:
+                raise ValueError("PyPI metadata exceeds the size limit")
+            data = json.loads(raw)
+            info = data.get("info", {}) if isinstance(data, dict) else {}
+            latest = info.get("version") if isinstance(info, dict) else None
+        if _parse(latest) is not None:
             log.info("update check: installed %s, latest on PyPI %s", __version__, latest)
             return latest
         log.warning("update check: PyPI response had no info.version")
     except Exception as e:
-        log.info("update check: PyPI unreachable (%s: %s) — skipped", type(e).__name__, e)
+        log.info("update check: PyPI unavailable (%s) — skipped", type(e).__name__)
     return None
 
 
@@ -218,11 +270,23 @@ def _detect_method(prefix: str, pkg_file: str) -> str:
         return "pipx"
     if "/uv/tools/" in p:
         return "uv"
+    if "/uv/archive-v" in p:
+        return "uvx"
     return "pip"
 
 
 def install_method() -> str:
+    """Include custom managed directories and disposable uvx environments."""
     from . import __file__ as pkg_file
+    if pkg_file and ("site-packages" in pkg_file or "dist-packages" in pkg_file):
+        prefix = Path(sys.prefix)
+        if (prefix / "uv-receipt.toml").is_file():
+            return "uv"
+        if (prefix / "pipx_metadata.json").is_file():
+            return "pipx"
+        custom_cache = os.environ.get("UV_CACHE_DIR")
+        if custom_cache and prefix.resolve().is_relative_to(Path(custom_cache).expanduser().resolve()):
+            return "uvx"
     return _detect_method(sys.prefix, pkg_file or "")
 
 
@@ -233,6 +297,7 @@ def upgrade_command(method: str | None = None) -> list[str] | None:
     return {
         "pipx": ["pipx", "upgrade", "klyk"],
         "uv": ["uv", "tool", "upgrade", "klyk"],
-        "pip": [sys.executable, "-m", "pip", "install", "--upgrade", "klyk"],
+        "uvx": ["uv", "tool", "run", "--upgrade", "--from", "klyk", "klyk", "version"],
+        "pip": [sys.executable, "-P", "-m", "pip", "install", "--upgrade", "klyk"],
         "editable": None,
     }[m]

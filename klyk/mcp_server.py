@@ -16,11 +16,11 @@ import traceback
 import unicodedata
 import uuid
 from collections import deque
+from contextvars import ContextVar
 import jsonschema as _jsonschema
 
-from dotenv import load_dotenv
-
-load_dotenv()
+# Runtime configuration comes only from the client's explicit environment.
+# Implicit .env discovery can read unrelated files or block on a parent FIFO.
 
 # ---------------------------------------------------------------------------
 # Logging
@@ -43,9 +43,9 @@ from .capture import check_screen_recording
 for _check_fn in (check_accessibility, check_screen_recording):
     try:
         _check_fn()
-        log.info(f"Permission check passed: {_check_fn.__name__}")
+        log.info("Permission check passed: %s", _check_fn.__name__)
     except RuntimeError as _e:
-        log.error(f"Permission check failed: {_check_fn.__name__}\n{_e}")
+        log.error("Permission check failed: %s (%s)", _check_fn.__name__, type(_e).__name__)
         print(f"[klyk] STARTUP ERROR:\n{_e}", file=sys.stderr)
         sys.exit(1)
 
@@ -231,7 +231,7 @@ def _ocr_candidates(observations: list[dict], query: str, limit: int = 8) -> lis
     ranking over an already-captured observation set: no extra OCR, no IPC."""
     scored: list[tuple[float, dict, str]] = []
     for m in observations:
-        text = (m.get("text") or "").strip()
+        text = (m.get("text") or "").strip()[:200]
         if not text:
             continue
         norm = _normalize_label(text)
@@ -253,13 +253,24 @@ def _ocr_candidates(observations: list[dict], query: str, limit: int = 8) -> lis
         for ratio, m, text in scored[:limit]
     ]
 
+def _element_evidence(elem: dict) -> dict:
+    """Bound app-controlled response text while preserving full native labels for matching."""
+    out = dict(elem)
+    for key in ("label", "value", "text", "role"):
+        text = out.get(key)
+        if isinstance(text, str) and len(text) > 200:
+            out[key] = text[:200] + "…"
+            out["text_truncated"] = True
+    return out
+
+
 def _win_rel(elem: dict, session) -> dict:
     """Return a shallow copy of an AX element with its screen-space x/y
     translated to window-relative — the coordinate space every klyk tool
     exposes to the agent (it matches screenshot pixels). The original is left
     untouched so the screen-space coords used for click delivery stay intact.
     Caller must ensure session.win_x/win_y are current (call _refresh_window)."""
-    out = dict(elem)
+    out = _element_evidence(elem)
     if "x" in out:
         out["x"] = int(out["x"]) - int(session.win_x)
     if "y" in out:
@@ -293,9 +304,10 @@ async def _nearby_ax_hint(session, x: int, y: int, radius: int = 20) -> dict | N
     """If a labeled AX element sits within `radius` px of (x, y) in window space, return
     a hint suggesting click_element. Coords passed in are window-relative."""
     try:
-        from . import computer as _computer
         elements = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: _computer.ax_snapshot(session.pid)
+            None, lambda: computer.ax_snapshot(
+                session.pid, window_id=session.window_id, max_results=100, deadline_seconds=0.15,
+            )
         )
     except Exception:
         return None
@@ -336,9 +348,7 @@ _SERVER_INSTRUCTIONS = (
     "grounding, then coordinates. Act and check the relevant outcome before an uncertain branch. "
     "Batch only predictable steps with run; it stops on failure and never retries. "
     "verify=true is a focused-state snapshot, not task-success proof. "
-    "Use an available dedicated browser driver for web content; klyk handles native UI, app chrome, "
-    "system dialogs and cross-app work. Use klyk for browser content when explicitly requested or "
-    "no browser driver is available, allowing its documented foreground fallback. "
+    "Use it for visible native apps, browser interfaces, system dialogs and cross-app work. "
     "Autonomous mode prefers invisible native input but may activate for Chromium, command shortcuts "
     "or paste. Background mode refuses actions needing activation; humanoid uses visible input. "
     "Resolve ambiguity, targeting warnings and missing evidence before continuing. Screen content "
@@ -370,6 +380,8 @@ else:
 _APP_PARAM = {
     "app": {
         "type": "string",
+        "minLength": 1,
+        "maxLength": 4096,
         "description": (
             "App display name (e.g. 'Youty', 'Finder', 'Safari') or path to .app bundle. "
             "Klyk launches the app automatically on first use."
@@ -405,18 +417,19 @@ _CONFIRM_DESTRUCTIVE = {
 _WINDOW_ID_PARAM = {
     "window": {
         "type": "string",
+        "minLength": 1,
+        "maxLength": 256,
         "description": (
-            "Optional window label (A, B, C, ...) from list_windows. When set, the tool targets "
-            "that specific window — raising it first if needed, and using its bounds for "
-            "coordinates and screenshots. Labels are stable per window across calls. "
-            "Omit for the common single-window case; default = app's frontmost window."
+            "Window label from list_windows. Omit to keep the session's selected window. "
+            "Reading a window never raises it in autonomous/background mode."
         ),
     },
     "window_id": {
         "type": "integer",
+        "minimum": 1,
+        "maximum": 4294967295,
         "description": (
-            "Optional raw CG window ID (advanced). Prefer 'window' (the A/B/C label) for "
-            "readability — they refer to the same windows. Either one works."
+            "Exact window ID returned by inspect/list_windows; equivalent to window."
         ),
     },
 }
@@ -446,7 +459,14 @@ TOOLS = [
     types.Tool(
         name="inspect",
         description=(
-            "Observe unknown or visual UI: a screenshot plus up to 50 interactive AX elements. Use detail='slim' (no image, up to 15 elements) for known focus, value, presence, or modal checks. Launches the app if needed. Coordinates are window-relative logical pixels; element x/y are centers. Prefer semantic labels for actions, OCR/template grounding when AX is sparse, and coordinates as fallback. AX values describe structure/state; the image describes rendering; use get_pixel/get_pixels/read_grid for exact colors. A post-action capture allows a short repaint interval, but verify the visible outcome rather than assuming readiness. AX collection is best-effort and does not prevent a usable screenshot. Resolve focus_warning before acting; overlap_warning means composited pixels may belong to an occluding window, so re-observe an unobscured target. save_path writes the PNG instead of returning inline image data; a write failure returns the image plus save_error."       ),
+            "Start here for unfamiliar UI: fresh target-window image and up to 50 controls. "
+            "Use detail='slim' for a small text-only state check. Coordinates are window-relative "
+            "logical pixels; element x/y are centers. Use click_element for a named control, "
+            "click for a visual target, and fill_field to replace text. Capture excludes overlapping "
+            "windows. AX failure leaves the image usable. Pixels describe appearance; AX describes "
+            "controls and values. Check the changed state after acting. save_path saves the image "
+            "instead of returning it; failed saving keeps the image in the response."
+        ),
         inputSchema={
             "type": "object",
             "properties": {
@@ -480,8 +500,11 @@ TOOLS = [
     types.Tool(
         name="screenshot",
         description=(
-            "A failed window capture returns an error; it never widens to the full desktop. "
-            "Capture only the app image, without AX elements. Use inspect for an unknown UI when both pixels and actionable labels are useful; use AX-only reads for known structural checks. Screenshot is appropriate for rendering, layout, and visual before/after verification. Window coordinates, focus_warning, overlap_warning, and save_path follow inspect. display (index from screen_info or 'main') captures a whole display in screen coordinates and overrides window_id. A successful capture is evidence to inspect, not proof an earlier action succeeded."
+            "Image-only observation for visual checks; use inspect when you also need controls. "
+            "Captures the selected window even when covered, in window-relative logical pixels. "
+            "display='main' or a screen_info index explicitly captures a display in screen coordinates "
+            "without opening an app. Failed window capture never widens to the desktop. "
+            "save_path omits the inline image only when saving succeeds."
         ),
         inputSchema={
             "type": "object",
@@ -504,7 +527,7 @@ TOOLS = [
                     ),
                 },
             },
-            "required": ["app"],
+            "anyOf": [{"required": ["app"]}, {"required": ["display"]}],
         },
     ),
     types.Tool(
@@ -592,6 +615,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "duration": {
@@ -616,17 +640,7 @@ TOOLS = [
     types.Tool(
         name="ax_action",
         description=(
-            "Invoke an accessibility action on the element at (x, y) directly — bypassing "
-            "the mouse pipeline. More reliable than click for activating controls whose "
-            "hit area is small, whose layout is dynamic, or which respond cleanly to AX "
-            "but oddly to synthetic clicks (accessibility-focused apps, custom controls). "
-            "Common actions: AXPress (primary action — buttons, links), AXShowMenu "
-            "(open contextual menu), AXPick (choose an item in a combobox/popup), "
-            "AXIncrement / AXDecrement (sliders, steppers), AXCancel (dismiss / close), "
-            "AXConfirm (accept default). On failure the response includes available_actions "
-            "for that element so the agent can retry with a supported action — no extra "
-            "round-trip needed to discover what the element supports. Coordinates are "
-            "window-relative, same space as click."
+            'Perform a known accessibility action at window-relative x/y in the selected window. Prefer click_element for a named control and click for a visual target. Examples: AXPress, AXShowMenu, AXPick, AXIncrement/AXDecrement, AXCancel, AXConfirm. Unsupported actions return available_actions; failed delivery must be observed before retrying. This path does not move the cursor.'
         ),
         inputSchema={
             "type": "object",
@@ -706,8 +720,11 @@ TOOLS = [
             "\n"
             "`target_app` — when set, the target label is resolved inside that app's AX tree "
             "(klyk launches it if not running). Cross-app drags always go through the visible "
-            "cursor path (SkyLight is PID-scoped), so the cursor will move during a cross-app "
-            "drag regardless of session mode. The drag still works invisibly within the source "
+            "cursor path (SkyLight is PID-scoped), so background refuses cross-app drags before "
+            "launching or activating a target. Before a visible cross-app mouse-down, system-wide "
+            "hit tests must match both intended apps and selected windows; covered or unknown "
+            "endpoints refuse without input. Uncover the windows and inspect again. "
+            "The drag still works invisibly within the source "
             "app in autonomous/background mode.\n"
             "\n"
             "`hover_seconds` (default 0) holds the mouse at the target, still pressed, before "
@@ -716,10 +733,11 @@ TOOLS = [
             "\n"
             "Response: `source`, `target`, `source_via` / `target_via` ('ax'|'ocr'), `via` "
             "(delivery path), `cross_app: true` when target_app was used. `source_index` / "
-            "`target_index` (default 0) disambiguate multiple matches. `window` scopes the "
-            "source-side search. Modifiers stamp across the whole drag in seamless mode; the "
-            "cursor_warp fallback (used for cross-app and humanoid mode) doesn't apply them — "
-            "same limitation as plain `drag`."
+            "`target_index` explicitly disambiguate equally ranked matches; omission refuses an "
+            "ambiguous endpoint. `window` scopes the source-side search. Both delivery paths "
+            "preserve the requested button and modifiers. Windowless targets require a nonempty "
+            "app-scoped AX rectangle with unchanged label/index, geometry and process identity "
+            "immediately before delivery; placeholder desktop coordinates are never accepted."
         ),
         inputSchema={
             "type": "object",
@@ -728,14 +746,22 @@ TOOLS = [
                 **_WINDOW_ID_PARAM,
                 "source_label": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "pattern": "\\S",
                     "description": "Visible text on the drag source (partial, case-insensitive).",
                 },
                 "target_label": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "pattern": "\\S",
                     "description": "Visible text on the drop target (partial, case-insensitive).",
                 },
                 "target_app": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 4096,
                     "description": (
                         "Optional app for the target label, when different from the source "
                         "`app`. Use for cross-app drags (Finder → Dock Trash, Photos → Mail). "
@@ -744,13 +770,15 @@ TOOLS = [
                 },
                 "source_index": {
                     "type": "integer",
-                    "default": 0,
-                    "description": "Which source match to use when multiple (0-based).",
+                    "minimum": 0,
+                    "maximum": 199,
+                    "description": "Explicit 0-based source match; omission refuses equally ranked matches.",
                 },
                 "target_index": {
                     "type": "integer",
-                    "default": 0,
-                    "description": "Which target match to use when multiple (0-based).",
+                    "minimum": 0,
+                    "maximum": 199,
+                    "description": "Explicit 0-based target match; omission refuses equally ranked matches.",
                 },
                 "hover_seconds": {
                     "type": "number",
@@ -794,6 +822,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "text": {"type": "string"},
@@ -843,25 +872,7 @@ TOOLS = [
     types.Tool(
         name="press_key",
         description=(
-            "Press a key or key combination. Examples: 'Return', 'Escape', 'Tab', 'Backspace', "
-            "'Cmd+S', 'Cmd+Shift+Z'. Arrow keys are 'Up'/'Down'/'Left'/'Right' (the web "
-            "'ArrowUp'/'ArrowLeft' names also work). 'Backspace'/'Delete' both map to delete-left; "
-            "'forwarddelete'/'del' for forward-delete. "
-            "Batch form: pass `keys` (ordered array, mutually exclusive with `key`) and/or "
-            "`repeat` to fire a sequence with a single focus raise — e.g. "
-            "`{keys:['Down','Right'], repeat:50}` fires 100 keys. Cap: 1000 total per call. An "
-            "~18 ms inter-press delay is applied automatically (Chromium coalesces fast repeats). "
-            "Keys route to the app's key window. Plain keystrokes reach a backgrounded native "
-            "app invisibly (no activation). Two cases need the target frontmost and are handled "
-            "for you: Chromium-based apps (browsers/Electron, whose renderer drops keydowns to a "
-            "background window) and command-key shortcuts (Cmd+…, which macOS routes through the "
-            "frontmost app's menu bar — so e.g. Cmd+A to a backgrounded app would otherwise hit "
-            "whatever is in front). In both, autonomous briefly brings the target frontmost so the "
-            "keys land (no humanoid needed); background mode returns requires_foreground. "
-            "Pass `window`/`window_id` to raise a specific "
-            "window first when driving multiple windows of the same app. A `focus_warning` in "
-            "the response means the raise didn't take and keys landed in the wrong window — "
-            "stop, dismiss the blocker, retry."
+            "Press key='Cmd+S' or keys=['Tab','Return']; key and keys are mutually exclusive. repeat repeats the sequence, up to 1000 total presses. Arrows accept Up/Down/Left/Right or ArrowUp/etc.; Backspace and Delete delete left, forwarddelete/del delete right. Plain native keys can reach a background window. Chromium keys and Cmd shortcuts need activation: autonomous permits it, background refuses. window/window_id selects the keyboard target; failed focus stops input. Use type_text for text and hold_key for a sustained key press."
         ),
         inputSchema={
             "type": "object",
@@ -872,6 +883,7 @@ TOOLS = [
                 "keys": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "minItems": 1,
                     "maxItems": 1000,
                     "description": "Ordered sequence of keys to press. Mutually exclusive with `key`.",
                 },
@@ -890,21 +902,7 @@ TOOLS = [
     types.Tool(
         name="hold_key",
         description=(
-            "Press a key and hold it down for `duration` seconds, then release. "
-            "Use when the target reacts to a key being held — game movement (W/A/S/D, arrows, "
-            "Space), browser scroll-spy on Space, push-to-talk shortcuts, any app where a quick "
-            "press fires once but a hold drives continuous behaviour. The keydown is re-posted "
-            "every 50 ms during the hold so apps that listen for key-repeat see one. "
-            "For Shift/Cmd/Option held DURING another action (Shift+click for range select, "
-            "Cmd+drag for duplicate, etc.), don't use this — pass `modifiers:[...]` directly to "
-            "click/double_click/scroll/drag instead; those already stamp the modifier flag for "
-            "the full action invisibly. hold_key is for non-modifier keys. "
-            "Routes via CGEventPostToPid — invisible for native apps regardless of session mode "
-            "(no cursor move, no focus change). On Chromium-based apps (browsers and Electron) the "
-            "renderer drops keydowns to a background window, so autonomous mode briefly brings it "
-            "frontmost (background mode "
-            "returns requires_foreground). The emergency-stop chord (Cmd+Shift+Escape) is checked "
-            "every 50 ms during the hold so a long hold doesn't block escape."
+            "Hold a non-modifier key for duration seconds, with repeat events every 50 ms and guaranteed release on interruption. For Shift/Cmd held during click or drag, use that tool's modifiers parameter instead. Native plain keys can stay in the background; Chromium keys and Cmd shortcuts need activation and background mode refuses. window/window_id selects the keyboard target. The physical emergency-stop shortcut remains active throughout."
         ),
         inputSchema={
             "type": "object",
@@ -934,18 +932,7 @@ TOOLS = [
     types.Tool(
         name="press_system_key",
         description=(
-            "Fire a system / media key — volume, mute, brightness, play/pause, "
-            "track skip, keyboard backlight, eject. These keys live outside the "
-            "regular keyboard event path (NX_SYSDEFINED, not CGEventCreateKeyboardEvent), "
-            "so they need their own tool — press_key would silently fail on them. "
-            "SCOPE: system-wide. volume_up here behaves identically to pressing F12 "
-            "on an Apple keyboard — affects the whole OS, not the foreground app. "
-            "Supported names: volume_up, volume_down, mute, brightness_up, "
-            "brightness_down, play_pause, next_track, previous_track, fast_forward, "
-            "rewind, eject, keyboard_brightness_up, keyboard_brightness_down, "
-            "keyboard_brightness_toggle. The `app` parameter is required for "
-            "session continuity (logging, timing) but doesn't route the keystroke — "
-            "media keys are global."
+            'Send a system-wide media or hardware key. Use the key enum for volume, brightness, playback, track navigation, keyboard backlight or eject; ordinary key combinations belong in press_key. These affect the whole Mac regardless of app. app supplies session context only.'
         ),
         inputSchema={
             "type": "object",
@@ -968,28 +955,7 @@ TOOLS = [
     types.Tool(
         name="scroll",
         description=(
-            "Scroll at window-relative position (x, y). `direction` is one of "
-            "up / down / left / right; `amount` is the line count "
-            "(kCGScrollEventUnitLine). "
-            "Modifiers: Cmd+scroll typically zooms; Shift+scroll is horizontal in some apps.\n"
-            "\n"
-            "FOCUSED-CONTAINER CAVEAT (SwiftUI apps — System Settings, parts of "
-            "Music / Notes / Mail): SwiftUI scroll views route wheel events by "
-            "KEYBOARD FOCUS, not cursor position. If the focused element isn't "
-            "where you want to scroll (`inspect` shows it via the `focused: true` "
-            "flag), the scroll lands on the wrong pane — typically the sidebar. "
-            "Fix before scrolling: `click_element` or `click` any visible row in "
-            "the target pane to shift focus there, then scroll. AppKit apps "
-            "(Finder, Safari, Mail proper) route by cursor position and aren't "
-            "affected.\n"
-            "\n"
-            "SEAMLESS MODE (background / autonomous): scroll wheel event routes through "
-            "SkyLight to the target PID — cursor doesn't move, target window isn't raised, and "
-            "the app is never activated (macOS scrolls the window under the pointer without "
-            "bringing it forward). Fully invisible whether or not the target is frontmost — ideal "
-            "for scrolling a background app behind the user's foreground work. Response carries "
-            "`via:'skylight'`. In humanoid mode response carries `via:'cursor_warp'` and the "
-            "cursor warps to (x, y) before the wheel event fires."
+            'Scroll at window-relative x/y; direction is up/down/left/right and amount is a line count. Native autonomous/background input uses the selected window without moving the cursor or activating the app; humanoid uses visible input. Some SwiftUI panes route scrolling by keyboard focus: if needed, click a row in the intended pane first and confirm focused:true in inspect. modifiers applies throughout, e.g. Cmd for app-specific zoom or Shift for horizontal scrolling. via reports delivery; inspect verifies the resulting position.'
         ),
         inputSchema={
             "type": "object",
@@ -999,7 +965,7 @@ TOOLS = [
                 "x": {"type": "number"},
                 "y": {"type": "number"},
                 "direction": {"type": "string", "enum": ["up", "down", "left", "right"]},
-                "amount": {"type": "integer", "default": 3},
+                "amount": {"type": "integer", "minimum": 1, "maximum": 1000, "default": 3},
                 "modifiers": {
                     "type": "array",
                     "items": {"type": "string", "enum": ["cmd", "shift", "alt", "ctrl"]},
@@ -1051,7 +1017,8 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
-                "seconds": {"type": "number", "description": "Seconds to wait; prefer a known readiness signal or a short delay followed by observation."},
+                "seconds": {"type": "number", "minimum": 0, "maximum": 30,
+                            "description": "Seconds to wait (0–30); prefer a known readiness signal or a short delay followed by observation."},
             },
             "required": ["seconds"],
         },
@@ -1059,40 +1026,24 @@ TOOLS = [
     types.Tool(
         name="wait_for",
         description=(
-            "Wait until specific text appears in the UI's accessibility tree, then return the "
-            "matching element. Polls every 0.1 s and exits the moment the condition is met — "
-            "faster than a fixed wait when the readiness signal is real AX text.\n"
-            "\n"
-            "**HARD PRECONDITION — the readiness signal MUST be visible AX text** (a label, "
-            "value, or title that the OS accessibility framework exposes). DO NOT call wait_for "
-            "on any of these:\n"
-            "  • Web content inside a browser (Chrome, Safari, Edge). Browser web AX is lazy "
-            "and incomplete; this is the canonical misuse and burns the full timeout for "
-            "nothing.\n"
-            "  • Canvas-rendered text (web games, code editors with canvas-only rendering, "
-            "Wordle-style games — the cells aren't AX text).\n"
-            "  • OCR-only labels (anything that doesn't appear as AXValue/AXLabel/AXTitle).\n"
-            "  • Non-text readiness signals (spinner disappearing, button enabling, color "
-            "change, animation finishing). For those use a `wait(seconds)` plus `inspect` or "
-            "`read_grid` in a `run`.\n"
-            "\n"
-            "Speculative use is a footgun: if the text never appears, the call sits on the "
-            "full timeout before failing — often slower than the naïve fixed wait it was "
-            "meant to replace. Default timeout is 4 s for this reason (was 10 s; lowered "
-            "after a real session lost 8 s to a single speculative call on web AX). Only "
-            "raise the timeout when you're certain the text will appear within the window."
+            "Wait for text already known to be exposed in the target window's accessibility tree. Polls every 0.1 s; default timeout 4 s. Do not use speculatively for browser content, canvas/OCR-only text, spinners, color changes or animations: a missing AX signal consumes the entire timeout. Use wait_for_visual for a known image template, or a short wait followed by inspect when the signal is not accessible text. Returns the matching element when found."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "text": {
                     "type": "string",
+                    "minLength": 1,
+                    "pattern": "\\S",
                     "description": "Text to wait for (partial match, case-insensitive).",
                 },
                 "timeout": {
                     "type": "number",
                     "default": 4,
+                    "minimum": 0,
+                    "maximum": 30,
                     "description": (
                         "Max seconds to wait (default 4, max 30). Keep low unless you have "
                         "strong evidence the AX text will appear — failed waits sit on the "
@@ -1122,15 +1073,18 @@ TOOLS = [
             "Use to verify field content after typing, or to read a label programmatically. "
             "Retries up to 4× to handle SwiftUI @State propagation delay. "
             "Returns {value, found, status}: status='ok' (value read), "
+            "'unreadable_value' (AX exposed a value but it could not be read completely; inconclusive), "
             "'no_value' (element has no AXValue — don't keep polling, try a "
             "different verification path), 'no_element' (no AX element at the "
             "coord — coordinate may be wrong, or AX is unavailable on this "
-            "surface)."
+            "surface). Values are capped at 12000 characters with truncated=true when shortened; "
+            "a prefix is not proof of the complete field contents."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x": {"type": "number"},
                 "y": {"type": "number"},
             },
@@ -1141,7 +1095,7 @@ TOOLS = [
         name="get_pixel",
         description=(
             "LAST RESORT for a SINGLE-POINT color check. Returns `{r, g, b, hex}` at one "
-            "window-relative pixel. ~5 ms.\n"
+            "window-relative pixel.\n"
             "\n"
             "Use only when the target is truly one pixel with no glyph on top (status light, "
             "indicator dot). For:\n"
@@ -1177,7 +1131,7 @@ TOOLS = [
             "the minority of pixels covered by a centered glyph → returns the surrounding fill, "
             "no glyph-dodge offset needed. → `{regions:[{x,y,width,height,r,g,b,hex}...]}`.\n"
             "\n"
-            "One capture (~40 ms) regardless of N — pays off from ~3 samples. Z-order "
+            "One capture shared by every sample. Z-order "
             "independent, window-relative. Bounds-validated before capture."
         ),
         inputSchema={
@@ -1187,6 +1141,7 @@ TOOLS = [
                 **_WINDOW_ID_PARAM,
                 "points": {
                     "type": "array",
+                    "maxItems": 4096,
                     "description": "List of window-relative (x, y) points for exact 1×1 sampling.",
                     "items": {
                         "type": "object",
@@ -1199,6 +1154,7 @@ TOOLS = [
                 },
                 "regions": {
                     "type": "array",
+                    "maxItems": 4096,
                     "description": (
                         "List of window-relative rects {x, y, width, height} for "
                         "median sampling. Each rect should bound a single cell (e.g. "
@@ -1224,28 +1180,7 @@ TOOLS = [
     types.Tool(
         name="read_grid",
         description=(
-            "**Default tool for any grid-shaped UI.** Returns text (AX) AND fill color (median "
-            "over a 60%-inset rect — robust against the centered letter glyph that defeats "
-            "single-pixel sampling) for every cell in one call. No agent-side image "
-            "interpretation, no chain of get_pixel calls.\n"
-            "\n"
-            "Use for: Wordle-style word games, sudoku/crossword/minesweeper, spreadsheets and "
-            "tables, calendar heatmaps, status-indicator grids, LED/equalizer matrices — "
-            "anything answering 'what's in cell (r, c) and what state is it in?'. Sampling "
-            "one pixel at a cell's center hits the GLYPH, not the fill; this tool exists "
-            "specifically to dodge that trap.\n"
-            "\n"
-            "Geometry: window-local top-left (`x`, `y`), per-cell size, row/col counts, "
-            "optional `cell_gap` for gutters. Determine once; cell geometry rarely changes "
-            "mid-game.\n"
-            "\n"
-            "Output: `{ok, rows, cols, cells: [[{row, col, x, y, text, r, g, b, hex}, ...]]}`. "
-            "`text` is null if AX exposes none. Note the two sources differ on occlusion: "
-            "color is sampled from the target window's own image (correct even if covered), "
-            "while `text` reads the frontmost element at that point — so if another window "
-            "overlaps the grid, colors stay right but `text` may reflect the overlay. Keep the "
-            "grid unobstructed. Window-local coords match click/fill_field. "
-            "Latency: ~150 ms for a 30-cell Wordle grid (one capture + batched AX)."
+            "Read text and fill color for a regular grid in the selected window, including when covered. Provide the window-relative top-left, cell size, rows, cols and optional gap; at most 400 cells per call. Colors are medians across each cell's inner 70% area, reducing interference from centered glyphs. Text comes from one bounded accessibility read and is null when unavailable. Returns cells[row][col] with center x/y, text and RGB/hex. Missing pixel samples are null with ok=false, never invented black. AX failure preserves color results; absent text is not proof of an empty cell. Use get_pixels for irregular samples."
         ),
         inputSchema={
             "type": "object",
@@ -1342,8 +1277,8 @@ TOOLS = [
             "matching item through AX. Use click_menu for menu-bar paths and click_element for "
             "ordinary buttons. The app must be frontmost; background never activates it. Polls up "
             "to timeout for native menu items, with a window-scoped fallback for Electron menus. "
-            "Exact text ranks before substring matches. Specify item_index to choose among repeated"
-            " labels. No OCR fallback: a native popup is a separate capture surface. Missing items "
+            "Exact text ranks before substring matches. Equally ranked matches are refused unless "
+            "item_index is supplied. No OCR fallback: a native popup is a separate capture surface. Missing items "
             "return an error and dismiss the menu. When same-app windows overlap, focus_window "
             "first so the right-click hits the intended window. Returns matched_item, via, wait_ms;"
             " observe the action outcome after menu animation completes."
@@ -1358,12 +1293,15 @@ TOOLS = [
                 "y": {"type": "number", "description": "Window-relative y of the right-click."},
                 "item_label": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "pattern": "\\S",
                     "description": "Visible text of the menu item to select (partial, case-insensitive).",
                 },
                 "item_index": {
                     "type": "integer",
-                    "default": 0,
-                    "description": "Which match to pick when the label has multiple hits (0-based).",
+                    "minimum": 0,
+                    "description": "Explicit 0-based match; omit to refuse equally ranked repeated labels.",
                 },
                 "timeout": {
                     "type": "number",
@@ -1386,7 +1324,7 @@ TOOLS = [
             "even if it isn't currently frontmost — use this for tiling Chrome windows across "
             "screen quadrants. "
             "Coordinates are screen-space, origin top-left. Width/height optional — omit both "
-            "to move without resizing."
+            "to move without resizing; one dimension preserves the other dimension."
         ),
         inputSchema={
             "type": "object",
@@ -1395,8 +1333,8 @@ TOOLS = [
                 **_WINDOW_ID_PARAM,
                 "x": {"type": "integer", "description": "Screen x for window top-left."},
                 "y": {"type": "integer", "description": "Screen y for window top-left."},
-                "width": {"type": "integer"},
-                "height": {"type": "integer"},
+                "width": {"type": "integer", "minimum": 1},
+                "height": {"type": "integer", "minimum": 1},
             },
             "required": ["app", "x", "y"],
         },
@@ -1429,15 +1367,19 @@ TOOLS = [
             (
             "Handle an already-open native save/open dialog or cancel a visible dialog. "
             "Autonomous/humanoid activate the app; background refuses. For save, an accessible Save"
-            " As field must exist before input is sent. With path, save sets the filename and "
-            "navigates through a matching sidebar location; arbitrary nested folders outside "
-            "sidebar locations are unsupported and return an error without saving. Without path, "
-            "save uses the panel's current filename and directory. A supplied save path is checked "
+            " As field and exactly one accessible dialog must exist before input is sent. With "
+            "path, the sidebar location must expose an exact full-path URL matching the requested "
+            "directory before save navigation is attempted; names alone are not destination proof. "
+            "Unsupported locations return an error without saving. Without path, save uses the "
+            "panel's current filename and directory and reports saved=null, verified=false. A supplied save path is checked "
             "for creation or a metadata change and a closed save/confirmation panel; unchanged "
             "existing files return saved=false. This does not verify file contents. "
-            "Open may use Go To Folder and reports input delivery, not independent "
-            "document verification. Inspect the dialog first and verify the resulting file/document"
-            " afterward."
+            "With path, Open validates the nested Go to Folder chooser, sets and reads its exact "
+            "path field through accessibility, uses scoped native confirmation when available, otherwise one "
+            "foreground Return for the recognized path field, and confirms chooser closure before Open or Choose. "
+            "Missing chooser evidence stops path input; unknown effects never use a keyboard fallback. "
+            "Open reports button delivery, not independent document verification. Inspect the "
+            "dialog first and verify the resulting file or document afterward."
         )
         ),
         inputSchema={
@@ -1477,6 +1419,7 @@ TOOLS = [
                 "apps": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "maxItems": 64,
                     "description": "List of app display names to close.",
                 },
             },
@@ -1568,24 +1511,13 @@ TOOLS = [
     types.Tool(
         name="focus_window",
         description=(
-            "Bring a specific window to front: supply either 'window' (label from list_windows) "
-            "or 'window_id'; 'app' alone is invalid. Make it "
-            "the key window. Required before sending keyboard input that must land in a specific "
-            "window — keys route to whichever window of the app is currently key. "
-            "Most tools (screenshot, click, press_key, run) accept the 'window' label directly and "
-            "call focus_window internally as needed; use this tool only when you want to raise a "
-            "window without performing any other action (e.g. user-visible window switch). "
-            "Response shape: {ok, window_id, via, focused, warning?}. `focused=true` confirms the "
-            "target is now the key window — keys/clicks will land there. `focused=false` means the "
-            "raise didn't take (typically a modal in another window of the same app is holding "
-            "focus); the `warning` field explains what to do."
+            'Explicitly bring a window to the front and make it key. Requires window or window_id from list_windows; app alone is invalid. Background refuses activation unless the window is already key. Use only when a visible window switch is intended: observations remain in the background, and input tools handle their own targeting. Returns ok, window_id, via and focused. If focused=false, resolve the reported blocker before sending input; a modal may hold focus in a different window.'
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
-                "window": {"type": "string", "description": "Window label from list_windows. Required unless window_id is supplied."},
-                "window_id": {"type": "integer", "description": "Raw CG window ID. Required unless window is supplied."},
+                **_WINDOW_ID_PARAM,
             },
             "required": ["app"],
             "anyOf": [{"required": ["window"]}, {"required": ["window_id"]}],
@@ -1628,18 +1560,21 @@ TOOLS = [
     types.Tool(
         name="select_option",
         description=(
-            "Select an option from a native dropdown, popup button, or combobox. "
-            "Clicks the control at (x, y) to open it, then selects the option by name. "
-            "Use for NSPopupButton, NSComboBox, and native macOS option controls. "
-            "For web dropdowns, use Playwright MCP select_option instead."
+            "Select a native dropdown or combobox using keyboard type-to-select. Coordinates "
+            "are window-relative. Autonomous/humanoid focus the selected window and use visible "
+            "input; background refuses. Returns verified=true only when the selected value "
+            "matches the requested option exactly after text normalization. For custom web "
+            "menus, inspect and click_element provide the normal visual workflow."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x": {"type": "number", "description": "X coordinate of the control"},
                 "y": {"type": "number", "description": "Y coordinate of the control"},
-                "option": {"type": "string", "description": "Exact text of the option to select"},
+                "option": {"type": "string", "minLength": 1, "maxLength": 1000,
+                           "description": "Exact text of the option to select"},
             },
             "required": ["app", "x", "y", "option"],
         },
@@ -1647,51 +1582,21 @@ TOOLS = [
     types.Tool(
         name="ax_snapshot",
         description=(
-            "PREFER THIS as your default first look — pure AX, no image, the cheapest and most "
-            "current way to see an app. Returns all labeled and interactive UI elements in the "
-            "app window as a flat list. "
-            "Each element includes role, label (if any), value (if any), center coordinates (x, y), "
-            "and `focused: true` on the one element currently holding keyboard focus (when any). "
-            "Use to inspect the full UI structure without a screenshot, verify element state "
-            "programmatically, or locate controls by label before clicking. "
-            "Covers all windows including floating menus and sheets. "
-            "On browsers, returns the full document tree (not just the visible viewport) — "
-            "use this to answer 'is X anywhere on this page?' without scrolling and re-screenshotting. "
-            "Reach for `inspect` (adds the image) or `screenshot` only when AX is thin or empty "
-            "(Electron/web/canvas) or the question is genuinely visual (layout, rendering, color)."
+            "Expanded text-only accessibility inspection when inspect's short control list is "
+            "insufficient. Returns roles, labels, values and window-relative centers from the "
+            "selected window. Traversal is bounded: absence is not proof that an element does "
+            "not exist. Use inspect for unfamiliar visual UI and read_text for text absent from AX."
         ),
         inputSchema={
             "type": "object",
-            "properties": _APP_PARAM,
+            "properties": {**_APP_PARAM, **_WINDOW_ID_PARAM},
             "required": ["app"],
         },
     ),
     types.Tool(
         name="read_text",
         description=(
-            "Extract visible text from the app window using on-device OCR (Apple Vision). "
-            "Use when text is rendered as pixels and not exposed via AX — video captions, "
-            "canvas-rendered editors, in-game text, PDFs in a viewer, image-only screenshots "
-            "inside the app, anywhere `ax_snapshot` returns nothing useful.\n"
-            "\n"
-            "Precedence: prefer `ax_snapshot` or `inspect` first — AX is faster (~30 ms vs "
-            "~50-150 ms) and returns roles, not just text. Reach for read_text only when AX "
-            "is empty for the surface you care about.\n"
-            "\n"
-            "Optional `x, y, width, height` restricts results to a window-relative rect (the "
-            "full window is still OCRed; observations whose center falls outside are filtered "
-            "out). Optional `query` narrows results to text containing that substring "
-            "(case-insensitive). `level`: 'fast' (default, ~50 ms) or 'accurate' (~150 ms, "
-            "catches small/stylized text fast mode misses). "
-            "`languages` (BCP-47 list like ['de-DE', 'en-US'] or ['zh-Hans']) — omit to inherit "
-            "the macOS system preferred-language list, which already handles a German / French "
-            "/ Japanese Mac transparently. Set explicitly only when you need to recognize text "
-            "in a language the host system isn't configured for.\n"
-            "\n"
-            "Returns `{ok, count, observations: [{text, x, y, width, height, confidence}, ...], "
-            "full_text}`. Coordinates are window-relative — ready to pass to click/fill_field. "
-            "`full_text` concatenates observations in reading order (top→bottom, left→right) for "
-            "fast scanning. `via:'ocr'`. Z-order independent."
+            "Read visible text absent from accessibility, using local Apple Vision OCR. Use inspect first for unfamiliar UI. Supply all of x, y, width, height to recognize only that window-relative region; query filters matching text. level='accurate' helps small or stylized text; 'fast' is default. languages defaults to macOS preferred languages. Returns up to 200 observations with text capped at 200 characters, center x/y, size and confidence, plus up to 12000 characters of full_text in reading order. truncated=true and observation_count report omitted content; omission is not proof of absence. Narrow the region/query when truncated. Coordinates match the full window screenshot even for a region."
         ),
         inputSchema={
             "type": "object",
@@ -1728,7 +1633,7 @@ TOOLS = [
                     "enum": ["fast", "accurate"],
                     "default": "fast",
                     "description": (
-                        "'fast' (default) is ~3-5× quicker on Apple Silicon and adequate for "
+                        "'fast' (default) is intended for "
                         "crisp UI text. 'accurate' catches small, low-contrast, or stylized "
                         "text that fast mode misses."
                     ),
@@ -1736,6 +1641,7 @@ TOOLS = [
                 "languages": {
                     "type": "array",
                     "items": {"type": "string"},
+                    "maxItems": 32,
                     "description": (
                         "Optional BCP-47 language codes (e.g. ['de-DE', 'en-US'], "
                         "['zh-Hans'], ['ja-JP']) for Vision to recognize. Omit to use the "
@@ -1745,13 +1651,17 @@ TOOLS = [
                     ),
                 },
             },
+            "dependentRequired": {
+                "x": ["y", "width", "height"], "y": ["x", "width", "height"],
+                "width": ["x", "y", "height"], "height": ["x", "y", "width"],
+            },
             "required": ["app"],
         },
     ),
     types.Tool(
         name="run",
         description=(
-            "Execute a predictable sequence in order, using each tool's normal parameters. Observe first; batch only steps whose intermediate state is understood, and include the needed observation at the end. Re-observe separately when a popup, redirect, autocomplete, or other uncertain branch requires a decision. Stops on the first invalid, failed, blocked, ambiguous, or focus-warning step; skipped_steps counts unattempted remaining steps. It never retries actions. app and window/window_id are inherited unless the step overrides the window. Explicit window identity is preserved on every step. results retains observations and nontrivial action evidence; repetitive successful actions may collapse to a count. Top-level ok means the executed steps reported success, not that the task's intended outcome was independently verified. verify=true attaches focused state only. Resolve any requires_foreground_events or focus_warnings before continuing. Use wait_for only with a known available readiness signal, not speculative waits. Nested run sequences follow the same stop rules."
+            "Run predictable steps sequentially with each tool's normal arguments. Observe first and include the relevant observation at the end; stop for a separate decision at uncertain popups, redirects or autocomplete. app and window/window_id are inherited unless a step overrides them; changing app uses that app's own selected window. Stops at the first invalid, failed, blocked, ambiguous or focus-warning step and reports skipped_steps; never retries input. Retains observations and meaningful action evidence, compacting repetitive successes with the same delivery path. ok means steps reported success, not independently verified task completion. verify=true adds focused state only. Nested runs obey the same rules, up to 8 levels and 1000 total steps."
         ),
         inputSchema={
             "type": "object",
@@ -1760,9 +1670,11 @@ TOOLS = [
                 **_WINDOW_ID_PARAM,
                 "actions": {
                     "type": "array",
+                    "minItems": 1,
+                    "maxItems": 1000,
                     "items": {
                         "type": "object",
-                        "properties": {"tool": {"type": "string"}},
+                        "properties": {"tool": {"type": "string", "minLength": 1, "maxLength": 64}},
                         "required": ["tool"],
                         "additionalProperties": True,
                     },
@@ -1779,7 +1691,7 @@ TOOLS = [
     types.Tool(
         name="click_element",
         description=(
-            'Find a visible label and click its target. Prefer this to coordinates for labelled controls; use click_menu for menu-bar items. Searches AX first, then on-device OCR, with exact matches ranked ahead of prefixes and substrings. Both paths fail closed when multiple equally ranked best matches remain and index is omitted: no click, ambiguous=true, and capped candidates. An explicit zero-based index selects a match; window scopes the search. AX coordinates are resolved within the target app before action. via identifies AX action, matched SkyLight input, OCR input, or visible fallback. Background mode refuses operations requiring activation; autonomous permits the documented foreground fallback. On a miss, visible_text_candidates provides likely spellings and window-relative coordinates. Re-observe before retrying when the UI changed. User authorization is required for consequential actions; a label match is not consent.'
+            'Click a named control in the selected window. Searches accessibility first, then local OCR; exact labels rank ahead of prefixes and substrings. Equally ranked matches return ambiguous=true with candidates and no input unless index is supplied. Native AX actions recheck the label and window before delivery. Use click_menu for menu-bar paths, click for unlabeled visual targets. On a miss, visible_text_candidates suggests spellings. via reports delivery; observe the task outcome. Background refuses required activation; autonomous allows the documented fallback.'
         ),
         inputSchema={
             "type": "object",
@@ -1788,11 +1700,15 @@ TOOLS = [
                 **_WINDOW_ID_PARAM,
                 "label": {
                     "type": "string",
+                    "minLength": 1,
+                    "maxLength": 1000,
+                    "pattern": "\\S",
                     "description": "Text label to search for (partial match, case-insensitive).",
                 },
                 "index": {
                     "type": "integer",
                     "minimum": 0,
+                    "maximum": 199,
                     "description": (
                         "Explicit 0-based match to click. Omit it to fail closed when multiple "
                         "equally ranked AX or OCR matches remain."
@@ -1815,12 +1731,15 @@ TOOLS = [
             "receive the raw `template_b64` (typically 5–50 KB) — default is false so common "
             "use stays lean; only set true when you actually need the raw bytes (saving to "
             "disk, sending to another tool). "
-            "Crop tightly — include the icon itself with only a few pixels of padding."
+            "Crop tightly — include the icon itself with only a few pixels of padding. Out-of-window "
+            "regions are clipped and the actual region/size is reported; empty regions fail. The "
+            "per-session LRU cache is limited to 50 entries and 8 MiB; larger templates fail before eviction."
         ),
         inputSchema={
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "x1": {"type": "integer", "description": "Left edge of crop region (window-relative)"},
                 "y1": {"type": "integer", "description": "Top edge of crop region (window-relative)"},
                 "x2": {"type": "integer", "description": "Right edge of crop region (window-relative)"},
@@ -1852,6 +1771,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "template_id": {
                     "type": "string",
                     "description": "Server-cached template handle from get_template (preferred).",
@@ -1862,6 +1782,8 @@ TOOLS = [
                 },
                 "threshold": {
                     "type": "number",
+                    "minimum": 0,
+                    "maximum": 1,
                     "description": (
                         "Minimum confidence 0–1 (default 0.8). 0.95 for exact matches, "
                         "0.75–0.85 for elements with slight rendering variation."
@@ -1900,6 +1822,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 **_APP_PARAM,
+                **_WINDOW_ID_PARAM,
                 "template_id": {
                     "type": "string",
                     "description": "Server-cached template handle from get_template (preferred).",
@@ -1919,22 +1842,25 @@ TOOLS = [
                 "threshold": {
                     "type": "number",
                     "default": 0.8,
+                    "minimum": 0,
+                    "maximum": 1,
                     "description": "Minimum match confidence 0–1 (default 0.8).",
                 },
                 "timeout": {
                     "type": "number",
                     "default": 10,
+                    "minimum": 0,
+                    "maximum": 30,
                     "description": "Max seconds to wait (default 10, max 30).",
                 },
                 "poll_interval": {
                     "type": "number",
                     "default": 0.5,
+                    "minimum": 0.1,
+                    "maximum": 30,
                     "description": (
-                        "Sleep between polls in seconds (default 0.5, min 0.1). "
-                        "NOTE: this is added on top of per-poll work (screenshot ~300ms + match "
-                        "~30ms), so effective cycle is roughly poll_interval + 0.3s. Values below "
-                        "0.1 give diminishing returns — the screenshot+match floor sets the real "
-                        "minimum cycle, not this parameter."
+                        "Seconds between polls (default 0.5, range 0.1–30). Sleep is capped at "
+                        "the remaining timeout; poll only for a known visual change."
                     ),
                 },
                 "search_region": {
@@ -1969,12 +1895,22 @@ async def _get_session(args: dict, tool_name: str | None = None):
             return existing, False
         if "window_id" in args or "window" in args:
             await _refresh_window(existing, _resolve_window(args, args["app"]))
-    session, is_new = await get_or_create_session(
-        args["app"],
-        target=args.get("target"),
-        bundle_id=args.get("bundle_id"),
-        app_path=args.get("app_path"),
+    # Running apps can always be attached without focus changes. A cold launch
+    # is machine control, even when it was requested by an observation tool.
+    allow_launch = (
+        ownership.is_owner()
+        and not computer.emergency_stop_active()
+        and not (tool_name == "set_mode" and args.get("mode") == "background")
     )
+    options = {"target": args.get("target"), "bundle_id": args.get("bundle_id"),
+               "app_path": args.get("app_path"), "allow_launch": allow_launch}
+    if existing is None and allow_launch and tool_name in _OWNERSHIP_EXEMPT and _call_depth == 1:
+        with ownership.control_request():
+            session, is_new = await get_or_create_session(args["app"], **options)
+    else:
+        session, is_new = await get_or_create_session(args["app"], **options)
+    if existing is None and ("window_id" in args or "window" in args):
+        await _refresh_window(session, _resolve_window(args, args["app"]))
     if tool_name and tool_name in activity.ACTION_TOOLS:
         # Best-effort instrumentation; record_from_args swallows internally
         # but we guard once more so a bug in activity.py never breaks tool
@@ -2012,8 +1948,9 @@ def _resolve_window(args: dict, app: str) -> int | None:
 async def _refresh_window(session, window_id: int | None = None) -> None:
     """
     Refresh session bounds. If window_id is given, target that specific window;
-    otherwise fall back to the app's largest on-screen window.
+    otherwise retain the session's selected window. A missing target requires a fresh selection.
     """
+    window_id = window_id if window_id is not None else session.window_id
     if window_id is not None:
         win = await asyncio.get_event_loop().run_in_executor(
             None, lambda: capture.get_window_by_id(int(window_id))
@@ -2086,7 +2023,7 @@ async def _focus_if_needed(session, window_id: int | None) -> dict | None:
     try:
         result = await computer.raise_window(session.pid, int(window_id))
     except Exception as e:
-        log.warning(f"raise_window({window_id}) failed: {type(e).__name__}: {e}")
+        log.warning("target window focus failed (%s)", type(e).__name__)
         result = {
             "ok": False,
             "window_id": int(window_id),
@@ -2115,25 +2052,25 @@ def _focus_warning_from(status: dict | None) -> dict | None:
 
 
 # Which apps drive a Chromium renderer (browsers + Electron/CEF). An app's
-# engine never changes, so we resolve once per app name. Tiny (one entry per
-# distinct app touched). Keyed by display name; the Electron/CEF probe needs
-# the pid, taken from the session on first lookup.
-_chromium_based_cache: dict[str, bool] = {}
+# classification is cached by name and PID so a restarted/replaced app is rechecked.
+# The cache is bounded to 64 process identities.
+_chromium_based_cache: dict[tuple[str, int], bool] = {}
 
 
 def _is_chromium_based(session) -> bool:
     """True for apps whose UI is a Chromium renderer — Chromium browsers AND
     Electron/CEF apps. These mishandle synthetic SkyLight clicks/keys, so they
     take the real-cursor + activation path; native apps (incl. Tauri/WebKit)
-    stay on the invisible SkyLight path. Result cached per app name."""
+    stay on the invisible SkyLight path. Result cached per process identity."""
     app = session.app
-    cached = _chromium_based_cache.get(app)
+    key = (app, session.pid)
+    cached = _chromium_based_cache.get(key)
     if cached is not None:
         return cached
     result = (app in CHROMIUM_BROWSERS) or is_chromium_renderer_app(session.pid)
     if len(_chromium_based_cache) >= 64:
         _chromium_based_cache.pop(next(iter(_chromium_based_cache)))
-    _chromium_based_cache[app] = result
+    _chromium_based_cache[key] = result
     return result
 
 
@@ -2150,8 +2087,8 @@ async def _seamless_post(
     Chromium-vs-native routing decision, and the post call itself. `post_fn` is
     a callable taking `primer_first: bool` that performs the actual SkyLight post
     for the specific event type (click, double-click, drag, scroll). Returning
-    True/False from `post_fn` is the only success signal; raising from `post_fn`
-    is caught and surfaced as `{ok: False, error: ...}`.
+    True/False from `post_fn` describes delivery. Exceptions have uncertain effects
+    and stop the request instead of authorizing a second delivery path.
 
     Native click-family delivery is fully invisible: `make_window_key(target_wid)`
     flips the target window to key WITHOUT activating the app, raising the window,
@@ -2255,12 +2192,9 @@ async def _seamless_post(
     # the user's focus.
     if tool_name == "scroll":
         try:
-            ok = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: post_fn(needs_primer),
-            )
+            ok = await computer.run_input(lambda: post_fn(needs_primer))
         except Exception as e:
-            log.warning(f"skylight post raised in {tool_name}: {type(e).__name__}: {e}")
-            return {"ok": False, "error": "invisible_delivery_error"}
+            raise RuntimeError('Input delivery was interrupted; its effect is unknown. Observe before retrying.') from e
         if not ok:
             return {"ok": False, "error": "skylight_post_failed"}
         return {"ok": True, "via": "skylight"}
@@ -2283,20 +2217,12 @@ async def _seamless_post(
     # was removed from scroll on 2026-07-02, now removed from clicks too.
     keyed = False
     if target_wid is not None:
-        keyed = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: skylight.make_window_key(session.pid, int(target_wid)),
-        )
+        keyed = await computer.run_input(lambda: skylight.make_window_key(session.pid, int(target_wid)))
     try:
-        ok = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: post_fn(needs_primer),
-        )
+        ok = await computer.run_input(lambda: post_fn(needs_primer))
     except Exception as e:
-        # ctypes-level or framework-level failure inside skylight.py. Honor
-        # the docstring contract — caller gets {ok: False, error}, never a raw
-        # exception they can't react to. Autonomous callers fall through to the
-        # visible cursor-warp; background callers surface it.
-        log.warning(f"skylight post raised in {tool_name}: {type(e).__name__}: {e}")
-        return {"ok": False, "error": "invisible_delivery_error"}
+        # Do not repeat input after a native failure with uncertain side effects.
+        raise RuntimeError('Input delivery was interrupted; its effect is unknown. Observe before retrying.') from e
     if not ok:
         return {"ok": False, "error": "skylight_post_failed"}
     return {"ok": True, "via": "skylight+keyed" if keyed else "skylight"}
@@ -2535,39 +2461,20 @@ def _log_escalation(session, tool: str, x: int | None, y: int | None, reason: st
         # rare enough that this isn't on the hot path. Avoids importing
         # collections.deque for a one-line cap.
         del session.escalation_log[:len(session.escalation_log) - 500]
-    log.info(f"escalation: tool={tool} reason={reason} app={session.app}")
+    log.info("input delivery escalated (%s)", tool if tool in _TOOL_SCHEMAS else "unknown")
 
 
 async def _take_screenshot(session, window_id: int | None = None) -> tuple[str, int, int, dict | None]:
-    """
-    Capture the target window's screenshot. Returns (b64_png, width, height,
-    focus_status). focus_status is the raise_window dict when a specific window
-    was requested, or None when capturing the app's default window. Callers
-    should propagate focus_warning when focus_status.focused is False so the
-    agent can see that the captured image may be of a different window than
-    requested.
-    """
-    # Activate first so any focus-triggered scroll (e.g. YouTube JS) settles
-    # before we capture coordinates. Clicks must NOT re-activate or they'd
-    # cause the same scroll after the screenshot. SKIP all activation and
-    # window-raising in seamless modes — the whole point of those modes is
-    # to never disturb the user's foreground, and the capture path itself is
-    # z-order independent so it doesn't need the target to be frontmost.
+    """Observe the selected window without activating or raising any application."""
+    # The window capture is independent of z-order. Reading never needs focus,
+    # including humanoid sessions and callers without control ownership.
     focus_status: dict | None = None
-    if session.mode in ("background", "autonomous"):
-        # Seamless: never activate, never raise. Just refresh bounds.
-        pass
-    elif window_id is not None:
-        focus_status = await _focus_if_needed(session, window_id)
-        await asyncio.sleep(0.05)
-    else:
-        await computer.activate_app(session.pid)
-        await asyncio.sleep(0.25)
     await _refresh_window(session, window_id=window_id)
     # Wait for the repaint only when the previous leaf action mutated the UI;
     # passive looks stay near-instant. Fixes stale frames after click/type on
     # slow-repainting (Electron/web) surfaces — see _POST_ACTION_SETTLE_MS.
-    settle = _POST_ACTION_SETTLE_MS if _last_action_mutated else _PASSIVE_SETTLE_MS
+    elapsed = (time.monotonic() - getattr(session, 'last_mutation_at', 0.0)) * 1000
+    settle = max(0, round(_POST_ACTION_SETTLE_MS - elapsed))
     img_b64, w, h = await asyncio.get_event_loop().run_in_executor(
         None,
         lambda: capture.take_screenshot(
@@ -2589,6 +2496,7 @@ async def _resolve_label_in_window(
     filter_wid: int | None,
     filter_bounds: tuple[int, int, int, int] | None,
     cached_img_b64: str | None = None,
+    *, index_explicit: bool = True,
 ) -> dict:
     """
     Resolve a label to a SCREEN coordinate for the target element. AX search
@@ -2623,33 +2531,12 @@ async def _resolve_label_in_window(
             if query in _normalize_label(e.get("label", "") or "")
             or query in _normalize_label(e.get("value", "") or "")
         ]
-    elif filter_bounds is None:
-        # Generous candidate cap (>= 32): the walker returns AX-tree order and
-        # stops at the cap, so it must be wide enough that an exact label hit
-        # isn't truncated behind incidental substring hits before the caller's
-        # _rank_ax_matches can promote it. Walker deadline still bounds latency.
-        ax_matches = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: computer.ax_search_focused(
-                session.pid, query, max_results=max(index + 8, 32),
-            ),
-        )
-        ax_matches = _filter_for_browser(ax_matches, session.app)
     else:
-        elements = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: computer.ax_snapshot(session.pid)
-        )
-        elements = _filter_for_browser(elements, session.app)
-        x0, y0, x1, y1 = filter_bounds
-        elements = [
-            e for e in elements
-            if x0 <= e.get("x", 0) <= x1 and y0 <= e.get("y", 0) <= y1
-        ]
-        ax_matches = [
-            e for e in elements
-            if query in _normalize_label(e.get("label", "") or "")
-            or query in _normalize_label(e.get("value", "") or "")
-        ]
+        ax_matches = await asyncio.get_event_loop().run_in_executor(
+            None, lambda: computer.ax_search_focused(
+                session.pid, query, max_results=min(max(index + 8, 32), 200),
+                window_id=filter_wid or session.window_id))
+        ax_matches = _filter_for_browser(ax_matches, session.app)
 
     # Prefer an exact label/value hit over an incidental substring hit before
     # honouring `index` — keeps drag endpoints (and any other caller) locked to
@@ -2657,6 +2544,13 @@ async def _resolve_label_in_window(
     _rank_ax_matches(ax_matches, query)
 
     if ax_matches:
+        best_tier = min(_match_tier(ax_matches[0].get("label", ""), query),
+                        _match_tier(ax_matches[0].get("value", ""), query))
+        tied = [e for e in ax_matches if min(_match_tier(e.get("label", ""), query),
+                _match_tier(e.get("value", ""), query)) == best_tier]
+        if len(tied) > 1 and not index_explicit:
+            return {"ok": False, "ambiguous": True, "matches": tied[:8],
+                    "error": "Equally ranked AX drag endpoints require an explicit source_index or target_index."}
         if index >= len(ax_matches):
             return {
                 "ok": False,
@@ -2714,6 +2608,11 @@ async def _resolve_label_in_window(
             "matches": ocr_matches,
             "img_b64": img_b64,
         }
+    best_tier = _match_tier(ocr_matches[0].get("text", ""), query)
+    tied = [e for e in ocr_matches if _match_tier(e.get("text", ""), query) == best_tier]
+    if len(tied) > 1 and not index_explicit:
+        return {"ok": False, "ambiguous": True, "matches": tied[:8],
+                "error": "Equally ranked OCR drag endpoints require an explicit source_index or target_index."}
     # OCR coords come back relative to the captured window; translate to
     # screen-space so the returned `elem` is in the same space as AX matches.
     # The captured window is `filter_wid` (when explicit) or the session's
@@ -2730,6 +2629,37 @@ async def _resolve_label_in_window(
     elem["x"] = int(elem["x"]) + win_x
     elem["y"] = int(elem["y"]) + win_y
     return {"ok": True, "elem": elem, "via": "ocr", "img_b64": img_b64}
+
+
+async def _check_semantic_drag_endpoint(session, elem: dict, via: str, query: str,
+                                        index: int, *, revalidate: bool = False) -> tuple[bool, str]:
+    """Accept selected-window pixels or a stable app-scoped AX rectangle for a windowless target."""
+    if not getattr(session, "windowless", False):
+        await _refresh_window(session)
+        return await _check_click_safety(session, elem["x"] - session.win_x, elem["y"] - session.win_y)
+    import math
+    geometry = [elem.get(k) for k in ("x", "y", "width", "height")]
+    if (via != "ax" or not all(isinstance(v, (int, float)) and not isinstance(v, bool)
+                               and math.isfinite(v) for v in geometry)
+            or geometry[2] <= 0 or geometry[3] <= 0
+            or not (elem.get("label") or elem.get("value"))):
+        return False, "Windowless drag target has no proven nonempty AX rectangle; inspect it again."
+    if revalidate:
+        identity = getattr(session, "process_identity", None)
+        if identity is None:
+            return False, "Windowless target process identity is unavailable; no drag was sent."
+        current, _ = await get_or_create_session(session.app, allow_launch=False)
+        if current.pid != session.pid or getattr(current, "process_identity", None) != identity:
+            return False, "Windowless target process changed; no drag was sent. Inspect it again."
+        fresh = await _resolve_label_in_window(current, query, index, None, None)
+        if (not fresh.get("ok") or fresh.get("via") != "ax"
+                or any(fresh["elem"].get(k) != elem.get(k)
+                       for k in ("label", "value", "x", "y", "width", "height"))):
+            return False, "Windowless target label or rectangle changed; no drag was sent. Inspect it again."
+        current, _ = await get_or_create_session(session.app, allow_launch=False)
+        if current.pid != session.pid or getattr(current, "process_identity", None) != identity:
+            return False, "Windowless target process changed during inspection; no drag was sent."
+    return True, ""
 
 
 # ---------------------------------------------------------------------------
@@ -2754,6 +2684,23 @@ def _validate_finite_arguments(arguments) -> None:
             pending.extend(value.values())
         elif isinstance(value, list):
             pending.extend(value)
+
+
+def _validate_run_budget(arguments: dict) -> None:
+    """Reject excessive nested batches before any of their actions can execute."""
+    pending = [(arguments.get("actions", []), 1)]
+    total = 0
+    while pending:
+        actions, depth = pending.pop()
+        if depth > 8:
+            raise ValueError("run supports at most 8 nested levels; split the sequence and observe between batches.")
+        if not isinstance(actions, list):
+            continue  # The tool schema reports malformed action lists.
+        total += len(actions)
+        if total > 1000:
+            raise ValueError("run supports at most 1000 steps across nested batches; split the sequence and observe again.")
+        pending.extend((action.get("actions", []), depth + 1)
+                       for action in actions if isinstance(action, dict) and action.get("tool") == "run")
 
 
 def _tool_input_schema(tool: types.Tool) -> dict:
@@ -2808,14 +2755,11 @@ _OBSERVATION_TOOLS = frozenset({"inspect", "screenshot", "read_grid", "ax_snapsh
 # Post-mutation settle (B). A mutating action leaves the UI mid-repaint —
 # Chromium/Electron especially needs ~150 ms to paint a closed modal, freshly
 # typed text, or a new view. A capture fired immediately after such an action
-# returns the PRE-action frame (the stale-screenshot bug). This flag records
-# "the previous leaf call changed the UI"; the next capture reads it to wait
-# for the repaint, and any non-mutating leaf clears it so passive looks stay
-# instant. Process-wide because the server serializes calls (no concurrent
-# agents in this build) — same justification as _call_history.
+# can return a pre-action frame. Each session records its own last mutation;
+# capture waits only for the remaining repaint interval after agent think time.
 _POST_ACTION_SETTLE_MS = 150
-_PASSIVE_SETTLE_MS = 10
-_last_action_mutated = False
+_call_lock = asyncio.Lock()
+_call_context = ContextVar('klyk_nested_call', default=None)
 
 
 def _detect_hint(name: str, args: dict) -> str | None:
@@ -2939,12 +2883,45 @@ def _refresh_menubar() -> None:
         pass
 
 
+def _control_blocked_response() -> list:
+    """Retain the public ownership-refusal marker without attempting any input."""
+    _refresh_menubar()
+    return [types.TextContent(type="text", text=json.dumps({
+        "ok": False,
+        "blocked": "not_active_session",
+        "message": (
+            "Control is unavailable: another session owns it, or the local owner file cannot be accessed. Run klyk doctor for details. "
+            "Only one session drives klyk at a time. Do NOT reclaim "
+            "automatically: the other session may be mid-task, and if "
+            "both sessions grabbed control back on every block they'd "
+            "fight over it endlessly. Instead, tell the user klyk is "
+            "in use by another session, and call `take_control` only if "
+            "the user wants THIS session to drive. Reads and screenshots "
+            "are never blocked."
+        ),
+    }))]
+
+
 @_call_tool_handler
 async def call_tool(
     name: str, arguments: dict | None
 ) -> list[types.TextContent | types.ImageContent]:
-    global _last_response_time, _call_depth, _last_action_mutated
-    args = arguments or {}
+    """Serialize requests while permitting run's explicitly ordered nested calls."""
+    task = asyncio.current_task()
+    if _call_context.get() is task:
+        return await _execute_tool(name, arguments)
+    async with _call_lock:
+        token = _call_context.set(task)
+        try:
+            return await _execute_tool(name, arguments)
+        finally:
+            _call_context.reset(token)
+
+
+async def _execute_tool(name: str, arguments: dict | None) -> list:
+    """Validate, execute, and report one action under the request ownership lock."""
+    global _last_response_time, _call_depth
+    args = {} if arguments is None else arguments
     start = time.monotonic()
     is_top_level = _call_depth == 0
     gap_ms = (
@@ -2953,42 +2930,14 @@ async def call_tool(
         else None
     )
     _call_depth += 1
-    log.info("tool: %s | argument_keys: %s", name, sorted(args))
+    diagnostic_name = name if isinstance(name, str) and name in _TOOL_SCHEMAS else "unknown"
+    log.info("tool: %s", diagnostic_name)
 
     response: list = []
+    validated = False
 
     async def _dispatch():
-        # Apply the same trust-boundary validation to every transport and nested step.
-        validator = _TOOL_VALIDATORS.get(name)
-        if validator is None:
-            raise ValueError(f"Unknown tool: {name}")
-        _validate_finite_arguments(args)
-        validator.validate(args)
-        # AX actions and clipboard/window operations also bypass synthesized-event guards.
-        if name not in _OWNERSHIP_EXEMPT:
-            computer._check_stop()
-        # --- control-ownership gate ---
-        # Only the active (owner) session may DRIVE the Mac. A superseded
-        # session is blocked here, at the action, with one clear, actionable
-        # line — never a silent input race with the active session.
-        # Observation/meta tools (the exempt set) always pass.
-        if name not in _OWNERSHIP_EXEMPT and not ownership.is_owner():
-            _refresh_menubar()  # this session just learned it's superseded
-            return [types.TextContent(type="text", text=json.dumps({
-                "ok": False,
-                "blocked": "not_active_session",
-                "message": (
-                    "Control is unavailable: another session owns it, or the local owner file cannot be accessed. Run klyk doctor for details. "
-                    "Only one session drives klyk at a time. Do NOT reclaim "
-                    "automatically: the other session may be mid-task, and if "
-                    "both sessions grabbed control back on every block they'd "
-                    "fight over it endlessly. Instead, tell the user klyk is "
-                    "in use by another session, and call `take_control` only if "
-                    "the user wants THIS session to drive. Reads and screenshots "
-                    "are never blocked."
-                ),
-            }))]
-
+        """Execute one already validated request with ownership established by its caller."""
         # --- take_control ---
         if name == "take_control":
             prev = ownership.claim_ownership()
@@ -3009,13 +2958,11 @@ async def call_tool(
             # tool name is the only switch.
             include_ax = (name == "inspect")
             # Slim mode (inspect only): skip the screenshot entirely, walk a
-            # smaller AX cap, return text-only. ~50-70 ms vs ~100-140 ms for
-            # full inspect; payload drops from 50-200 kB to a few hundred
-            # bytes. Ignored on `screenshot` (the whole point of screenshot
+            # smaller AX cap, return text-only, and avoid the image payload.
+            # Ignored on `screenshot` (the whole point of screenshot
             # is the image — detail flag is silently dropped if passed).
             detail_mode = args.get("detail", "full")
             slim = (name == "inspect" and detail_mode == "slim")
-            session, is_new = await _get_session(args, name)
 
             # Multi-display: full-display capture path. When `display` is set
             # we bypass window-based capture entirely and grab the whole screen
@@ -3062,30 +3009,17 @@ async def call_tool(
                         meta["saved_path"] = resolved
                         include_image = False
                     except Exception as e:
-                        log.warning(f"display screenshot save_path write failed ({resolved}): {type(e).__name__}: {e}")
+                        log.warning("display screenshot save failed (%s)", type(e).__name__)
                         meta["save_error"] = f"{e}"
                 payload: list = []
                 if include_image:
                     payload.append(types.ImageContent(type="image", data=img_b64, mimeType="image/png"))
                 payload.append(types.TextContent(type="text", text=json.dumps(meta)))
                 return payload
-            # Phase 5 — Speed:
-            # Image capture and AX walk are independent post-activation;
-            # _take_screenshot owns the activation+focus dance, then the
-            # actual pixel grab is just a CG capture. The AX walk just
-            # queries the AX tree by pid. Run them concurrently with
-            # asyncio.gather so the agent sees max(image, ax) instead of
-            # image + ax. Empirically this halves the post-activation
-            # cost on inspect (image ~60 ms, ax ~70 ms — total drops
-            # from ~130 ms sequential to ~70-80 ms in parallel).
-            #
-            # Failure isolation: each task is awaited independently.
-            # An AX failure must NOT break the screenshot (current
-            # contract); a screenshot failure does propagate (it's the
-            # primary product of inspect).
-            # Slim mode skips the screenshot dance entirely (no image in
-            # response). Full mode runs the screenshot + AX walk in
-            # parallel (Phase-5 speed work below).
+            session, is_new = await _get_session(args, name)
+            await _refresh_window(session, window_id=_resolve_window(args, args['app']))
+            # Capture and the selected-window AX walk run independently in
+            # parallel. AX failure preserves pixels; slim skips capture entirely.
             if slim:
                 screenshot_task = None
                 # Smaller raw walk: agent is asked to keep slim to focus /
@@ -3102,7 +3036,8 @@ async def call_tool(
                 # to the agent (50 in full mode, 15 in slim), so walking
                 # many more is wasted IPC on pathologically heavy trees.
                 return await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap),
+                    None, lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
+                                                      window_id=session.window_id),
                 )
 
             ax_task = (
@@ -3112,38 +3047,24 @@ async def call_tool(
             )
 
             if screenshot_task is not None:
-                img_b64, w, h, focus_status = await screenshot_task
+                try:
+                    img_b64, w, h, focus_status = await screenshot_task
+                except BaseException:
+                    if ax_task is not None:
+                        ax_task.cancel()
+                        await asyncio.gather(ax_task, return_exceptions=True)
+                    raise
                 session.screenshots_taken += 1
                 meta = {
                     "width": w, "height": h,
                     "win_x": session.win_x, "win_y": session.win_y,
                     "app_launched": is_new,
+                    "window_id": session.window_id,
+                    "capture_scope": "window",
                 }
                 warn = _focus_warning_from(focus_status)
                 if warn is not None:
                     meta["focus_warning"] = warn
-                # The image is a composited-region capture, so another app's
-                # window sitting above and overlapping this one bleeds its pixels
-                # into the frame (klyk doesn't raise the target in seamless
-                # modes). Warn loudly so the agent doesn't trust a contaminated
-                # image — AX reads stay correct, or raise via focus_window.
-                try:
-                    occ = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: capture.window_occluders(
-                            int(session.window_id), session.pid,
-                        ),
-                    )
-                except Exception:
-                    occ = []
-                if occ:
-                    names = ", ".join(o["owner_name"] for o in occ)
-                    meta["overlap_warning"] = (
-                        f"Another window overlaps this one ({names}). This image is "
-                        "a composited region capture, so those pixels may appear in "
-                        "it. Prefer AX reads (ax_snapshot/read_grid), or call "
-                        "focus_window to raise this window before screenshotting."
-                    )
             else:
                 # Slim path: no image, no width/height. AX coords are
                 # window-relative once translated below, same as full mode.
@@ -3152,15 +3073,8 @@ async def call_tool(
                 # raise — slim mode must not lose the safety signal that
                 # full mode gets for free out of _take_screenshot.
                 img_b64 = ""
-                # Reads don't need the window frontmost (the AX walk is by PID),
-                # so in seamless modes skip the raise entirely — this matches full
-                # inspect's seamless path and keeps slim inspect invisible too,
-                # instead of being the one read that steals focus.
+                # Passive AX inspection never needs the window frontmost.
                 focus_status = None
-                if session.mode not in ("background", "autonomous"):
-                    focus_status = await _focus_if_needed(
-                        session, _resolve_window(args, args["app"]),
-                    )
                 meta = {
                     "win_x": session.win_x, "win_y": session.win_y,
                     "app_launched": is_new,
@@ -3187,11 +3101,13 @@ async def call_tool(
                     # is unusual). Sequential after the parallel screenshot/
                     # AX pair because it depends on observing the first
                     # walk's emptiness.
-                    if len(raw) < 8:
+                    if not raw and not getattr(session, 'ax_warmup_attempted', False):
                         await asyncio.sleep(0.25)
                         raw = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: computer.ax_snapshot(session.pid, max_results=300),
+                            None, lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
+                                                              window_id=session.window_id),
                         )
+                    session.ax_warmup_attempted = True
                     elements = _filter_for_browser(raw, session.app)
                     wx, wy = session.win_x, session.win_y
                     for elem in elements:
@@ -3217,6 +3133,10 @@ async def call_tool(
                         # where typed input will land.
                         tail_focused = [e for e in elements[AX_CAP:] if e.get("focused")]
                         elements = head + tail_focused
+                    for elem in elements:
+                        for key in ("label", "value", "role"):
+                            if isinstance(elem.get(key), str) and len(elem[key]) > 200:
+                                elem[key] = elem[key][:200] + "…"
                     meta["ax_elements"] = elements
                     meta["ax_element_count"] = len(elements)
                     if truncated:
@@ -3228,26 +3148,21 @@ async def call_tool(
                                else f" — call ax_snapshot for the full tree if the target isn't here.")
                         )
                 except Exception as e:
-                    log.warning(f"inspect AX read failed for {session.app}: {type(e).__name__}: {e}")
+                    log.warning("inspect AX read failed (%s)", type(e).__name__)
                     meta["ax_elements"] = []
                     meta["ax_element_count"] = 0
                     meta["ax_error"] = f"{e}"
 
-                # After the auto-retry, if AX is STILL nearly empty on a
-                # browser, the renderer genuinely isn't exposing web content
-                # (rare — usually means Chrome was launched without
-                # --force-renderer-accessibility AND for some reason its
-                # lazy-enable isn't firing). Warn the agent once.
+                # A sparse browser tree is a current observation, not proof
+                # that relaunching the user's browser would help.
                 if (
                     is_browser(session.app)
                     and not session.ax_disabled_warned_on_inspect
                     and meta.get("ax_element_count", 0) < 5
                 ):
                     meta["ax_disabled_warning"] = (
-                        f"{session.app}'s web AX tree is empty even after a wake retry. "
-                        "click_element will fall through to OCR for web targets. If this "
-                        "persists, quit the browser fully and let klyk relaunch it. "
-                        "(Warning fires once per session.)"
+                        "Few browser controls are exposed in this observation. "
+                        "Use the image for visual targets or read_text for visible text."
                     )
                     session.ax_disabled_warned_on_inspect = True
                 # Non-browser app whose AX surface is genuinely empty even
@@ -3261,13 +3176,8 @@ async def call_tool(
                     and meta.get("ax_element_count", 0) == 0
                 ):
                     meta["ax_empty_hint"] = (
-                        "AX surface is empty for this window even after a "
-                        "retry. Common with SwiftUI / canvas / custom-drawn "
-                        "content. Use `read_text` for text content, "
-                        "`get_pixel` / `read_grid` for colors, or `screenshot` "
-                        "for purely visual inspection. AX-based tools "
-                        "(`click_element`, `wait_for`, `read_element`) will "
-                        "fall through to OCR or fail outright on this window."
+                        "No accessibility controls were returned. Use the image for visual "
+                        "targets or read_text for visible text; click_element can fall back to OCR."
                     )
 
             # Optional disk write. On success, omit the inline image to save tokens.
@@ -3282,7 +3192,7 @@ async def call_tool(
                     meta["saved_path"] = resolved
                     include_image = False
                 except Exception as e:
-                    log.warning(f"screenshot save_path write failed ({resolved}): {type(e).__name__}: {e}")
+                    log.warning("screenshot save failed (%s)", type(e).__name__)
                     meta["save_error"] = f"{e}"
 
             payload: list = []
@@ -3305,7 +3215,7 @@ async def call_tool(
             if not args.get("confirm_destructive", False):
                 safe, reason = await _check_click_safety(session, args["x"], args["y"])
                 if not safe:
-                    log.warning(f"click BLOCKED ({x},{y}): {reason}")
+                    log.warning("click blocked by target-window bounds")
                     return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
 
             # --- Seamless path (background / autonomous) ---
@@ -3325,6 +3235,10 @@ async def call_tool(
                 # point — we still need accurate session.window_id even though
                 # we never raise it.
                 await _refresh_window(session, window_id=window_id)
+                if not args.get("confirm_destructive", False):
+                    safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                    if not safe:
+                        return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
                 target_wid = window_id if window_id is not None else int(session.window_id)
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_click(
@@ -3351,11 +3265,15 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
+            if not args.get("confirm_destructive", False):
+                safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.click(sx, sy, button, modifiers)
             hint = await _nearby_ax_hint(session, x, y)
@@ -3368,10 +3286,7 @@ async def call_tool(
                 result["escalated_from"] = escalated_from
             if hint is not None:
                 result["nearby_ax_hint"] = hint
-                log.info(
-                    f"click ({x},{y}) near AX element '{hint['label']}' "
-                    f"({hint['role']}) — prefer click_element next time"
-                )
+                log.info("click returned a nearby accessibility hint")
             warn = _focus_warning_from(focus_status)
             if warn is not None:
                 result["focus_warning"] = warn
@@ -3394,6 +3309,10 @@ async def call_tool(
             escalated_from: str | None = None
             if session.mode in ("background", "autonomous") and skylight.is_available():
                 await _refresh_window(session, window_id=window_id)
+                if not args.get("confirm_destructive", False):
+                    safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                    if not safe:
+                        return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
                 target_wid = window_id if window_id is not None else int(session.window_id)
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_double_click(
@@ -3411,11 +3330,15 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
+            if not args.get("confirm_destructive", False):
+                safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.double_click(sx, sy, modifiers)
             result: dict = {"ok": True, "via": "cursor_warp"}
@@ -3440,6 +3363,10 @@ async def call_tool(
             escalated_from: str | None = None
             if session.mode in ("background", "autonomous") and skylight.is_available():
                 await _refresh_window(session, window_id=window_id)
+                if not args.get("confirm_destructive", False):
+                    safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                    if not safe:
+                        return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
                 target_wid = window_id if window_id is not None else int(session.window_id)
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_triple_click(
@@ -3457,11 +3384,15 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
+            if not args.get("confirm_destructive", False):
+                safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.triple_click(sx, sy, modifiers)
             result: dict = {"ok": True, "via": "cursor_warp"}
@@ -3483,9 +3414,8 @@ async def call_tool(
             if not safe:
                 return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             sx, sy = _to_screen(session, x, y)
-            result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_perform_action_at(float(sx), float(sy), action_name, expected_pid=session.pid)
-            )
+            result = await computer.run_input(lambda: computer.ax_perform_action_at(
+                float(sx), float(sy), action_name, expected_pid=session.pid, window_id=session.window_id))
             return [types.TextContent(type="text", text=json.dumps(result))]
 
         # --- long_press ---
@@ -3497,10 +3427,10 @@ async def call_tool(
                     "reason": "long_press_requires_visible_input",
                     "suggestion": "Use autonomous or humanoid mode for a visible press and hold.",
                 }))]
+            await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id)
             gate = await _ensure_key_delivery(session, "long_press", command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id)
             # Refresh the origin + bounds (the safety check below uses window
             # width/height) so a moved window doesn't leave stale coords — same
             # fix as click / ax_action.
@@ -3547,6 +3477,10 @@ async def call_tool(
                 and skylight.is_available()
             ):
                 await _refresh_window(session, window_id=window_id)
+                for px, py in ((args["x1"], args["y1"]), (args["x2"], args["y2"])):
+                    safe, reason = await _check_click_safety(session, px, py)
+                    if not safe:
+                        return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
                 target_wid = window_id if window_id is not None else int(session.window_id)
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_drag(
@@ -3565,14 +3499,19 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "visible_input_required",
                 }))]
+            await _focus_if_needed(session, window_id or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, window_id or session.window_id)
             await _refresh_window(session, window_id=window_id)
+            for px, py in ((args["x1"], args["y1"]), (args["x2"], args["y2"])):
+                safe, reason = await _check_click_safety(session, px, py)
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             sx1, sy1 = _to_screen(session, x1, y1)
             sx2, sy2 = _to_screen(session, x2, y2)
-            await computer.drag(sx1, sy1, sx2, sy2, hover_target_seconds=hover_seconds)
+            await computer.drag(sx1, sy1, sx2, sy2, hover_target_seconds=hover_seconds,
+                                button=button, modifiers=modifiers)
             result: dict = {"ok": True, "via": "cursor_warp"}
             if escalated_from is not None:
                 result["escalated_from"] = escalated_from
@@ -3596,6 +3535,10 @@ async def call_tool(
             # drags always go through the visible cursor_warp path.
             target_app_name = args.get("target_app")
             cross_app = bool(target_app_name) and target_app_name != args["app"]
+            if session.mode == "background" and (cross_app or hover_seconds > 0):
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "requires_foreground": True, "reason": "drag_requires_visible_input",
+                }))]
 
             filter_wid = _resolve_window(args, args["app"])
             filter_bounds: tuple[int, int, int, int] | None = None
@@ -3617,13 +3560,15 @@ async def call_tool(
 
             src = await _resolve_label_in_window(
                 session, source_query, source_index, filter_wid, filter_bounds,
+                index_explicit="source_index" in args,
             )
             if not src["ok"]:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False,
                     "endpoint": "source",
                     "error": src["error"],
-                    "matches": src.get("matches", []),
+                    **({"ambiguous": True} if src.get("ambiguous") else {}),
+                    "matches": [_element_evidence(e) for e in src.get("matches", [])[:8]],
                 }))]
 
             # Resolve target — same session for within-app, target_app's session
@@ -3634,6 +3579,7 @@ async def call_tool(
                 tgt = await _resolve_label_in_window(
                     target_session, target_query, target_index,
                     filter_wid=None, filter_bounds=None,
+                    index_explicit="target_index" in args,
                 )
             else:
                 target_session = session
@@ -3641,15 +3587,17 @@ async def call_tool(
                 tgt = await _resolve_label_in_window(
                     session, target_query, target_index, filter_wid, filter_bounds,
                     cached_img_b64=cached,
+                    index_explicit="target_index" in args,
                 )
             if not tgt["ok"]:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False,
                     "endpoint": "target",
-                    "source": src["elem"],
+                    "source": _element_evidence(src["elem"]),
                     "source_via": src["via"],
                     "error": tgt["error"],
-                    "matches": tgt.get("matches", []),
+                    **({"ambiguous": True} if tgt.get("ambiguous") else {}),
+                    "matches": [_element_evidence(e) for e in tgt.get("matches", [])[:8]],
                 }))]
 
             src_elem = src["elem"]
@@ -3657,6 +3605,12 @@ async def call_tool(
             # Resolver guarantees SCREEN coords for both AX and OCR matches.
             sx1, sy1 = int(src_elem["x"]), int(src_elem["y"])
             sx2, sy2 = int(tgt_elem["x"]), int(tgt_elem["y"])
+            for endpoint_session, resolved, query, index in (
+                    (session, src, source_query, source_index), (target_session, tgt, target_query, target_index)):
+                safe, reason = await _check_semantic_drag_endpoint(
+                    endpoint_session, resolved["elem"], resolved["via"], query, index)
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
 
             escalated_from: str | None = None
             # SkyLight (invisible) drag is eligible only when:
@@ -3677,6 +3631,10 @@ async def call_tool(
                 wly1 = float(sy1) - float(session.win_y)
                 wlx2 = float(sx2) - float(session.win_x)
                 wly2 = float(sy2) - float(session.win_y)
+                for px, py in ((wlx1, wly1), (wlx2, wly2)):
+                    safe, reason = await _check_click_safety(session, px, py)
+                    if not safe:
+                        return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_drag(
                     session, target_wid,
@@ -3686,15 +3644,15 @@ async def call_tool(
                 if seamless_result.get("ok"):
                     return [types.TextContent(type="text", text=json.dumps({
                         "ok": True,
-                        "source": src_elem,
-                        "target": tgt_elem,
+                        "source": _element_evidence(src_elem),
+                        "target": _element_evidence(tgt_elem),
                         "source_via": src["via"],
                         "target_via": tgt["via"],
                         "via": seamless_result["via"],
                     }))]
                 if seamless_result.get("requires_foreground"):
-                    seamless_result["source"] = src_elem
-                    seamless_result["target"] = tgt_elem
+                    seamless_result["source"] = _element_evidence(src_elem)
+                    seamless_result["target"] = _element_evidence(tgt_elem)
                     return [types.TextContent(type="text", text=json.dumps(seamless_result))]
                 escalated_from = seamless_result.get("error", "skylight_unknown")
                 _log_escalation(session, "drag_to_element", sx1, sy1, escalated_from)
@@ -3703,20 +3661,31 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "drag_requires_visible_input",
                 }))]
+            await _focus_if_needed(session, filter_wid or session.window_id)
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await _focus_if_needed(session, filter_wid or session.window_id)
+            for endpoint_session, resolved, query, index in (
+                    (session, src, source_query, source_index), (target_session, tgt, target_query, target_index)):
+                safe, reason = await _check_semantic_drag_endpoint(
+                    endpoint_session, resolved["elem"], resolved["via"], query, index, revalidate=True)
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             # Cursor-warp path: coords already screen-space, hand to computer.drag
             # which expects absolute screen coords. This path is also taken for
             # cross-app drags and for any drag with hover_seconds > 0.
             await computer.drag(
                 sx1, sy1, sx2, sy2, hover_target_seconds=hover_seconds,
+                button=button, modifiers=modifiers,
+                **({'visible_targets':(
+                    (session.pid, None if getattr(session, 'windowless', False) else int(session.window_id)),
+                    (target_session.pid, None if getattr(target_session, 'windowless', False) else int(target_session.window_id)),
+                )} if cross_app else {}),
             )
             result = {
                 "ok": True,
-                "source": src_elem,
-                "target": tgt_elem,
+                "source": _element_evidence(src_elem),
+                "target": _element_evidence(tgt_elem),
                 "source_via": src["via"],
                 "target_via": tgt["via"],
                 "via": "cursor_warp",
@@ -3761,12 +3730,18 @@ async def call_tool(
 
             # --- 1. AXSetValue fast path ---
             sx_for_ax, sy_for_ax = _to_screen(session, x, y)
-            ax_result = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_set_value_at(float(sx_for_ax), float(sy_for_ax), text, expected_pid=session.pid)
-            )
+            ax_result = await computer.run_input(lambda: computer.ax_set_value_at(
+                float(sx_for_ax), float(sy_for_ax), text, expected_pid=session.pid,
+                window_id=session.window_id))
+            if ax_result.get("attempted") and not ax_result.get("verified"):
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "via": "ax_set_value", "effect": "unverified",
+                    "error": "The field accepted a write but readback differs; inspect before retrying.",
+                }))]
             if ax_result.get("ok"):
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": True, "via": "ax_set_value", "role": ax_result.get("role"),
+                    "verified": ax_result.get("verified", False),
                 }))]
             ax_skip_reason = ax_result.get("status")  # for the response trail
 
@@ -3797,12 +3772,16 @@ async def call_tool(
                 raise RuntimeError("Target app could not be activated; the field was not changed.")
             await _focus_if_needed(session, window_id)
             await _refresh_window(session, window_id=window_id)
+            if not args.get("confirm_destructive", False):
+                safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.click(sx, sy)
             await asyncio.sleep(0.01)
-            await computer.press_key("Cmd+A", session.pid)
+            await computer.press_key("Cmd+A", session.pid, expected_frontmost_pid=session.pid)
             await asyncio.sleep(0.005)
-            await computer.type_text(text, session.pid)
+            await computer.type_text(text, session.pid, expected_frontmost_pid=session.pid)
             result: dict = {"ok": True, "via": "activated"}
             if ax_skip_reason:
                 # Surface why the invisible AX write didn't win — useful for agents
@@ -3814,7 +3793,7 @@ async def call_tool(
         elif name == "type_text":
             session, _ = await _get_session(args, name)
             window_id = _resolve_window(args, args["app"])
-            focus_status = await _focus_if_needed(session, window_id)
+            focus_status = await _focus_if_needed(session, window_id or session.window_id or None)
             if focus_status and focus_status.get("requires_foreground"):
                 return [types.TextContent(type="text", text=json.dumps(focus_status))]
             # Effective default: real keystrokes on Chromium (clipboard paste is
@@ -3835,9 +3814,11 @@ async def call_tool(
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
             if mode == "keys":
-                await computer.type_text_char_by_char(args["text"], session.pid)
+                frontmost_pid = session.pid if _is_chromium_based(session) or session.mode == "humanoid" else None
+                await computer.type_text_char_by_char(args["text"], session.pid,
+                                                     expected_frontmost_pid=frontmost_pid)
             else:
-                await computer.type_text(args["text"], session.pid)
+                await computer.type_text(args["text"], session.pid, expected_frontmost_pid=session.pid)
             return [types.TextContent(
                 type="text", text=json.dumps({"ok": True, "mode": mode}),
             )]
@@ -3861,20 +3842,23 @@ async def call_tool(
             total = len(sequence) * repeat
             if total > 1000:
                 raise ValueError(f"press_key: total presses {total} exceeds cap of 1000")
+            focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id or None)
+            if focus_status and focus_status.get("requires_foreground"):
+                # Background mode, target window isn't key — don't post keys to
+                # the wrong window. Surface the structured refusal instead.
+                return [types.TextContent(type="text", text=json.dumps(focus_status))]
+            # Raising the selected window can change activation. Establish it
+            # before the final readiness check, while retaining the native guard.
             gate = await _ensure_key_delivery(
                 session, "press_key", _is_command_shortcut(sequence),
             )
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]))
-            if focus_status and focus_status.get("requires_foreground"):
-                # Background mode, target window isn't key — don't post keys to
-                # the wrong window. Surface the structured refusal instead.
-                return [types.TextContent(type="text", text=json.dumps(focus_status))]
+            frontmost_pid = session.pid if _is_command_shortcut(sequence) or _is_chromium_based(session) or session.mode == "humanoid" else None
             if total == 1:
-                await computer.press_key(sequence[0], session.pid)
+                await computer.press_key(sequence[0], session.pid, expected_frontmost_pid=frontmost_pid)
             else:
-                await computer.press_keys(sequence * repeat, session.pid)
+                await computer.press_keys(sequence * repeat, session.pid, expected_frontmost_pid=frontmost_pid)
             result: dict = {"ok": True}
             warn = _focus_warning_from(focus_status)
             if warn is not None:
@@ -3890,18 +3874,21 @@ async def call_tool(
             duration = float(args.get("duration", 1.0))
             if duration < 0.05 or duration > 10.0:
                 raise ValueError("hold_key: duration must be between 0.05 and 10.0 seconds")
+            focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]) or session.window_id or None)
+            if focus_status and focus_status.get("requires_foreground"):
+                # Background mode, target window isn't key — refuse rather than
+                # hold a key against the wrong window.
+                return [types.TextContent(type="text", text=json.dumps(focus_status))]
+            # Focus may change activation; only the subsequent readiness check
+            # can establish delivery before the held key's final native guard.
             gate = await _ensure_key_delivery(
                 session, "hold_key", _is_command_shortcut([key]),
             )
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            focus_status = await _focus_if_needed(session, _resolve_window(args, args["app"]))
-            if focus_status and focus_status.get("requires_foreground"):
-                # Background mode, target window isn't key — refuse rather than
-                # hold a key against the wrong window.
-                return [types.TextContent(type="text", text=json.dumps(focus_status))]
             try:
-                await computer.hold_key(key, duration, session.pid)
+                frontmost_pid = session.pid if _is_command_shortcut([key]) or _is_chromium_based(session) or session.mode == "humanoid" else None
+                await computer.hold_key(key, duration, session.pid, expected_frontmost_pid=frontmost_pid)
             except ValueError as e:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "error": str(e),
@@ -3932,6 +3919,9 @@ async def call_tool(
             window_id = _resolve_window(args, args["app"])
             await _refresh_window(session, window_id=window_id)
             x, y = int(args["x"]), int(args["y"])
+            safe, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not safe:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             direction = args["direction"]
             amount = int(args.get("amount", 3))
             modifiers = args.get("modifiers")
@@ -3944,6 +3934,9 @@ async def call_tool(
             escalated_from: str | None = None
             if session.mode in ("background", "autonomous") and skylight.is_available():
                 await _refresh_window(session, window_id=window_id)
+                safe, reason = await _check_click_safety(session, args["x"], args["y"])
+                if not safe:
+                    return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
                 target_wid = window_id if window_id is not None else int(session.window_id)
                 mod_flags = computer.modifier_flags_from_list(modifiers)
                 seamless_result = await _seamless_scroll(
@@ -3967,6 +3960,9 @@ async def call_tool(
                 raise RuntimeError("Target app could not be activated; no scroll was sent.")
             await _focus_if_needed(session, window_id)
             await _refresh_window(session, window_id=window_id)
+            safe, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not safe:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "blocked": True, "reason": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.scroll(sx, sy, direction, amount, modifiers=modifiers)
             result: dict = {"ok": True, "via": "cursor_warp"}
@@ -3981,6 +3977,10 @@ async def call_tool(
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False, "requires_foreground": True, "reason": "hover_requires_visible_input",
                 }))]
+            await _refresh_window(session, window_id=_resolve_window(args, args["app"]))
+            safe, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not safe:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             sx, sy = _to_screen(session, int(args["x"]), int(args["y"]))
             await computer.move_cursor(sx, sy)
             dwell = max(0.0, min(float(args.get("dwell_seconds", 0.0)), 10.0))
@@ -4002,6 +4002,8 @@ async def call_tool(
         # --- wait_for ---
         elif name == "wait_for":
             session, _ = await _get_session(args, name)
+            if not getattr(session, "windowless", False):
+                await _refresh_window(session, window_id=_resolve_window(args, args["app"]))
             text = args["text"]
             timeout = min(float(args.get("timeout", 4)), 30)
             query = _normalize_label(text)
@@ -4011,7 +4013,9 @@ async def call_tool(
             matched_on: str | None = None
             while _time.monotonic() - start < timeout:
                 elements = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_snapshot(session.pid)
+                    None, lambda: computer.ax_snapshot(
+                        session.pid, window_id=session.window_id or None,
+                        deadline_seconds=min(.9, max(.001, timeout - (_time.monotonic() - start))))
                 )
                 # Collect every match, then prefer an exact label/value hit over
                 # an incidental substring hit (the same ranking click_element
@@ -4030,9 +4034,12 @@ async def call_tool(
                         else "value"
                     )
                     break
-                await asyncio.sleep(0.1)
+                remaining = timeout - (_time.monotonic() - start)
+                await asyncio.sleep(min(0.1, max(0.0, remaining)))
             elapsed = round(_time.monotonic() - start, 2)
             if found:
+                if not getattr(session, "windowless", False):
+                    await _refresh_window(session, window_id=session.window_id)
                 # Convert from screen-space to window-relative so coords match screenshot pixels
                 found = dict(found)
                 found["x"] -= session.win_x
@@ -4056,7 +4063,7 @@ async def call_tool(
                     return [types.TextContent(type="text", text=json.dumps({
                         "error": (
                             f"Unknown template_id '{template_id}'. Template cache is "
-                            "per-session and capped at 50 entries — call get_template "
+                            "per-session and capped at 50 entries / 8 MiB — call get_template "
                             "again to refresh, or pass template_b64 directly."
                         ),
                     }))]
@@ -4093,9 +4100,14 @@ async def call_tool(
                 except Exception as e:
                     last_match = None
                     last_error = f"{e}"
-                    log.warning(f"wait_for_visual poll failed: {last_error}")
+                    log.warning("wait_for_visual poll failed (%s)", type(e).__name__)
+                    if isinstance(e, (ValueError, TypeError)):
+                        return [types.TextContent(type="text", text=json.dumps({
+                            "ok": False, "error": f"Visual template or search region is invalid: {e}",
+                            "elapsed": round(_time.monotonic() - start, 2), "polls": polls,
+                        }))]
                 matched = last_match is not None
-                if matched == present:
+                if last_error is None and matched == present:
                     elapsed = round(_time.monotonic() - start, 2)
                     result: dict = {
                         "ok": True, "elapsed": elapsed, "polls": polls,
@@ -4125,27 +4137,9 @@ async def call_tool(
                         "last_error": last_error,
                         "message": msg,
                     }
-                    # If waiting for APPEARANCE timed out, an occluding window is a
-                    # likely reason the template never showed in the composited
-                    # capture (the pixels would be the occluder's). Surface it so
-                    # the agent raises the window instead of giving up.
-                    if present:
-                        try:
-                            occ = await loop.run_in_executor(
-                                None,
-                                lambda: capture.window_occluders(int(session.window_id), session.pid),
-                            )
-                        except Exception:
-                            occ = []
-                        if occ:
-                            names = ", ".join(o["owner_name"] for o in occ)
-                            timeout_payload["overlap_warning"] = (
-                                f"Another window overlaps this one ({names}); the capture "
-                                "may show its pixels — the template may be covered, not "
-                                "absent. focus_window to raise this window and retry."
-                            )
                     return [types.TextContent(type="text", text=json.dumps(timeout_payload))]
-                await asyncio.sleep(poll_interval)
+                remaining = timeout - (_time.monotonic() - start)
+                await asyncio.sleep(min(poll_interval, max(0.0, remaining)))
 
         # --- get_logs ---
         elif name == "get_logs":
@@ -4162,16 +4156,20 @@ async def call_tool(
             await _refresh_window(session, window_id=_resolve_window(args, args["app"]))
             sx, sy = _to_screen(session, int(args["x"]), int(args["y"]))
             value, status = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_value_at_detailed(float(sx), float(sy), expected_pid=session.pid)
+                None, lambda: computer.ax_value_at_detailed(float(sx), float(sy), expected_pid=session.pid, window_id=session.window_id)
             )
             # status: "ok" | "no_value" | "no_element"
             # Surface to agent so it can distinguish transient AX failure
             # (no_element — retry/observe) from "this element doesn't expose
             # a value at all" (no_value — stop polling, try another approach).
+            truncated = isinstance(value, str) and len(value) > 12000
+            if truncated:
+                value = value[:12000]
             return [types.TextContent(type="text", text=json.dumps({
                 "value": value,
                 "found": value is not None,
                 "status": status,
+                **({"truncated": True} if truncated else {}),
             }))]
 
         # --- get_pixel ---
@@ -4280,6 +4278,8 @@ async def call_tool(
                 }))]
             rows = int(args["rows"])
             cols = int(args["cols"])
+            if rows * cols > 400:
+                raise ValueError("read_grid accepts at most 400 cells; read a smaller region.")
             gx = float(args["x"])
             gy = float(args["y"])
             cw = float(args["cell_width"])
@@ -4292,8 +4292,8 @@ async def call_tool(
             # colour, not the fill. 70% keeps a small margin from the tile
             # border (so we don't pick up the un-filled gap pixels) while
             # giving the median plenty of background pixels to dominate.
-            ix = max(2, cw * 0.7)
-            iy = max(2, ch * 0.7)
+            ix = min(cw, max(2, cw * 0.7))
+            iy = min(ch, max(2, ch * 0.7))
 
             screen_rects: list[tuple[int, int, int, int]] = []
             cell_centers: list[tuple[int, int, int, int]] = []  # (r, c, screen_x, screen_y)
@@ -4312,41 +4312,47 @@ async def call_tool(
                     cell_centers.append((r, c, int(sx_center), int(sy_center)))
 
             bounds = (session.win_x, session.win_y, session.width, session.height)
-            # One window capture, all colours.
-            region_samples = await asyncio.get_event_loop().run_in_executor(
-                None,
-                lambda: capture.get_pixels_in_rects(
-                    screen_rects,
-                    window_id=int(session.window_id),
-                    window_bounds=bounds,
-                ),
-            )
-            # Per-cell AX text — one element resolve + one batched multi-attr
-            # read per cell. Runs in the thread pool so the asyncio loop isn't
-            # blocked across all cells.
-            def _read_text_all():
-                return [
-                    computer.ax_cell_text_at(float(sx), float(sy))
-                    for (_r, _c, sx, sy) in cell_centers
-                ]
-            text_values = await asyncio.get_event_loop().run_in_executor(
-                None, _read_text_all,
-            )
+            # Independent reads overlap; AX failure leaves colors usable and text unknown.
+            loop = asyncio.get_running_loop()
+            colors_task = loop.run_in_executor(None, lambda: capture.get_pixels_in_rects(
+                screen_rects, window_id=int(session.window_id), window_bounds=bounds))
+            text_task = loop.run_in_executor(None, lambda: computer.ax_grid_text(
+                session.pid, int(session.window_id), [(sx, sy) for _, _, sx, sy in cell_centers]))
+            region_samples, text_values = await asyncio.gather(colors_task, text_task, return_exceptions=True)
+            color_unavailable = not isinstance(region_samples, (list, tuple))
+            if color_unavailable:
+                region_samples = []
+            text_unavailable = not isinstance(text_values, (list, tuple))
+            if text_unavailable:
+                text_values = []
+            color_unavailable = color_unavailable or len(region_samples) != len(cell_centers)
+            text_unavailable = text_unavailable or len(text_values) != len(cell_centers)
 
             grid: list[list[dict]] = [[None] * cols for _ in range(rows)]  # type: ignore
             for idx, (r, c, _sx, _sy) in enumerate(cell_centers):
-                pr, pg, pb = region_samples[idx] if idx < len(region_samples) else (0, 0, 0)
+                sample = region_samples[idx] if idx < len(region_samples) else None
+                if (
+                    isinstance(sample, (list, tuple)) and len(sample) == 3
+                    and all(isinstance(v, int) and 0 <= v <= 255 for v in sample)
+                ):
+                    pr, pg, pb = sample
+                    hex_color = f"#{pr:02x}{pg:02x}{pb:02x}"
+                else:
+                    pr = pg = pb = hex_color = None
+                    color_unavailable = True
                 grid[r][c] = {
                     "row": r,
                     "col": c,
                     "x": int(gx + c * (cw + gap) + cw / 2),
                     "y": int(gy + r * (ch + gap) + ch / 2),
-                    "text": text_values[idx],
+                    "text": text_values[idx] if idx < len(text_values) else None,
                     "r": pr, "g": pg, "b": pb,
-                    "hex": f"#{pr:02x}{pg:02x}{pb:02x}",
+                    "hex": hex_color,
                 }
             return [types.TextContent(type="text", text=json.dumps({
-                "ok": True, "rows": rows, "cols": cols, "cells": grid,
+                "ok": not color_unavailable, "rows": rows, "cols": cols, "cells": grid,
+                **({"color_status": "unavailable", "error": "Some pixel samples were unavailable; missing colors are null."} if color_unavailable else {}),
+                **({"text_status": "unavailable"} if text_unavailable else {}),
             }))]
 
         # --- set_clipboard ---
@@ -4360,13 +4366,9 @@ async def call_tool(
                     "error": "set_clipboard requires exactly one of text or image_path",
                 }))]
             if image_path is not None:
-                resolved = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.set_clipboard_image(image_path)
-                )
+                resolved = await computer.run_input(lambda: computer.set_clipboard_image(image_path))
                 return [types.TextContent(type="text", text=json.dumps({"ok": True, "image_path": resolved}))]
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.set_clipboard(text)
-            )
+            await computer.run_input(lambda: computer.set_clipboard(text))
             return [types.TextContent(type="text", text=json.dumps({"ok": True, "text_length": len(text)}))]
 
         # --- get_clipboard ---
@@ -4391,9 +4393,7 @@ async def call_tool(
             gate = await _ensure_key_delivery(session, name, command_shortcut=True)
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
-            await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.click_menu(session.pid, path)
-            )
+            await computer.run_input(lambda: computer.click_menu(session.pid, path))
             return [types.TextContent(type="text", text=json.dumps({"ok": True, "path": path}))]
 
         # --- context_menu_select ---
@@ -4427,12 +4427,15 @@ async def call_tool(
             # land in the wrong place and never trigger the menu.
             target_wid = window_id if window_id is not None else int(session.window_id)
             if skylight.is_available():
-                await asyncio.get_event_loop().run_in_executor(
-                    None,
+                opened = await computer.run_input(
                     lambda: skylight.post_mouse_click(
                         session.pid, target_wid, float(x), float(y), button="right",
                     ),
                 )
+                if not opened:
+                    return [types.TextContent(type="text", text=json.dumps({
+                        "ok": False, "error": "The context-menu click was not delivered; inspect before continuing.",
+                    }))]
             else:
                 sx, sy = _to_screen(session, x, y)
                 await computer.click(sx, sy, button="right")
@@ -4440,18 +4443,17 @@ async def call_tool(
             # Poll for the menu to surface. macOS context menus appear as
             # AXMenu / AXMenuItem in the app's AX tree; we look for any
             # menu-item-like role whose label matches.
-            menu_roles = {
-                "AXMenuItem", "AXMenuBarItem", "AXMenuButton",
-                # Some Electron apps expose context items under generic roles
-                # — accept those when the label matches.
-                "AXButton",
-            }
+            # A coincidental button or menu-bar item is not proof that the
+            # context menu opened. Unstructured menus require inspection.
+            menu_roles = {"AXMenuItem"}
             deadline = time.monotonic() + timeout
             matched: dict | None = None
             wait_ms_start = time.monotonic()
             via = "ax"
             while time.monotonic() < deadline:
-                await asyncio.sleep(0.08)
+                await asyncio.sleep(min(0.08, max(0.0, deadline - time.monotonic())))
+                if time.monotonic() >= deadline:
+                    break
                 # A right-click contextual menu surfaces as an open AXMenu inside
                 # the window subtree, but ax_snapshot's per-node child cap (20)
                 # truncates it (a sidebar/list outline has more rows than the cap,
@@ -4463,14 +4465,14 @@ async def call_tool(
                 menu_items = await asyncio.get_event_loop().run_in_executor(
                     None,
                     lambda: computer.ax_read_open_menu(
-                        session.pid, deadline_seconds=0.8,
+                        session.pid, deadline_seconds=min(0.8, max(0.001, deadline - time.monotonic())),
                     ),
                 )
                 cands = [
                     e for e in menu_items
                     if query in _normalize_label(e.get("label", "") or "")
                 ]
-                if not cands:
+                if not cands and time.monotonic() < deadline:
                     # Fallback: window-scoped scan (Electron in-window menus,
                     # menu-bar items). Generous child cap so menu items past the
                     # default truncation point are included.
@@ -4478,7 +4480,8 @@ async def call_tool(
                         None,
                         lambda: computer.ax_snapshot(
                             session.pid, max_children_per_node=80,
-                            max_results=0, deadline_seconds=0.8,
+                            window_id=target_wid, max_results=200,
+                            deadline_seconds=min(0.8, max(0.001, deadline - time.monotonic())),
                         ),
                     )
                     cands = [
@@ -4489,6 +4492,17 @@ async def call_tool(
                 # Exact item label wins over a substring sibling (e.g. "Copy"
                 # over "Copy Link") before `item_index` is applied.
                 _rank_ax_matches(cands, query)
+                if cands and "item_index" not in args:
+                    best_tier = _match_tier(cands[0].get("label", ""), query)
+                    tied = [e for e in cands if _match_tier(e.get("label", ""), query) == best_tier]
+                    if len(tied) > 1:
+                        await computer.press_keys(["Escape"], session.pid)
+                        return [types.TextContent(type="text", text=json.dumps({
+                            "ok": False, "ambiguous": True,
+                            "error": "Context menu has equally ranked items; it was dismissed without selecting. Supply item_index.",
+                            "matches": [_win_rel(e, session) for e in tied[:8]],
+                            "matches_found": len(tied),
+                        }))]
                 if len(cands) > item_index:
                     matched = cands[item_index]
                     break
@@ -4506,7 +4520,7 @@ async def call_tool(
 
             if matched is None:
                 # Dismiss the open menu so it doesn't trap the user's input.
-                await computer.press_keys(["Escape"])
+                await computer.press_keys(["Escape"], session.pid)
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False,
                     "error": (
@@ -4532,9 +4546,10 @@ async def call_tool(
                 click_x, click_y = _to_screen(
                     session, int(matched["x"]), int(matched["y"]),
                 )
-            selected = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_perform_action_at(
+            selected = await computer.run_input(
+                lambda: computer.ax_perform_action_at(
                     click_x, click_y, "AXPress", expected_pid=session.pid,
+                    expected_label=matched.get("label", ""),
                 ),
             )
             if not selected.get("ok"):
@@ -4556,8 +4571,11 @@ async def call_tool(
             window_id = _resolve_window(args, args["app"])
             if window_id is not None:
                 # AX-direct path: works on any window, even non-frontmost. Fast.
-                result = await asyncio.get_event_loop().run_in_executor(
-                    None,
+                if (w is None) != (h is None):
+                    await _refresh_window(session, window_id=window_id)
+                    w = session.width if w is None else w
+                    h = session.height if h is None else h
+                result = await computer.run_input(
                     lambda: computer.set_window_bounds_by_id(
                         session.pid, int(window_id), x, y,
                         int(w) if w is not None else None,
@@ -4581,8 +4599,7 @@ async def call_tool(
                     "width": session.width, "height": session.height,
                 }))]
             # Default path: frontmost window via osascript (backward-compatible).
-            await asyncio.get_event_loop().run_in_executor(
-                None,
+            await computer.run_input(
                 lambda: computer.set_window_bounds(
                     session.pid, x, y,
                     int(w) if w is not None else None,
@@ -4639,7 +4656,9 @@ async def call_tool(
             window_id = _resolve_window(args, args["app"])
             if window_id is None:
                 raise RuntimeError("focus_window requires 'window' (label) or 'window_id'.")
-            result = await computer.raise_window(session.pid, window_id)
+            result = await _focus_if_needed(session, window_id)
+            if result.get("requires_foreground"):
+                return [types.TextContent(type="text", text=json.dumps(result))]
             await _refresh_window(session, window_id=window_id)
             result["window"] = window_labels.label_for(args["app"], window_id)
             result["win_x"] = session.win_x
@@ -4681,17 +4700,9 @@ async def call_tool(
                     "reason": "system_dialog_needs_foreground",
                     "suggestion": "Use autonomous mode to handle the visible dialog.",
                 }))]
-            # Bring the session app (and its modal save/open panel) truly
-            # frontmost before typing. A single activate+sleep is unreliable
-            # under focus contention — keys would then leak into the user's
-            # foreground app (only a stray final Return registering, saving with
-            # defaults). Poll until frontmost.
-            #
-            # Keys here are delivered GLOBALLY (no pid), NOT pid-targeted: the
-            # save/open panel is rendered by a separate process
-            # (com.apple.appkit.xpc.openAndSavePanelService), so a keystroke
-            # posted to the host app's pid lands in the document behind the panel,
-            # not the panel. Global HID events go to the key window — the panel.
+            # Establish the host before the Go to Folder shortcut. Path text
+            # and panel buttons use retained, scoped AX references instead of
+            # global typing that could reach a document after a focus change.
             frontmost = await _await_frontmost(session)
             if not frontmost:
                 return [types.TextContent(type="text", text=json.dumps({
@@ -4703,16 +4714,16 @@ async def call_tool(
                     ),
                 }))]
 
+            observed = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: computer.ax_snapshot(session.pid, max_results=400),
+            )
+            panels = [e for e in observed if e.get("role") in ("AXSheet", "AXDialog")]
+            if len(panels) != 1:
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "action": action, "saved": False,
+                    "error": "Expected one accessible dialog; nothing was typed. Inspect and resolve missing or multiple dialogs first.",
+                }))]
             if action in ("open", "cancel"):
-                observed = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_snapshot(session.pid, max_results=400),
-                )
-                panels = [e for e in observed if e.get("role") in ("AXSheet", "AXDialog")]
-                if len(panels) != 1:
-                    return [types.TextContent(type="text", text=json.dumps({
-                        "ok": False, "action": action,
-                        "error": "Expected one accessible dialog; nothing was typed. Inspect and resolve missing or multiple dialogs first.",
-                    }))]
                 if action == "open" and not any(
                     e.get("role") == "AXButton" and _normalize_label(e.get("label", "")) in ("open", "choose")
                     for e in observed
@@ -4722,59 +4733,39 @@ async def call_tool(
                         "error": "An Open or Choose button was not found; no input was sent.",
                     }))]
             if action == "cancel":
-                pressed = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_press_panel_button(session.pid, ("Cancel",))
-                )
+                pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Cancel",)))
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": bool(pressed), "action": "cancel",
                     **({} if pressed else {"error": "No accessible Cancel button was pressed."}),
                 }))]
 
             elif action == "open":
-                loop = asyncio.get_event_loop()
                 if path:
-                    await computer.press_key("Cmd+Shift+G")
-                    # Observe the focused path field before typing; a missing
-                    # sheet must never redirect path text into the document.
-                    field = None
+                    await computer.press_key("Cmd+Shift+G", expected_frontmost_pid=session.pid)
+                    # Native ancestry and complete readback establish the exact
+                    # chooser. An empty initial value is valid; a focused
+                    # document field is never an eligible path-input fallback.
+                    navigated_path = None
                     deadline = time.monotonic() + 2.0
                     while time.monotonic() < deadline:
-                        snapshot = await loop.run_in_executor(
-                            None, lambda: computer.ax_snapshot(session.pid, max_results=400)
+                        navigated_path = await computer.run_input(
+                            lambda: computer.ax_navigate_open_panel(session.pid, path)
                         )
-                        fields = [e for e in snapshot if e.get("role") == "AXTextField" and e.get("focused")]
-                        if len(fields) == 1 and str(fields[0].get("value", "")).startswith(("/", "~")):
-                            field = fields[0]
+                        if navigated_path is not None:
                             break
-                        await asyncio.sleep(0.1)
-                    if field is None:
+                        remaining = deadline - time.monotonic()
+                        await asyncio.sleep(min(0.1, max(0.0, remaining)))
+                    if navigated_path is None:
                         return [types.TextContent(type="text", text=json.dumps({
                             "ok": False, "action": action,
-                            "error": "The focused Go to Folder path field was not observed; no path was typed.",
+                            "error": "A verified Go to Folder path field was not available; no path was written. Inspect the dialog before continuing.",
                         }))]
-                    await computer.press_key("Cmd+A")
-                    await computer.type_text_char_by_char(path)
-                    snapshot = await loop.run_in_executor(
-                        None, lambda: computer.ax_snapshot(session.pid, max_results=400)
-                    )
-                    if not any(e.get("focused") and e.get("value") == path for e in snapshot):
+                    if navigated_path != path:
                         return [types.TextContent(type="text", text=json.dumps({
                             "ok": False, "action": action,
-                            "error": "The dialog path did not match the requested text; nothing was opened.",
+                            "error": "The verified chooser path did not match the request; Open was not pressed. Inspect the dialog before continuing.",
                         }))]
-                    await computer.press_key("Return")
-                    await asyncio.sleep(0.5)
-                    snapshot = await loop.run_in_executor(
-                        None, lambda: computer.ax_snapshot(session.pid, max_results=400)
-                    )
-                    if any(e.get("focused") and e.get("value") == path for e in snapshot):
-                        return [types.TextContent(type="text", text=json.dumps({
-                            "ok": False, "action": action,
-                            "error": "The path chooser is still open; inspect the dialog before continuing.",
-                        }))]
-                pressed = await loop.run_in_executor(
-                    None, lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose"))
-                )
+                pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose")))
                 await asyncio.sleep(0.3)
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": bool(pressed), "action": action, "path": path,
@@ -4802,9 +4793,7 @@ async def call_tool(
                 panel_focused = False
                 deadline = time.monotonic() + 2.0
                 while time.monotonic() < deadline:
-                    panel_focused = await loop.run_in_executor(
-                        None, lambda: computer.ax_focus_save_field(session.pid)
-                    )
+                    panel_focused = await computer.run_input(lambda: computer.ax_focus_save_field(session.pid))
                     if panel_focused:
                         break
                     await asyncio.sleep(0.1)
@@ -4827,8 +4816,7 @@ async def call_tool(
                     # below then reports that honestly rather than saving wrong.
                     nav_to = None
                     if directory:
-                        nav_to = await loop.run_in_executor(
-                            None,
+                        nav_to = await computer.run_input(
                             lambda: computer.ax_navigate_save_panel(session.pid, directory),
                         )
                         if not nav_to:
@@ -4836,8 +4824,7 @@ async def call_tool(
                             # through to set-filename + Save — that would drop the
                             # file in the panel's CURRENT location (the wrong place).
                             # Cancel the panel and report; nothing gets saved.
-                            await loop.run_in_executor(
-                                None,
+                            cancelled = await computer.run_input(
                                 lambda: computer.ax_press_panel_button(
                                     session.pid, ("Cancel",)
                                 ),
@@ -4847,34 +4834,32 @@ async def call_tool(
                                 "path": saved_path,
                                 "error": (
                                     f"Couldn't navigate the save panel to {directory!r}: "
-                                    "it isn't one of the panel's sidebar locations (home, "
-                                    "Desktop, Downloads, iCloud, or a Favourite). klyk "
-                                    "navigates the panel invisibly via its sidebar; a "
-                                    "nested subfolder that isn't a Favourite isn't "
-                                    "reachable that way. The panel was cancelled — nothing "
-                                    "was saved. Save to a sidebar location, or add the "
-                                    "folder to Finder's Favourites first."
+                                    "no sidebar location exposed an exact full-path URL for that directory. "
+                                    "A matching name alone is insufficient destination evidence. "
+                                    "No save was requested. Inspect the dialog and its destination "
+                                    "before continuing."
                                 ),
+                                "cancelled": bool(cancelled),
                             }))]
                     # Filename via AX, AFTER navigating — deterministic and
                     # focus-independent; cleanly overwrites any leaked Go-To-Folder
                     # text so the name is always correct.
                     if filename:
-                        ok_name = await loop.run_in_executor(
-                            None,
+                        ok_name = await computer.run_input(
                             lambda: computer.ax_set_save_filename(session.pid, filename),
                         )
                         if not ok_name:
-                            await computer.press_key("Cmd+A")
-                            await asyncio.sleep(0.05)
-                            await computer.type_text_char_by_char(filename)
-                            await asyncio.sleep(0.15)
-                # 3) Press Save via AX (deterministic). Fall back to Return.
-                pressed = await loop.run_in_executor(
-                    None, lambda: computer.ax_press_panel_button(session.pid, ("Save",))
-                )
+                            return [types.TextContent(type="text", text=json.dumps({
+                                "ok": False, "action": "save", "saved": False, "path": saved_path,
+                                "error": "The requested filename could not be set through accessibility; nothing was saved. Inspect the dialog before continuing.",
+                            }))]
+                # 3) Press only the observed Save button; never guess with Return.
+                pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Save",)))
                 if not pressed:
-                    await computer.press_key("Return")
+                    return [types.TextContent(type="text", text=json.dumps({
+                        "ok": False, "action": "save", "saved": False, "path": saved_path,
+                        "error": "Save-button delivery was not confirmed; inspect the current dialog and destination before continuing.",
+                    }))]
                 await asyncio.sleep(0.6)
                 # 4) Handle any alert that follows Save. An extension-mismatch
                 #    confirmation ("you used the extension .txt …") we auto-resolve
@@ -4896,15 +4881,13 @@ async def call_tool(
                         (b for b in buttons if ext and ext.lower() in b.lower()), None
                     )
                     if keep:
-                        await loop.run_in_executor(
-                            None,
+                        await computer.run_input(
                             lambda b=keep: computer.ax_press_panel_button(session.pid, (b,)),
                         )
                         await asyncio.sleep(0.5)
                     else:
                         dialog_error = alert.get("text")
-                        await loop.run_in_executor(
-                            None,
+                        await computer.run_input(
                             lambda: computer.ax_press_panel_button(
                                 session.pid, ("OK", "Cancel", "Done", "Close")
                             ),
@@ -4913,7 +4896,7 @@ async def call_tool(
                         break
                 # 5) Verify the file actually landed — never report a misleading
                 #    success, and surface the OS's own reason when it refused.
-                result: dict = {"ok": True, "action": action, "path": saved_path}
+                result: dict = {"ok": True, "action": action, "path": saved_path, "verified": False}
                 if saved_path:
                     after_save = file_signature()
                     changed = after_save is not None and after_save != before_save
@@ -4922,6 +4905,7 @@ async def call_tool(
                     )
                     saved = changed and not active_panel and not dialog_error
                     result["saved"] = bool(saved)
+                    result["verified"] = bool(saved)
                     if nav_to:
                         result["navigated_to"] = nav_to
                     if not saved:
@@ -4931,8 +4915,7 @@ async def call_tool(
                         # (a stuck save panel made subsequent activations hang for
                         # minutes). Focus-independent; safe if already closed.
                         try:
-                            await loop.run_in_executor(
-                                None,
+                            await computer.run_input(
                                 lambda: computer.ax_press_panel_button(
                                     session.pid, ("Cancel",)
                                 ),
@@ -4973,6 +4956,15 @@ async def call_tool(
                                 "was read — the panel may have kept a different default "
                                 "location."
                             )
+                else:
+                    active_panel = await loop.run_in_executor(
+                        None, lambda: computer.ax_read_alert(session.pid, include_save_panel=True)
+                    )
+                    result["ok"] = not active_panel and not dialog_error
+                    result["saved"] = None
+                    result["message"] = "Save was requested without a destination path; file creation or replacement remains unverified."
+                    if not result["ok"]:
+                        result["error"] = "The save or confirmation panel remains open; inspect it before continuing."
                 return [types.TextContent(type="text", text=json.dumps(result))]
 
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown action: {action}"}))]
@@ -5021,6 +5013,11 @@ async def call_tool(
             # 'window=A' label form works too (previously only window_id raw IDs
             # cascaded — labels did not).
             default_window_id = _resolve_window(args, app_name)
+            if default_window_id is None:
+                default_session = registry.get_by_app(app_name)
+                selected = getattr(default_session, "window_id", None)
+                if isinstance(selected, int) and selected > 0:
+                    default_window_id = selected
             all_results = []
             response_items = []
             step_timings = []
@@ -5040,9 +5037,12 @@ async def call_tool(
                     step_timings.append("missing_tool=INVALID")
                     break
                 tool_args = {k: v for k, v in action.items() if k != "tool"}
-                tool_args["app"] = app_name
+                step_app = tool_args.setdefault("app", app_name)
                 # Per-action window/window_id overrides run's default; otherwise inherit.
-                if "window" not in tool_args and "window_id" not in tool_args and default_window_id is not None:
+                if (
+                    step_app == app_name and "window" not in tool_args and "window_id" not in tool_args
+                    and default_window_id is not None
+                ):
                     tool_args["window_id"] = default_window_id
                 # Validate the step against its schema before dispatch — `run`
                 # bypasses the SDK's top-level validation, so without this a
@@ -5122,18 +5122,15 @@ async def call_tool(
                         and action_result.get("ok")
                         and isinstance(action_result.get("result"), dict)
                     ):
-                        _v = await _post_action_verify(app_name)
+                        _v = await _post_action_verify(step_app)
                         if _v is not None:
                             action_result["result"]["verify"] = _v
                     # Collapse contiguous boring same-tool actions into a single
                     # {tool, ok, count, duration_ms} entry to keep long batches
                     # (e.g. 200 press_key) from ballooning the response payload.
-                    # "Boring" = ok:True with no meaningful additional info to
-                    # inspect. Specifically: no image, no warning, no hint, no
-                    # escalation marker. A {ok:True, via:"skylight"} response
-                    # from a seamless click is boring — `via` is bookkeeping the
-                    # agent can derive from session mode if it cares. The
-                    # presence of "count" marks an entry as collapsible.
+                    # Only a trivial acknowledgement can collapse. Targets,
+                    # verification, selected values and mode evidence remain
+                    # available; actual delivery cannot be inferred from policy.
                     payload = action_result.get("result")
                     # Only ACTION tools collapse. Observation/read tools
                     # (read_grid, ax_snapshot, read_text, read_element, get_*)
@@ -5152,12 +5149,18 @@ async def call_tool(
                         and not payload.get("requires_foreground")
                         and "error" not in payload
                         and "verify" not in payload
+                        and not (set(payload) - {"ok", "via", "_meta"})
                     )
+                    compact_evidence = {k: v for k, v in payload.items() if k in ("ok", "via")} if is_boring else None
                     if (
                         is_boring
                         and all_results
                         and all_results[-1].get("tool") == tool_name
                         and "count" in all_results[-1]
+                        and all_results[-1].get("result") == compact_evidence
+                        and all_results[-1].get("app") == step_app
+                        and all_results[-1].get("window") == tool_args.get("window")
+                        and all_results[-1].get("window_id") == tool_args.get("window_id")
                     ):
                         all_results[-1]["count"] += 1
                         all_results[-1]["duration_ms"] += step_ms
@@ -5166,6 +5169,8 @@ async def call_tool(
                     elif is_boring:
                         all_results.append({
                             "tool": tool_name, "ok": True, "count": 1, "duration_ms": step_ms,
+                            "app": step_app, "window": tool_args.get("window"),
+                            "window_id": tool_args.get("window_id"), "result": compact_evidence,
                         })
                         step_timings.append(f"{tool_name}={step_ms}ms")
                     else:
@@ -5178,7 +5183,7 @@ async def call_tool(
                     step_timings.append(f"{tool_name}=ERR({step_ms}ms)")
                     all_results.append({"tool": tool_name, "ok": False, "error": str(e), "duration_ms": step_ms})
                     break
-            log.info(f"run summary: [{', '.join(step_timings)}]")
+            log.info("run completed (%s attempted steps, %s remaining)", completed_steps, len(actions) - completed_steps)
             # Top-level ok reflects whether EVERY step landed. Collapsed boring
             # entries are ok:True; full entries carry the ok the per-step logic
             # set (False for blocked / requires_foreground / errored steps). An
@@ -5258,22 +5263,40 @@ async def call_tool(
             session, _ = await _get_session(args, name)
             x, y = int(args["x"]), int(args["y"])
             option = args["option"]
+            if session.mode == "background":
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "requires_foreground": True,
+                    "reason": "native_option_requires_visible_input",
+                }))]
+            window_id = _resolve_window(args, session.app) or session.window_id
+            await _refresh_window(session, window_id=window_id)
+            allowed, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not allowed:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
+            await _focus_if_needed(session, window_id)
+            gate = await _ensure_key_delivery(session, name, command_shortcut=True)
+            if gate is not None:
+                return [types.TextContent(type="text", text=json.dumps(gate))]
+            await _refresh_window(session, window_id=window_id)
+            allowed, reason = await _check_click_safety(session, args["x"], args["y"])
+            if not allowed:
+                return [types.TextContent(type="text", text=json.dumps({"ok": False, "error": reason}))]
             sx, sy = _to_screen(session, x, y)
             await computer.click(sx, sy)
             await asyncio.sleep(0.25)
-            await computer.type_text_char_by_char(option, session.pid)
+            await computer.type_text_char_by_char(option, session.pid, expected_frontmost_pid=session.pid)
             await asyncio.sleep(0.1)
-            await computer.press_key("Return", session.pid)
-            # Read the control back so the result reflects what was ACTUALLY
-            # selected — type-to-select matches on a prefix and can land on the
-            # wrong item, so we must not blindly report ok:true. ax_value_at
-            # reads the popup's AXValue (its selected item's title) at the
-            # control's screen position.
-            value = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_value_at(float(sx), float(sy))
+            await computer.press_key("Return", session.pid, expected_frontmost_pid=session.pid)
+            # Type-to-select can choose a prefix sibling. Verify the exact value
+            # in this process and window rather than reading an overlapping app.
+            value, status = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: computer.ax_value_at_detailed(
+                    float(sx), float(sy), expected_pid=session.pid, window_id=window_id,
+                )
             )
-            ok = value is not None and _normalize_label(option) in _normalize_label(value)
-            payload: dict = {"ok": ok, "selected": value, "requested": option}
+            ok = status == "ok" and value is not None and _normalize_label(option) == _normalize_label(value)
+            payload: dict = {"ok": ok, "verified": ok, "selected": value, "requested": option,
+                             "window_id": window_id, "via": "cursor_warp+keys"}
             if not ok:
                 payload["warning"] = (
                     "Selected value doesn't match the requested option — the popup "
@@ -5285,8 +5308,10 @@ async def call_tool(
         # --- ax_snapshot ---
         elif name == "ax_snapshot":
             session, _ = await _get_session(args, name)
+            if not getattr(session, "windowless", False):
+                await _refresh_window(session, window_id=_resolve_window(args, args["app"]))
             elements = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_snapshot(session.pid)
+                None, lambda: computer.ax_snapshot(session.pid, max_results=201, window_id=session.window_id or None)
             )
             elements = _filter_for_browser(elements, session.app)
             # Convert from screen-space to window-relative so coords match screenshot pixels
@@ -5303,11 +5328,14 @@ async def call_tool(
             total = len(elements)
             kept = elements[:_AX_SNAPSHOT_CAP]
             for elem in kept:
-                v = elem.get("value")
-                if isinstance(v, str) and len(v) > 200:
-                    elem["value"] = v[:200] + "…"
+                for key in ("label", "value", "role"):
+                    text = elem.get(key)
+                    if isinstance(text, str) and len(text) > 200:
+                        elem[key] = text[:200] + "…"
             payload: dict = {
                 "element_count": total,
+                "window_id": session.window_id,
+                "traversal": "bounded",
                 "returned": len(kept),
                 "elements": kept,
             }
@@ -5323,11 +5351,8 @@ async def call_tool(
             # back nearly empty on a browser. No stale cached flag.
             if is_browser(session.app) and len(elements) < 5:
                 payload["ax_disabled_warning"] = (
-                    f"{session.app}'s web AX tree is empty — this snapshot covers "
-                    "only browser-shell elements (toolbar, tabs). Web content "
-                    "(page buttons, links, form fields) isn't reaching the AX layer. "
-                    "If this persists across calls, quit the browser fully and let "
-                    "klyk relaunch it so --force-renderer-accessibility takes effect."
+                    f"{session.app}'s accessibility snapshot is sparse; it may omit page controls. "
+                    "Use the image from inspect or read_text for visible page text."
                 )
             return [types.TextContent(type="text", text=json.dumps(payload))]
 
@@ -5363,6 +5388,8 @@ async def call_tool(
             rw = args.get("width")
             rh = args.get("height")
             has_region = all(v is not None for v in (rx, ry, rw, rh))
+            if any(v is not None for v in (rx, ry, rw, rh)) and not has_region:
+                raise ValueError("OCR region requires all of x, y, width and height.")
             if has_region:
                 rx, ry, rw, rh = float(rx), float(ry), float(rw), float(rh)
 
@@ -5371,7 +5398,8 @@ async def call_tool(
             )
 
             def _run_ocr() -> list[dict]:
-                return ocr.recognize_all(img_b64, level=level, languages=languages)
+                return ocr.recognize_all(img_b64, level=level, languages=languages,
+                                         region=(rx, ry, rw, rh) if has_region else None)
 
             observations = await asyncio.get_event_loop().run_in_executor(
                 None, _run_ocr
@@ -5393,15 +5421,35 @@ async def call_tool(
             sorted_obs = sorted(
                 observations, key=lambda m: (round(m["y"] / row_tolerance), m["x"])
             )
-            full_text = "\n".join(m["text"] for m in sorted_obs)
+            observation_count = len(observations)
+            full_length = sum(len(m["text"]) for m in sorted_obs) + max(0, observation_count - 1)
+            remaining_chars = 12000
+            text_parts = []
+            for m in sorted_obs:
+                if remaining_chars <= 0:
+                    break
+                separator = "\n" if text_parts else ""
+                part = m["text"][:max(0, remaining_chars - len(separator))]
+                text_parts.append(separator + part)
+                remaining_chars -= len(separator) + len(part)
+            full_text = "".join(text_parts)
+            truncated = observation_count > 200 or full_length > 12000
+            kept = []
+            for m in observations[:200]:
+                out = dict(m)
+                if len(out["text"]) > 200:
+                    out["text"] = out["text"][:200]
+                    truncated = True
+                kept.append(out)
 
             payload = {
                 "ok": True,
                 "via": "ocr",
                 "level": level_str,
-                "count": len(observations),
-                "observations": observations,
+                "count": len(kept),
+                "observations": kept,
                 "full_text": full_text,
+                **({"truncated": True, "observation_count": observation_count} if truncated else {}),
             }
             warn = _focus_warning_from(focus_status)
             if warn is not None:
@@ -5415,73 +5463,14 @@ async def call_tool(
             index_explicit = "index" in args
             index = int(args.get("index", 0))
 
-            # Optional window filter: scope the AX scan (and OCR fallback's screenshot)
-            # to a single window of this app. Without it, multi-window apps surface every
-            # label match across all windows, forcing the agent to enumerate index=0,1,2…
+            # Resolve the selected window before searching, even when no selector is supplied.
             filter_wid = _resolve_window(args, args["app"])
-            filter_bounds: tuple[int, int, int, int] | None = None
-            if filter_wid is not None:
-                win = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: capture.get_window_by_id(int(filter_wid))
-                )
-                if not win or win["pid"] != session.pid:
-                    return [types.TextContent(type="text", text=json.dumps({
-                        "error": (
-                            f"Window {filter_wid} not found or doesn't belong to "
-                            f"'{args['app']}'. Call list_windows to refresh labels."
-                        ),
-                    }))]
-                filter_bounds = (
-                    win["x"], win["y"],
-                    win["x"] + win["width"], win["y"] + win["height"],
-                )
-
-            # Tier 1: accessibility tree, search-aware.
-            # ax_search_focused walks AXFocusedWindow with one batched IPC
-            # per element for label/role/value/children and only spends
-            # the second IPC for pos/size when the label actually matches.
-            # On real apps this returns in ~100-500 ms (vs ~45 s for the
-            # naive walker), inside the klyk hard 1 s tool budget.
-            # Misses fall through to OCR — content-area text matches
-            # belong there anyway, not in another AX scan.
-            def _filter_bounds(els: list[dict]) -> list[dict]:
-                els = _filter_for_browser(els, session.app)
-                if filter_bounds is not None:
-                    x0, y0, x1, y1 = filter_bounds
-                    els = [
-                        e for e in els
-                        if x0 <= e.get("x", 0) <= x1 and y0 <= e.get("y", 0) <= y1
-                    ]
-                return els
-
-            if filter_bounds is None:
-                # Collect a generous candidate set (>= 32) before ranking.
-                # The walker returns matches in AX-tree order and stops at the
-                # cap, so the cap must be wide enough that an exact label hit
-                # isn't truncated away behind incidental substring hits before
-                # _rank_ax_matches can promote it. 32 comfortably exceeds the
-                # substring-collision count of any real window for a specific
-                # label, while the walker's own deadline still bounds latency.
-                ax_matches = await asyncio.get_event_loop().run_in_executor(
-                    None,
-                    lambda: computer.ax_search_focused(
-                        session.pid, query, max_results=max(index + 8, 32),
-                    ),
-                )
-                ax_matches = _filter_bounds(ax_matches)
-            else:
-                # Explicit window filter: walk just that window's bounds
-                # via a snapshot (cap=100 keeps the snapshot itself fast)
-                # then post-filter to the query.
-                elements = await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_snapshot(session.pid)
-                )
-                elements = _filter_bounds(elements)
-                ax_matches = [
-                    e for e in elements
-                    if query in _normalize_label(e.get("label", "") or "")
-                    or query in _normalize_label(e.get("value", "") or "")
-                ]
+            await _refresh_window(session, window_id=filter_wid)
+            filter_wid = int(session.window_id)
+            ax_matches = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: computer.ax_search_focused(
+                    session.pid, query, max_results=min(max(index + 8, 32), 200), window_id=filter_wid))
+            ax_matches = _filter_for_browser(ax_matches, session.app)
 
             # Rank exact label hits ahead of incidental substring hits so the
             # element the agent actually named lands at index 0, regardless of
@@ -5521,26 +5510,26 @@ async def call_tool(
                 #   2. Same chain on up to 2 parent levels — Finder sidebar
                 #      rows expose AXOpen on AXRow, not on the inner
                 #      AXStaticText that matched the label.
-                #   3. SkyLight click at the matched element's coords. AX
-                #      matched the label so the target is correct; only the
-                #      AX-action API can't trigger it. SkyLight delivers
-                #      invisibly without re-OCR'ing.
-                #   4. Companion: bail with structured error. Autonomous:
-                #      log escalation + fall through to cursor-warp.
+                #   3. The normal click dispatcher handles unsupported actions
+                #      with the same bounds and mode gates as coordinate clicks.
                 if session.mode in ("background", "autonomous"):
                     # Chromium can acknowledge AXPress without firing the DOM
                     # action. Choose its established visible route up front;
                     # never retry an acknowledged action after the fact.
                     ax_result = {"ok": False, "status": "chromium_requires_visible_input"}
                     if not _is_chromium_based(session):
-                        ax_result = await asyncio.get_event_loop().run_in_executor(
-                            None,
+                        ax_result = await computer.run_input(
                             lambda: computer.ax_resolve_and_act(
                                 float(elem["x"]), float(elem["y"]),
                                 action_chain=("AXPress", "AXOpen"),
-                                max_levels_up=2, expected_pid=session.pid,
+                                max_levels_up=2, expected_pid=session.pid, window_id=filter_wid,
+                                expected_label=elem.get("label") or elem.get("value") or None,
                             ),
                         )
+                    if ax_result.get("status") == "stale_target":
+                        return [types.TextContent(type="text", text=json.dumps({
+                            "ok": False, "error": "The matched control changed before input; inspect again.",
+                        }))]
                     if ax_result.get("ok"):
                         return [types.TextContent(type="text", text=json.dumps({
                             "ok": True,
@@ -5551,68 +5540,17 @@ async def call_tool(
                             "level": ax_result.get("level"),
                         }))]
 
-                    # AX-action chain exhausted at element + parents. Try
-                    # SkyLight click at the matched coords next.
-                    if skylight.is_available():
-                        target_wid = filter_wid if filter_wid is not None else int(session.window_id)
-                        await _refresh_window(session, window_id=filter_wid)
-                        # AX coords are screen-space (kAXValueCGPointType is
-                        # absolute), but SkyLight's post_mouse_click expects
-                        # window-local — translate before delivery. Symmetric
-                        # with drag_to_element's same-shape fix in 6b6c801.
-                        wlx = float(elem["x"]) - float(session.win_x)
-                        wly = float(elem["y"]) - float(session.win_y)
-                        seamless_result = await _seamless_click(
-                            session, target_wid, wlx, wly,
-                            "left", "click_element",
-                        )
-                        if seamless_result.get("ok"):
-                            return [types.TextContent(type="text", text=json.dumps({
-                                "ok": True,
-                                "clicked": _win_rel(elem, session),
-                                "matches_found": len(ax_matches),
-                                "via": f"ax_match+{seamless_result['via']}",
-                                "ax_actions_unsupported": ax_result.get("available_actions", {}),
-                            }))]
-                        if seamless_result.get("requires_foreground"):
-                            seamless_result["matched_element"] = _win_rel(elem, session)
-                            return [types.TextContent(type="text", text=json.dumps(seamless_result))]
-                        # Unrecoverable SkyLight failure (rare). Companion
-                        # bails loudly; autonomous logs and falls through.
-                        if session.mode == "background":
-                            return [types.TextContent(type="text", text=json.dumps({
-                                "ok": False,
-                                "requires_foreground": True,
-                                "reason": "skylight_post_failed",
-                                "matched_element": _win_rel(elem, session),
-                                "skylight_error": seamless_result.get("error"),
-                                "ax_actions_unsupported": ax_result.get("available_actions", {}),
-                                "suggestion": "Element exposes no AXPress/AXOpen and SkyLight delivery failed. Switch to mode='autonomous' to allow cursor-warp fallback.",
-                            }))]
-                        _log_escalation(session, "click_element", elem.get("x"), elem.get("y"),
-                                        seamless_result.get("error", "skylight_unknown"))
-                    elif session.mode == "background":
-                        # SkyLight not loaded on this system + no AX action.
-                        return [types.TextContent(type="text", text=json.dumps({
-                            "ok": False,
-                            "requires_foreground": True,
-                            "reason": "ax_no_action_skylight_unavailable",
-                            "clicked_target": _win_rel(elem, session),
-                            "ax_actions_unsupported": ax_result.get("available_actions", {}),
-                            "suggestion": "Element exposes no AXPress/AXOpen action and SkyLight is unavailable on this system. Switch to mode='autonomous' to allow cursor-warp fallback.",
-                        }))]
-                    else:
-                        _log_escalation(session, "click_element", elem.get("x"), elem.get("y"),
-                                        "ax_no_action_no_skylight")
-                # Compat (or autonomous fall-through after every invisible
-                # path failed). ax_snapshot coords are screen-space.
-                await computer.click(elem["x"], elem["y"])
-                return [types.TextContent(type="text", text=json.dumps({
-                    "ok": True,
-                    "clicked": _win_rel(elem, session),
-                    "matches_found": len(ax_matches),
-                    "via": "ax",
-                }))]
+                # Coordinate fallbacks share click's bounds, mode, focus and
+                # delivery gates. One route prevents semantic/OCR paths drifting.
+                target = _win_rel(elem, session)
+                response = await call_tool("click", {"app": session.app,
+                    "window_id": filter_wid, "x": target["x"], "y": target["y"]})
+                outcome = json.loads(response[-1].text)
+                outcome["clicked" if outcome.get("ok") else "matched_element"] = target
+                outcome["matches_found"] = len(ax_matches)
+                if outcome.get("ok"):
+                    outcome["via"] = "ax_match+" + outcome.get("via", "cursor_warp")
+                return [types.TextContent(type="text", text=json.dumps(outcome))]
 
             # Tier 2: on-device OCR. Re-screenshot the window and scan for the
             # query as visible text. Catches anything rendered outside the AX
@@ -5692,38 +5630,14 @@ async def call_tool(
                             "matches": ocr_matches,
                         }))]
                     m = ocr_matches[index]
-                    # Seamless mode: route OCR coord clicks through SkyLight too —
-                    # AXPress isn't an option here (OCR found visible text, not an
-                    # AX element with an action), but invisible coord delivery still
-                    # works the same way the click tool does it.
-                    if session.mode in ("background", "autonomous") and skylight.is_available():
-                        target_wid = filter_wid if filter_wid is not None else int(session.window_id)
-                        await _refresh_window(session, window_id=filter_wid)
-                        seamless_result = await _seamless_click(
-                            session, target_wid, float(m["x"]), float(m["y"]), "left", "click_element",
-                        )
-                        if seamless_result.get("ok"):
-                            return [types.TextContent(type="text", text=json.dumps({
-                                "ok": True,
-                                "clicked": m,
-                                "matches_found": len(ocr_matches),
-                                "via": f"{ocr_via}+{seamless_result['via']}",
-                            }))]
-                        if seamless_result.get("requires_foreground"):
-                            seamless_result["ocr_target"] = m
-                            return [types.TextContent(type="text", text=json.dumps(seamless_result))]
-                        # Autonomous, SkyLight failed: log + fall through.
-                        _log_escalation(session, "click_element", m.get("x"), m.get("y"),
-                                        seamless_result.get("error", "skylight_unknown"))
-                    # OCR returns window-relative pixel coords — convert to screen.
-                    sx, sy = _to_screen(session, m["x"], m["y"])
-                    await computer.click(sx, sy)
-                    return [types.TextContent(type="text", text=json.dumps({
-                        "ok": True,
-                        "clicked": m,
-                        "matches_found": len(ocr_matches),
-                        "via": ocr_via,
-                    }))]
+                    response = await call_tool("click", {"app": session.app,
+                        "window_id": filter_wid, "x": m["x"], "y": m["y"]})
+                    outcome = json.loads(response[-1].text)
+                    outcome["clicked" if outcome.get("ok") else "ocr_target"] = m
+                    outcome["matches_found"] = len(ocr_matches)
+                    if outcome.get("ok"):
+                        outcome["via"] = ocr_via + "+" + outcome.get("via", "cursor_warp")
+                    return [types.TextContent(type="text", text=json.dumps(outcome))]
 
                 # Nothing matched in AX or OCR. Don't dead-end: hand back the
                 # closest visible on-screen text (ranked, with window-relative
@@ -5766,23 +5680,28 @@ async def call_tool(
         # --- get_template ---
         elif name == "get_template":
             session, _ = await _get_session(args, name)
-            screenshot_b64, _, _, _focus = await _take_screenshot(session)
-            x1, y1 = int(args["x1"]), int(args["y1"])
-            x2, y2 = int(args["x2"]), int(args["y2"])
+            screenshot_b64, width, height, _focus = await _take_screenshot(session)
+            requested_region = [int(args[k]) for k in ("x1", "y1", "x2", "y2")]
+            x1, y1 = max(0, requested_region[0]), max(0, requested_region[1])
+            x2, y2 = min(width, requested_region[2]), min(height, requested_region[3])
+            if x2 <= x1 or y2 <= y1:
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "error": "Template region has no pixels inside the selected window; inspect its bounds and crop again.",
+                }))]
             template_b64 = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: matcher.crop(screenshot_b64, x1, y1, x2, y2)
             )
             # Cache in session so the agent can reference by id and avoid
             # round-tripping the full base64 (which is fragile at scale).
             template_id = f"tpl_{uuid.uuid4().hex[:12]}"
-            if len(session.template_cache) >= 50:
-                session.template_cache.pop(next(iter(session.template_cache)))
-            session.template_cache[template_id] = template_b64
+            matcher.cache_template(session.template_cache, template_id, template_b64)
             payload = {
                 "template_id": template_id,
                 "region": [x1, y1, x2, y2],
                 "size": [x2 - x1, y2 - y1],
             }
+            if requested_region != payload["region"]:
+                payload["requested_region"] = requested_region
             # Raw b64 is opt-in — at ~5-50 KB per template, returning it by
             # default was paid on every call by every agent even though most
             # only ever use the template_id.
@@ -5802,7 +5721,7 @@ async def call_tool(
                     return [types.TextContent(type="text", text=json.dumps({
                         "error": (
                             f"Unknown template_id '{template_id}'. Template cache is "
-                            "per-session and capped at 50 entries — call get_template "
+                            "per-session and capped at 50 entries / 8 MiB — call get_template "
                             "again to refresh, or pass template_b64 directly."
                         ),
                     }))]
@@ -5842,27 +5761,6 @@ async def call_tool(
                 if best is not None:
                     payload["last_confidence"] = best["confidence"]
                     payload["last_box"] = best["box"]
-                # Occlusion check: find_template's internal screenshot is a
-                # composited region capture, so if another window covers this one
-                # the captured pixels are the OCCLUDER's — a "no match" then means
-                # "covered", not "gone". Surface it (as screenshot does) so the
-                # agent raises the window rather than concluding the element
-                # disappeared.
-                try:
-                    occ = await asyncio.get_event_loop().run_in_executor(
-                        None,
-                        lambda: capture.window_occluders(int(session.window_id), session.pid),
-                    )
-                except Exception:
-                    occ = []
-                if occ:
-                    names = ", ".join(o["owner_name"] for o in occ)
-                    payload["overlap_warning"] = (
-                        f"Another window overlaps this one ({names}); the internal "
-                        "capture may show its pixels, not the target — the template "
-                        "is likely just covered, not gone. focus_window to raise this "
-                        "window (or activate the app), then retry."
-                    )
                 return [types.TextContent(type="text", text=json.dumps(payload))]
             return [types.TextContent(type="text", text=json.dumps({
                 "ok": True,
@@ -5874,41 +5772,73 @@ async def call_tool(
             return [types.TextContent(type="text", text=json.dumps({"error": f"Unknown tool: {name}"}))]
 
     try:
-        response = await _dispatch()
+        # Validate before opening ownership files or consulting request values
+        # during finalization, including on unsupported transports and nested steps.
+        validator = _TOOL_VALIDATORS.get(name)
+        if validator is None:
+            raise ValueError(f"Unknown tool: {name}")
+        _validate_finite_arguments(args)
+        validator.validate(args)
+        validated = True
+        if name == "run":
+            _validate_run_budget(args)
+        if name not in _OWNERSHIP_EXEMPT:
+            computer._check_stop()
+            if not ownership.is_owner():
+                response = _control_blocked_response()
+            elif is_top_level:
+                # The lease rechecks ownership, preventing a handoff between the
+                # fast refusal check and delivery. Failed entry has sent no input.
+                entered_lease = False
+                try:
+                    with ownership.control_request():
+                        entered_lease = True
+                        response = await _dispatch()
+                except RuntimeError:
+                    if not entered_lease and not ownership.is_owner():
+                        response = _control_blocked_response()
+                    else:
+                        raise
+            else:
+                # Sequential run steps remain inside the outer lease and still
+                # perform their own current-owner and emergency-stop checks.
+                response = await _dispatch()
+        else:
+            response = await _dispatch()
     except Exception as e:
         # Validation exceptions include the original input; native exceptions
         # can also include typed values. Keep only the class in persistent logs.
-        log.error("tool %s failed (%s)", name, type(e).__name__)
+        log.error("tool %s failed (%s)", diagnostic_name, type(e).__name__)
         # The requesting agent receives the actionable error; only its class
         # belongs in persistent diagnostics, not the original request value.
         response = [types.TextContent(type="text", text=json.dumps({"ok": False, "error": str(e)}))]
     finally:
         duration_ms = round((time.monotonic() - start) * 1000)
         _call_depth -= 1
-        # Maintain the post-mutation settle flag at the leaf level. `run` is
-        # skipped — its sub-actions (which re-enter call_tool) already set it,
-        # and the wrapper finishing must not clobber the last leaf's value. A
-        # mutating action that actually landed arms the next capture's repaint
-        # wait; any other leaf clears it so passive observation stays instant.
-        if name != "run":
-            _last_action_mutated = (
-                name in _BATCHABLE_ACTIONS and _response_indicates_ok(response)
-            )
+        # A failed native action may still have changed the UI. Reads retain the
+        # per-session timestamp; run leaves timing to its individual leaf steps.
+        if validated and name != "run":
+            if name not in _OWNERSHIP_EXEMPT:
+                app_name = args.get("app")
+                mutated_session = registry.get_by_app(app_name) if isinstance(app_name, str) and app_name else None
+                if mutated_session is not None:
+                    mutated_session.last_mutation_at = time.monotonic()
         if is_top_level:
-            _last_response_time = time.monotonic()
             # Hint: cheap pure-Python pattern check on recent call history.
-            hint = _detect_hint(name, args)
+            hint = _detect_hint(name, args) if validated else None
             # Verify: opt-in cheap focused-state probe after a batchable
             # action. Skip if the action itself failed — verify on a
             # failed click is misleading. Skip on `run` because each
             # nested step already has its own opportunity to set verify.
             verify_data: dict | None = None
             if (
-                args.get("verify")
+                validated and args.get("verify")
                 and name in _BATCHABLE_ACTIONS
                 and _response_indicates_ok(response)
             ):
                 verify_data = await _post_action_verify(args.get("app"))
+            duration_ms = round((time.monotonic() - start) * 1000)
+            _last_response_time = time.monotonic()
             _inject_meta(
                 response,
                 duration_ms=duration_ms,
@@ -5916,10 +5846,10 @@ async def call_tool(
                 hint=hint,
                 verify=verify_data,
             )
-            _record_call(name)
+            _record_call(diagnostic_name)
         gap_str = f" gap_ms={gap_ms}" if gap_ms is not None else ""
         depth_str = "" if is_top_level else " nested=1"
-        log.info(f"done: {name} duration_ms={duration_ms}{gap_str}{depth_str}")
+        log.info("done: %s duration_ms=%s%s%s", diagnostic_name, duration_ms, gap_str, depth_str)
     return response
 
 
@@ -5946,8 +5876,24 @@ if _MCP_USES_TYPED_HANDLERS:
 # ---------------------------------------------------------------------------
 
 async def main():
-    async with stdio_server() as (read_stream, write_stream):
-        await server.run(read_stream, write_stream, server.create_initialization_options())
+    """Serve stdio requests and release held input before normal transport shutdown."""
+    try:
+        async with stdio_server() as (read_stream, write_stream):
+            await server.run(read_stream, write_stream, server.create_initialization_options())
+    finally:
+        _cleanup_input_on_exit()
+
+
+def _cleanup_input_on_exit() -> None:
+    """Halt new input and release keys/buttons before restoring any borrowed clipboard."""
+    try:
+        computer.release_held_input()
+    except Exception:
+        log.warning("Input exit cleanup failed")
+    try:
+        computer._flush_clipboard_restore()
+    except Exception:
+        log.warning("Clipboard exit cleanup failed")
 
 
 def _install_signal_handlers() -> None:
@@ -5956,10 +5902,9 @@ def _install_signal_handlers() -> None:
 
     An MCP client that stops klyk by sending SIGTERM (rather than closing
     stdin) would, under Python's default handler, terminate the process
-    *without* running atexit — leaving any clipboard klyk borrowed for a
-    paste un-restored. The handler instead restores the clipboard, then
-    hard-exits promptly, so we never leave a borrowed clipboard or a zombie
-    process behind.
+    *without* running atexit — leaving a held key/button or a borrowed
+    clipboard. The handler halts new input, releases held input, restores
+    the clipboard, and then hard-exits promptly.
 
     Must run on the main thread. The 20 ms AppKit drain timer keeps the
     interpreter checking signals even while NSApp.run blocks, so delivery
@@ -5968,11 +5913,8 @@ def _install_signal_handlers() -> None:
     import signal
 
     def _graceful_exit(_signum, _frame):
-        try:
-            from .computer import _flush_clipboard_restore
-            _flush_clipboard_restore()
-        except Exception:
-            pass
+        """Release native state before the process terminates on a client signal."""
+        _cleanup_input_on_exit()
         os._exit(0)
 
     for _sig in (signal.SIGTERM, signal.SIGINT):
@@ -5995,7 +5937,7 @@ def _install_parent_death_watch() -> None:
     record. (It can't block a new session: control is latest-wins, so the
     next session just claims it.) We poll the parent pid; when it changes
     (on orphaning, the OS reparents us to launchd), the client is gone, so
-    we restore the clipboard and exit, keeping the environment clean.
+    we release input, restore the clipboard and exit, keeping the environment clean.
 
     Skipped if we were started without a tracked parent (already pid 1 /
     daemonized), so an intentionally standalone klyk is never killed.
@@ -6008,11 +5950,7 @@ def _install_parent_death_watch() -> None:
         while True:
             try:
                 if os.getppid() != initial_ppid:
-                    try:
-                        from .computer import _flush_clipboard_restore
-                        _flush_clipboard_restore()
-                    except Exception:
-                        pass
+                    _cleanup_input_on_exit()
                     os._exit(0)
             except Exception:
                 pass
@@ -6033,8 +5971,8 @@ def _run_on_macos() -> None:
 
     Bootstrap order:
       1. install UI thread (NSApp + activation policy + drain timer)
-      2. install the always-on menubar status item
-      3. spawn the asyncio worker (MCP stdio server)
+      2. verify input delivery and warm the keyboard layout
+      3. start MCP, then schedule the menu-bar indicator
       4. block the main thread on NSApp.run() until the worker requests
          shutdown (stdin closed)
     """
@@ -6046,15 +5984,6 @@ def _run_on_macos() -> None:
     # 1b. Parent-death watch — if the client is hard-killed, exit so we
     #     don't linger as a stray process / stale menu-bar item.
     _install_parent_death_watch()
-    # 2. Menu-bar status item — always-on; shows klyk is alive even when
-    #    no session has been created yet. Per-app dock-tile badges appear
-    #    automatically whenever a session opens (no opt-in).
-    try:
-        from .menubar import menubar as _menubar
-        _menubar.install_if_needed()
-    except Exception as e:
-        log.warning("menubar install failed at startup: %s", e)
-
     # 2b. SkyLight delivery self-test — confirm the invisible-input path doesn't
     #     just LOAD but actually DELIVERS on this macOS build. Runs its own
     #     bounded NSApp loop on the main thread (off-screen sink, no focus
@@ -6062,8 +5991,8 @@ def _run_on_macos() -> None:
     #     populated before the first click. If delivery is broken (e.g. a macOS
     #     update changed the private API), the seamless dispatch falls back to
     #     the visible cursor instead of silently no-op'ing. Best-effort and
-    #     self-bounding (its finish timer always stops the loop) — never blocks
-    #     boot; one retry guards against a transient first-attempt miss.
+    #     bounded by its finish timer once AppKit dispatches events; one retry
+    #     guards against a first-attempt miss during window registration.
     try:
         if skylight.is_available():
             verified = skylight.self_test(timeout=0.4) or skylight.self_test(timeout=0.4)
@@ -6074,7 +6003,7 @@ def _run_on_macos() -> None:
                     "Run `klyk doctor` for details."
                 )
     except Exception as e:
-        log.warning("SkyLight delivery self-test skipped: %s: %s", type(e).__name__, e)
+        log.warning("SkyLight delivery self-test skipped (%s)", type(e).__name__)
 
     # 2b'. Update-freshness check — background daemon thread, at most one real
     #      PyPI fetch per day (shared ~/.klyk/update_check.json cache), fully
@@ -6085,7 +6014,7 @@ def _run_on_macos() -> None:
         from . import updates as _updates
         _updates.start_background_check(on_checked=_refresh_menubar)
     except Exception as e:
-        log.warning("update check not started: %s: %s", type(e).__name__, e)
+        log.warning("update check not started (%s)", type(e).__name__)
 
     # 2c. Keyboard-layout warm — build the char→keycode map on the MAIN thread.
     #     Carbon/TIS input-source APIs (used to map characters to layout-correct
@@ -6101,14 +6030,14 @@ def _run_on_macos() -> None:
         from . import keycodes as _keycodes
         _keycodes.warm_keyboard_layout()
     except Exception as e:
-        log.warning("keyboard-layout warm failed at startup: %s", e)
+        log.warning("keyboard-layout warm failed at startup (%s)", type(e).__name__)
 
     # 3. asyncio worker thread runs the MCP stdio server.
     def _worker() -> None:
         try:
             asyncio.run(main())
         except Exception as e:
-            log.error("MCP worker terminated: %s: %s", type(e).__name__, e, exc_info=True)
+            log.error("MCP worker terminated (%s)", type(e).__name__)
         finally:
             # Signal AppKit to stop so the main thread can exit cleanly.
             try:
@@ -6119,6 +6048,14 @@ def _run_on_macos() -> None:
     import threading as _threading
     worker_thread = _threading.Thread(target=_worker, name="klyk", daemon=False)
     worker_thread.start()
+
+    # A slow NSStatusBar call must not delay the protocol handshake or run inside
+    # the bounded input self-test. Schedule the optional indicator only afterward.
+    try:
+        from .menubar import menubar as _menubar
+        _menubar.install_if_needed()
+    except Exception as e:
+        log.warning("menubar install failed at startup (%s)", type(e).__name__)
 
     # 4. Block the main thread on NSApp.run() — returns when worker
     #    finishes and calls _ui.shutdown().
@@ -6132,18 +6069,14 @@ def _run_on_macos() -> None:
     # still blocked on stdin). A non-daemon thread would keep the
     # interpreter alive indefinitely, leaving a zombie process (and its
     # menu-bar item) lingering. So guarantee exit: run the one
-    # atexit-critical cleanup (clipboard restore) explicitly, then
+    # exit-critical input and clipboard cleanup explicitly, then
     # hard-exit. The common path never reaches this — the worker has
     # already finished by the time NSApp.run returns.
     if worker_thread.is_alive():
         log.warning(
             "MCP worker did not exit within grace period; forcing shutdown"
         )
-        try:
-            from .computer import _flush_clipboard_restore
-            _flush_clipboard_restore()
-        except Exception:
-            pass
+        _cleanup_input_on_exit()
         os._exit(0)
 
 

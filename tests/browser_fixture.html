@@ -9,8 +9,11 @@
 const input=document.getElementById('input');
 const increment=document.getElementById('increment');
 const result=document.getElementById('result');
-let count=0;
-function report(){fetch('/state',{method:'POST',body:JSON.stringify({count,text:input.value})});}
+let count=0,sequence=0,pasteEvents=0,pasteText=null;
+// Sequence browser events so a delayed earlier request cannot replace newer evidence.
+function report(){fetch('/state',{method:'POST',body:JSON.stringify({sequence:++sequence,count,text:input.value,paste_events:pasteEvents,paste_text:pasteText})});}
+// Keep the actual disposable paste payload before the browser applies its default input action.
+input.addEventListener('paste',event=>{pasteEvents++;pasteText=(event.clipboardData?.getData('text/plain')??'').slice(0,1024);report();});
 increment.onclick=()=>{result.textContent='Count '+(++count);report();};
 input.oninput=report;
 report();

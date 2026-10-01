@@ -21,6 +21,7 @@ import json
 import math
 import os
 import select
+import stat
 import subprocess
 import sys
 import tempfile
@@ -28,6 +29,7 @@ import time
 from pathlib import Path
 
 from .private_files import private_directory
+from .logs import LogRecordBuffer
 
 # This module lives inside the `klyk` package; the repo root is its grandparent.
 # Putting the repo root on PYTHONPATH lets `-m klyk.mcp_server` resolve when
@@ -54,17 +56,23 @@ class KlykClient:
     """
 
     def __init__(self, server_cmd=None, timeout=30.0):
-        # Canonical launch is `python -m klyk.mcp_server` (matches the shipped
+        # Canonical launch is `python -P -m klyk.mcp_server` (matches the shipped
         # MCP config); never a bare file path, because the server uses relative
         # imports and only resolves as a package module.
-        self._cmd = server_cmd or [sys.executable, "-m", "klyk.mcp_server"]
-        if not math.isfinite(timeout) or timeout <= 0:
+        self._cmd = server_cmd or [sys.executable, "-P", "-m", "klyk.mcp_server"]
+        try:
+            valid_timeout = (isinstance(timeout, (int, float)) and not isinstance(timeout, bool)
+                             and math.isfinite(timeout) and timeout > 0)
+        except OverflowError:
+            valid_timeout = False
+        if not valid_timeout:
             raise KlykError("timeout must be a finite positive number")
         self._timeout = timeout
         self._proc = None
         self._next_id = 0
         self._stdout_buffer = bytearray()
         self._stderr_tail = b""
+        self._stderr_records = LogRecordBuffer()
         self._stderr_open = False
 
     # -- lifecycle ---------------------------------------------------------
@@ -81,10 +89,12 @@ class KlykClient:
             raise KlykError("client already started")
         self._stdout_buffer.clear()
         self._stderr_tail = b""
+        self._stderr_records = LogRecordBuffer()
         env = os.environ.copy()
-        env["PYTHONPATH"] = os.pathsep.join(
-            p for p in (str(_REPO_ROOT), env.get("PYTHONPATH", "")) if p
-        )
+        # Only this already-loaded package supplies an import root. Inherited
+        # relative/empty PYTHONPATH entries could execute workspace code even
+        # with -P, before the server can apply its own trust checks.
+        env["PYTHONPATH"] = str(_REPO_ROOT)
         self._proc = subprocess.Popen(
             self._cmd,
             stdin=subprocess.PIPE,
@@ -151,7 +161,11 @@ class KlykClient:
         if deadline is None:
             deadline = time.monotonic() + self._timeout
         try:
-            pending = memoryview((json.dumps(message) + "\n").encode("utf-8"))
+            encoded = (json.dumps(message, allow_nan=False) + "\n").encode("utf-8")
+        except (TypeError, ValueError, RecursionError, UnicodeError):
+            raise KlykError("klyk requests must contain JSON values and finite numbers") from None
+        try:
+            pending = memoryview(encoded)
             while pending:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
@@ -193,11 +207,18 @@ class KlykClient:
                 msg = json.loads(line)
             except json.JSONDecodeError:
                 continue  # ignore any non-JSON line the server may emit
+            except (ValueError, RecursionError):
+                raise KlykError("klyk returned invalid or excessively nested JSON; restart the connection") from None
             if not isinstance(msg, dict) or msg.get("id") != req_id:
                 continue  # skip notifications / unrelated responses
             if "error" in msg:
-                raise KlykError(msg["error"].get("message", str(msg["error"])))
-            return msg.get("result", {})
+                error = msg["error"]
+                if not isinstance(error, dict) or not isinstance(error.get("message"), str):
+                    raise KlykError("klyk returned a malformed protocol error; restart the connection")
+                raise KlykError(error["message"])
+            if not isinstance(msg.get("result"), dict):
+                raise KlykError("klyk returned a malformed protocol result; restart the connection")
+            return msg["result"]
 
     def _read_line(self, deadline):
         """Read complete stdout lines while draining stderr under one deadline.
@@ -228,7 +249,8 @@ class KlykClient:
         if self._proc.stderr in ready:
             chunk = os.read(self._proc.stderr.fileno(), 65536)
             self._stderr_open = bool(chunk)
-            self._stderr_tail = (self._stderr_tail + chunk)[-8192:]
+            for line in self._stderr_records.feed(chunk):
+                self._stderr_tail = (self._stderr_tail + line.encode("utf-8") + b"\n")[-8192:]
         if self._proc.stdout in ready:
             chunk = os.read(self._proc.stdout.fileno(), 65536)
             if not chunk:
@@ -241,9 +263,20 @@ class KlykClient:
                 raise KlykError("klyk response exceeds the 64 MiB limit; request a smaller observation")
 
     def _connection_error(self, message):
-        """Attach a bounded recent diagnostic tail to transport failures."""
-        err = " | ".join(self._stderr_tail.decode("utf-8", errors="replace").splitlines()[-5:])
-        return KlykError(message + (f"; stderr: {err}" if err else ""))
+        """Report actionable startup categories without replaying private SDK payloads."""
+        diagnostics = (self._stderr_tail.decode("utf-8", errors="replace")
+                       + self._stderr_records.partial()).casefold()
+        if "accessibility permission" in diagnostics:
+            detail = "Accessibility permission is required; run klyk doctor"
+        elif "screen recording permission" in diagnostics:
+            detail = "Screen Recording permission is required; run klyk doctor"
+        elif "no module named" in diagnostics:
+            detail = "a required module could not load; reinstall Klyk in this interpreter"
+        elif diagnostics:
+            detail = "server diagnostics were omitted to protect private request data; run klyk doctor"
+        else:
+            detail = ""
+        return KlykError(message + (f"; {detail}" if detail else ""))
 
 
 def _emit(obj):
@@ -263,14 +296,24 @@ _CAPTURE_DIR = Path.home() / ".klyk" / "captures"
 _CAPTURE_KEEP = 20          # bounded cache: keep the most recent N, evict older
 
 
-def _prune_captures(keep: int = _CAPTURE_KEEP):
+def _prune_captures(keep: int = _CAPTURE_KEEP, preserve=()):
     """Bound the capture cache: delete all but the `keep` most recent PNGs.
     Best-effort — a failed unlink (e.g. a racing process) is non-fatal."""
+    pngs = []
+    protected = frozenset(preserve)
     try:
-        pngs = sorted(_CAPTURE_DIR.glob("*.png"), key=lambda p: p.stat().st_mtime)
+        for path in _CAPTURE_DIR.glob("*.png"):
+            try:
+                info = path.lstat()
+            except OSError:
+                continue  # A single disappearing or invalid entry must not disable eviction.
+            if stat.S_ISREG(info.st_mode) and info.st_uid == os.getuid():
+                pngs.append((path, info.st_mtime_ns))
     except OSError:
         return
-    for stale in pngs[:-keep] if keep else pngs:
+    # A restored/future-dated old file must never evict the image just returned.
+    pngs.sort(key=lambda item: (str(item[0]) in protected, item[1]))
+    for stale, _ in pngs[:-keep] if keep else pngs:
         try:
             stale.unlink()
         except OSError:
@@ -297,6 +340,10 @@ def materialize_images(result, tool="image"):
     for item in content:
         if not (isinstance(item, dict) and item.get("type") == "image" and item.get("data")):
             continue
+        if len(saved) >= _CAPTURE_KEEP:
+            item["save_error"] = "The 20-image file cache limit was reached; this image remains inline."
+            continue
+        path = None
         try:
             raw = base64.b64decode(item["data"])
         except Exception:
@@ -311,6 +358,11 @@ def materialize_images(result, tool="image"):
                 path = Path(handle.name)
                 handle.write(raw)
         except OSError as e:
+            if path is not None:
+                try:
+                    path.unlink(missing_ok=True)
+                except OSError:
+                    pass
             item["save_error"] = str(e)  # surface, but don't lose the call
             continue
         # Swap the heavy inline payload for a viewable path reference.
@@ -319,11 +371,13 @@ def materialize_images(result, tool="image"):
         saved.append(str(path))
 
     if saved:
-        _prune_captures()
+        _prune_captures(preserve=saved)
         result["image_hint"] = (
             "Screenshot(s) written to disk — open the saved_path with your image "
             "reader to view (klyk-call returns a path, not inline pixels)."
         )
+        if any(isinstance(item, dict) and item.get("save_error") for item in content):
+            result["image_hint"] += " Images with save_error remain inline."
     return result
 
 

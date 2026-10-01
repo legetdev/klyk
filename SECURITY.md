@@ -30,7 +30,7 @@ Klyk runs entirely on the user's local Mac, with permissions granted by the user
 
 klyk executes whatever the connected agent tells it to. If that agent also ingests untrusted content — a web page, an email, a PDF, a chat message — a malicious instruction hidden in that content can be turned into real clicks and keystrokes on your Mac. This is the classic *confused-deputy* problem, and the "agent that reads the web **and** drives the machine" configuration is the highest-risk way to run klyk.
 
-klyk's consent guidance is **agent-cooperative, not enforced**: money/destructive guidance, `confirm_destructive`, and any bounds override are not proof of user approval, and a valid in-window click can still be destructive. Code also enforces target-window bounds, duplicate-label rejection, one active control owner, and the `Cmd+Shift+Esc` emergency latch. The latch blocks **all** input until the user presses the chord again to clear it; the agent **cannot** resume it (the `resume` tool only reports status).
+klyk's consent guidance is **agent-cooperative, not enforced**: money/destructive guidance, `confirm_destructive`, and any bounds override are not proof of user approval, and a valid in-window click can still be destructive. Code also enforces target-window bounds, duplicate-label rejection, one active control owner, and the `Cmd+Shift+Esc` emergency latch. Each running server blocks new input after observing the chord and releases held keys and buttons. Holding the chord does not toggle it repeatedly. Only a second physical chord clears that server's latch; the `resume` tool only reports status. The latch is process-local: restarting or reconnecting starts a new server with an inactive latch. It is not a persistent pause for future servers or a security boundary against other software running as the same user.
 
 Mitigations are operational, not technical: run klyk only with agents and workflows you trust, keep untrusted-content reading and machine control in separate sessions where you can, and supervise anything consequential.
 
@@ -38,21 +38,21 @@ Mitigations are operational, not technical: run klyk only with agents and workfl
 
 Stderr from apps launched by klyk is run through credential scrubbers at capture time before being stored in the in-session log buffer. The scrubbed patterns:
 
-- `password=…`, `secret=…`, `token=…`, `api_key=…`, `access_key=…`, `auth=…`, `bearer=…` (key visible, value replaced with `***`)
+- Passwords, API keys, access/refresh/session tokens, client secrets, AWS access/secret keys, and private-key fields in common `key=value` and quoted forms (key visible, value replaced with `***`)
 - Quoted JSON credential fields such as `"password": "…"`, including spaces and escaped quotes in the value
 - `Authorization: Bearer …` HTTP headers
 - AWS access key IDs (`AKIA*`, `ASIA*`, …)
 - JWTs (`eyJ…`.`…`.`…`)
-- Single-quoted credential values and Basic/Digest Authorization headers
+- Single-quoted credential values, Basic/Digest Authorization headers, and Cookie/Set-Cookie headers
 
-Captured log records are limited to 8 KiB each and 500 records per channel. Oversized records are omitted entirely so a truncated credential's tail is not exposed. Persistent diagnostics use a dedicated Klyk logger; MCP protocol debug messages and tool exception payloads are not written to that log.
+Captured log records are limited to 8 KiB each and 500 records per channel. Oversized records are omitted entirely so a truncated credential's tail is not exposed. Persistent diagnostics use a dedicated Klyk logger, escape control characters, and omit tracebacks, request values, unrecognized tool names, and arbitrary argument keys. MCP protocol debug messages and tool exception payloads are not written to that log. Failed connection messages report fixed diagnostic categories instead of replaying server stderr.
 
 This is defense-in-depth — agents shouldn't be trusted to filter credentials downstream, and a misbehaving app that prints secrets to stderr shouldn't infect the rest of the trust chain. It is **best-effort; it cannot catch every credential format — not a guarantee.** Do not rely on it as your only safeguard.
 
 ## What's deliberately not scrubbed
 
 - Screenshots and OCR text returned to the agent: the agent asked for the pixels, so it gets them. Don't run klyk on screens with content you can't show the agent.
-- A failed window/region capture returns an error rather than retrying the whole desktop. Composited captures can still include overlapping windows inside the requested region.
+- Window screenshots capture only the selected window, including when covered. Compatibility fallbacks retain that window ID; failure never widens to the desktop. Explicit display or region capture includes whatever is visible in that requested area.
 - AX labels and values: same rationale — the agent asked.
 
 ## Local files and resource limits
@@ -61,9 +61,11 @@ The shell client stores up to 20 recent screenshots in `~/.klyk/captures`, an ow
 
 Klyk refuses symbolic links, hard links, and special files at its private-file write boundaries. An unsafe or unwritable log path disables file logging without preventing the MCP connection. A failed screenshot export keeps the inline image and returns `save_error`. User-selected parent directories remain under the user's control; Klyk is not a filesystem sandbox for an untrusted agent.
 
-Template decoding accepts PNG only, with a 32 MiB encoded-data limit, at most 8192 pixels per side, and at most 16 million pixels. The shell client's response buffer is limited to 64 MiB. These limits reject malformed or excessive payloads; they do not make an untrusted MCP agent safe to run.
+PNG decoding and OCR validate a 32 MiB encoded-data limit, at most 8192 pixels per side, and at most 16 million pixels before native allocation. Template extraction and matching reject an estimated working set above 512 MiB before decoding or allocating image arrays; use a smaller screenshot or search region when refused. Each session retains at most 50 templates and 8 MiB of encoded template data, with at most 64 sessions. The shell client's response buffer is limited to 64 MiB. These limits reject malformed or excessive payloads; they do not make an untrusted MCP agent safe to run.
 
-Numeric requests reject NaN and infinity before execution. Verdict and grading capture retain the selected window and refuse missing or reassigned windows instead of selecting another document.
+Generated MCP launch commands use Python's safe-path flag to exclude the current working directory from module lookup. Apple command-line helpers use fixed system paths so inherited `PATH` cannot substitute a workspace executable. Klyk does not automatically discover or load `.env` files; configure environment values explicitly in the launcher or MCP client. This does not isolate Python from a deliberately configured import path or other software running as the same user.
+
+Control handoffs refuse while another server is delivering or releasing input. App termination and CLI restart check the process start identity before signaling, so a reused PID does not authorize terminating its replacement. Numeric requests reject NaN and infinity before execution. Verdict and grading capture retain the selected window and refuse missing or reassigned windows instead of selecting another document.
 
 ## Publication
 

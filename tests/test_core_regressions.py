@@ -3,10 +3,12 @@
 import asyncio
 import ctypes
 import base64
+import math
 import os
 from pathlib import Path
 import subprocess
 import tempfile
+import struct
 from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
@@ -14,6 +16,7 @@ from unittest.mock import MagicMock, patch
 import numpy as np
 
 from klyk import ownership
+from klyk.image_bounds import png_dimensions, validate_image_dimensions
 
 from test_input_cleanup import load_functions
 
@@ -26,8 +29,11 @@ class MatcherBoundsTests(unittest.TestCase):
         self.haystack = np.random.default_rng(7).uniform(0, 255, (8, 9, 3))
         self.needle = self.haystack[2:4, 3:5].copy()
         images = {"screen": self.haystack, "template": self.needle}
-        self.namespace = {"np": np, "capture": SimpleNamespace(decode_png_to_rgb_array=images.__getitem__)}
-        load_functions("matcher.py", {"find", "_match_ncc", "_window_sums", "_xcorr_valid", "_next_fast_len"}, self.namespace)
+        self.namespace = {"np": np, "math": math,
+                          "png_dimensions": lambda key: images[key].shape[1::-1],
+                          "capture": SimpleNamespace(decode_png_to_rgb_array=images.__getitem__)}
+        load_functions("matcher.py", {"find", "_match_ncc", "_window_sums", "_xcorr_valid", "_next_fast_len",
+                                      "_validate_match_budget", "_clip_region"}, self.namespace)
 
     def test_empty_or_reversed_regions_are_rejected(self):
         """Off-image negative endpoints cannot turn into a valid unrelated crop."""
@@ -94,6 +100,7 @@ class CaptureFailureTests(unittest.TestCase):
             "_HAS_IMAGEIO": False, "os": os, "tempfile": tempfile,
             "subprocess": subprocess, "base64": base64,
             "time": SimpleNamespace(sleep=lambda _: None), "get_scale_factor": lambda: 1.0,
+            "_validate_image_dimensions": validate_image_dimensions, "png_dimensions": png_dimensions,
         }
         load_functions("capture.py", {"take_screenshot", "_parse_sips_dimensions"}, self.namespace)
 
@@ -113,7 +120,7 @@ class CaptureFailureTests(unittest.TestCase):
         def run(command, **kwargs):
             """Produce a valid capture and fail conversion as subprocess.run would."""
             paths.append(command[-1])
-            if command[0] == "screencapture":
+            if command[0] == "/usr/sbin/screencapture":
                 Path(command[-1]).write_bytes(b"\x89PNG\r\n\x1a\n" + b"x" * 120)
                 return SimpleNamespace(returncode=0)
             self.assertTrue(kwargs.get("check"))
@@ -126,11 +133,11 @@ class CaptureFailureTests(unittest.TestCase):
 
     def test_explicit_full_screen_capture_remains_supported(self):
         """An unscoped request still returns its image and measured dimensions."""
-        png = b"\x89PNG\r\n\x1a\n" + b"x" * 120
+        png = b"\x89PNG\r\n\x1a\n\x00\x00\x00\x0dIHDR" + struct.pack(">II", 40, 30) + b"\0" * 120
 
         def run(command, **kwargs):
             """Return a full-screen image followed by its measured dimensions."""
-            if command[0] == "screencapture":
+            if command[0] == "/usr/sbin/screencapture":
                 self.assertNotIn("-R", command)
                 self.assertNotIn("-l", command)
                 Path(command[-1]).write_bytes(png)

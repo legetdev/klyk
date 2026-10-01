@@ -39,11 +39,15 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     var opened = ""
     var clicks = 0
     var selections = 0
+    var inputEvents: [String: Int] = [:]
+    var inputMonitor: Any?
     var statePath = ProcessInfo.processInfo.environment["KLYK_FIXTURE_STATE"]!
+    let compactLayout = ProcessInfo.processInfo.environment["KLYK_FIXTURE_COMPACT"] == "1"
 
     // Build two independently addressable windows and native controls with stable labels.
     func applicationDidFinishLaunching(_ notification: Notification) {
         NSWindow.allowsAutomaticWindowTabbing = false
+        startInputMonitor()
         let menu = NSMenu()
         let appItem = NSMenuItem(); menu.addItem(appItem)
         let appMenu = NSMenu(); appItem.submenu = appMenu
@@ -61,7 +65,8 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
         }
         NSApp.mainMenu = menu
         for index in 0..<2 {
-            let window = NSWindow(contentRect: NSRect(x: 120 + index * 420, y: 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
+            let step = ProcessInfo.processInfo.environment["KLYK_FIXTURE_OVERLAP"] == "1" ? 0 : 420
+            let window = NSWindow(contentRect: NSRect(x: 120 + index * step, y: compactLayout ? 20 : 160, width: 400, height: 600), styleMask: [.titled,.closable,.resizable], backing: .buffered, defer: false)
             window.title = index == 0 ? "Klyk Fixture A" : "Klyk Fixture B"
             window.isReleasedWhenClosed = false
             let offset = Double(ProcessInfo.processInfo.environment["KLYK_FIXTURE_OFFSET"] ?? "0") ?? 0
@@ -95,11 +100,37 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             source.setAccessibilityLabel("Drag sample"); source.source = true; content.addSubview(source)
             let target = DragBox(frame:NSRect(x:200,y:350,width:150,height:45))
             target.setAccessibilityLabel("Drop target"); target.onDrop = { [weak self] value in self?.drops.append(value); self?.writeState() }; content.addSubview(target)
-            window.makeKeyAndOrderFront(nil); windows.append(window)
+            if ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] == "1" {
+                window.orderBack(nil)
+            } else {
+                window.makeKeyAndOrderFront(nil)
+            }
+            windows.append(window)
         }
-        NSApp.activate(ignoringOtherApps: true)
+        if ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] != "1" {
+            NSApp.activate(ignoringOtherApps: true)
+        }
         Timer.scheduledTimer(withTimeInterval: 0.1, repeats: true) { [weak self] _ in self?.writeState() }
         writeState()
+    }
+
+    // Observe actual delivered input pairs without consuming or changing their events.
+    func startInputMonitor() {
+        let mask: NSEvent.EventTypeMask = [.keyDown, .keyUp, .flagsChanged, .leftMouseDown, .leftMouseUp,
+            .rightMouseDown, .rightMouseUp, .otherMouseDown, .otherMouseUp, .leftMouseDragged,
+            .rightMouseDragged, .otherMouseDragged, .scrollWheel, .mouseMoved]
+        inputMonitor = NSEvent.addLocalMonitorForEvents(matching: mask) { [weak self] event in
+            guard let self else { return event }
+            let name: String
+            switch event.type {
+            case .keyDown: name = "key_down:\(event.keyCode)"
+            case .keyUp: name = "key_up:\(event.keyCode)"
+            default: name = "event:\(event.type.rawValue)"
+            }
+            self.inputEvents[name, default: 0] += 1
+            self.writeState()
+            return event
+        }
     }
 
     // Count actual AppKit action delivery independently from the MCP response.
@@ -123,15 +154,25 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
             if response == .OK,let url=panel.url { self.opened=(try? String(contentsOf:url,encoding:.utf8)) ?? "";self.writeState() }
         }
     }
-    // Atomically expose fixture state for independent assertions without inspecting private apps.
+    // Atomically expose fixture state and the native usable screen area without inspecting private apps.
     func writeState() {
-        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "clicks":clicks,"opened":opened,"selections":selections,
-            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())}, "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops, "windows":windows.map{["title":$0.title,"visible":$0.isVisible,"x":$0.frame.origin.x,"y":$0.frame.origin.y,"width":$0.frame.width,"height":$0.frame.height]}]
+        let frames: [[String: Any]] = windows.map { window in
+            let visible = window.screen?.visibleFrame ?? .zero
+            return ["id":window.windowNumber,"title":window.title,"visible":window.isVisible,"attached_sheet":window.attachedSheet != nil,
+                "x":window.frame.origin.x,"y":window.frame.origin.y,"width":window.frame.width,"height":window.frame.height,
+                "content_width":window.contentView?.bounds.width ?? 0,"content_height":window.contentView?.bounds.height ?? 0,
+                "screen_visible_frame":["x":visible.origin.x,"y":visible.origin.y,"width":visible.width,"height":visible.height]]
+        }
+        let data: [String: Any] = ["pid":ProcessInfo.processInfo.processIdentifier, "active":NSApp.isActive,
+            "layout":compactLayout ? "compact" : "default", "requested_y":compactLayout ? 20 : 160,
+            "clicks":clicks,"opened":opened,"selections":selections,"input_events":inputEvents,
+            "selection":fields.map{field -> String in guard let editor=field.currentEditor() as? NSTextView else { return "none" };return NSStringFromRange(editor.selectedRange())},
+            "fields":fields.map{$0.stringValue}, "scroll":scrollViews.map{$0.documentVisibleRect.origin.y}, "drops":drops,"windows":frames]
         if let encoded = try? JSONSerialization.data(withJSONObject:data,options:[.sortedKeys]) { try? encoded.write(to:URL(fileURLWithPath:statePath),options:.atomic) }
     }
 }
 let app = NSApplication.shared
 let delegate = FixtureDelegate()
 app.delegate = delegate
-app.setActivationPolicy(.regular)
+app.setActivationPolicy(ProcessInfo.processInfo.environment["KLYK_FIXTURE_BACKGROUND"] == "1" ? .accessory : .regular)
 app.run()

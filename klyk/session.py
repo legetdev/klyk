@@ -43,6 +43,9 @@ class Session:
     # query, so a probe at session-create time often races and misses. The
     # only reliable signal is the AX read the agent is currently performing.
     ax_disabled_warned_on_inspect: bool = False
+    ax_warmup_attempted: bool = False
+    # Only wait for the unelapsed part of this window's last mutation repaint.
+    last_mutation_at: float = 0.0
     # Input-delivery mode. Default is "autonomous" — klyk prefers invisible
     # delivery (no cursor warp, no focus theft) and auto-activates the
     # target app only when the invisible path can't deliver (e.g. Chromium
@@ -66,6 +69,8 @@ class Session:
     # (screenshot, inspect, click) should refuse on a windowless session;
     # the cross-app-drag target path is the supported use case.
     windowless: bool = False
+    # Stable process start identity prevents close/reuse from signalling a recycled PID.
+    process_identity: dict | None = field(default=None, repr=False)
     _log_proc: object = field(default=None, repr=False)    # log stream watcher (native) or app proc (electron)
     _log_reader: StderrReader | None = field(default=None, repr=False)
 
@@ -216,14 +221,27 @@ async def create_session(
     app_name: str | None = None,
     bundle_id: str | None = None,
     app_path: str | None = None,
+    *,
+    allow_launch: bool = True,
 ) -> Session:
+    """Attach without activation; cold launches require the caller's explicit launch policy."""
     from . import capture, launcher, computer
 
     if target == "native":
-        pid, was_running = await asyncio.get_event_loop().run_in_executor(
-            None,
-            lambda: launcher.launch_native_app(app_name=app_name, bundle_id=bundle_id),
-        )
+        if allow_launch:
+            pid, was_running = await computer.run_input(
+                lambda: launcher.launch_native_app(app_name=app_name, bundle_id=bundle_id, check_stop=computer._check_stop)
+            )
+        else:
+            pid = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: launcher._quick_pid_for_app(bundle_id, app_name)
+            )
+            if pid is None:
+                raise RuntimeError("The app is not running; this request cannot launch it. Open the app or use an authorized control request outside background mode.")
+            was_running = True
+        identity = launcher.process_identity(pid)
+        if identity is None:
+            raise RuntimeError("The app process identity could not be verified; no input was sent. Inspect the running app before retrying.")
         # Windowless system apps (Dock, SystemUIServer, ControlCenter,
         # NotificationCenter, Spotlight) never expose AXWindows — they own
         # screen-edge layers, not windows. Skip the 15 s wait and build a
@@ -231,9 +249,9 @@ async def create_session(
         # need AX use the AXChildren fallback path inside ax_snapshot.
         # Cross-app drag targets like Finder → Dock Trash depend on this.
         if (app_name or "").strip() in _WINDOWLESS_APPS:
-            log_proc = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: launcher.start_native_log_stream(pid)
-            )
+            # Popen returns immediately; keep creation and ownership assignment
+            # in the same task turn so cancellation cannot orphan the watcher.
+            log_proc = launcher.start_native_log_stream(pid)
             session = Session(
                 session_id=str(uuid.uuid4()),
                 app=app_name or "",
@@ -243,6 +261,7 @@ async def create_session(
                 win_x=0, win_y=0,
                 width=0, height=0,
                 scale=capture.get_scale_factor(),
+                process_identity=identity,
             )
             session._log_proc = log_proc
             session._log_reader = StderrReader(log_proc.stdout, session.log_buffer)
@@ -278,9 +297,9 @@ async def create_session(
                 "Screen Recording permission isn't granted (klyk can't see "
                 "the window without it). Run `klyk doctor` to check."
             )
-        log_proc = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: launcher.start_native_log_stream(pid)
-        )
+        if launcher.process_identity(pid) != identity:
+            raise RuntimeError("The app process changed while its window opened; no input was sent. Inspect the running app again.")
+        log_proc = launcher.start_native_log_stream(pid)
         session = Session(
             session_id=str(uuid.uuid4()),
             app=app_name or "",
@@ -292,12 +311,14 @@ async def create_session(
             width=int(win["bounds"]["Width"]),
             height=int(win["bounds"]["Height"]),
             scale=capture.get_scale_factor(),
+            process_identity=identity,
             # No precomputed ax_disabled flag — the inspect handler decides
             # dynamically based on the actual AX read.
         )
         session._log_proc = log_proc
         session._log_reader = StderrReader(log_proc.stdout, session.log_buffer)
-        await computer.activate_app(pid)
+        # Running-app attachment is always passive. Launch itself determines
+        # presentation; observation never adds a separate activation.
 
     elif target == "electron":
         if not app_path and app_name:
@@ -323,9 +344,20 @@ async def create_session(
         elif not app_path:
             raise ValueError("app_path or app_name required for electron target")
 
-        pid, proc = await asyncio.get_event_loop().run_in_executor(
-            None, lambda: launcher.launch_electron_app(app_path)
-        )
+        if allow_launch:
+            pid, proc = await computer.run_input(lambda: launcher.launch_electron_app(app_path, check_stop=computer._check_stop))
+        else:
+            lookup_name = app_name or _os.path.basename(app_path)
+            lookup_name = _os.path.basename(lookup_name)
+            pid = await asyncio.get_event_loop().run_in_executor(
+                None, lambda: launcher._quick_pid_for_app(bundle_id, lookup_name)
+            )
+            if pid is None:
+                raise RuntimeError("The app is not running; this request cannot launch it. Open the app or use an authorized control request outside background mode.")
+            proc = None
+        identity = launcher.process_identity(pid)
+        if identity is None:
+            raise RuntimeError("The app process identity could not be verified; no input was sent. Inspect the running app before retrying.")
         win = await asyncio.get_event_loop().run_in_executor(
             None, lambda: capture.wait_for_window(pid, timeout=15.0)
         )
@@ -335,6 +367,8 @@ async def create_session(
                 "The bundle launched but never opened a visible window. Run "
                 "`klyk doctor` to verify Screen Recording is granted."
             )
+        if launcher.process_identity(pid) != identity:
+            raise RuntimeError("The app process changed while its window opened; no input was sent. Inspect the running app again.")
 
         session = Session(
             session_id=str(uuid.uuid4()),
@@ -347,10 +381,10 @@ async def create_session(
             width=int(win["bounds"]["Width"]),
             height=int(win["bounds"]["Height"]),
             scale=capture.get_scale_factor(),
+            process_identity=identity,
         )
         session._log_proc = proc
-        session._log_reader = StderrReader(proc.stderr, session.log_buffer)
-        await computer.activate_app(pid)
+        session._log_reader = StderrReader(proc.stderr, session.log_buffer) if proc is not None else None
 
     else:
         raise ValueError(
@@ -370,24 +404,27 @@ async def get_or_create_session(
     target: str | None = None,
     bundle_id: str | None = None,
     app_path: str | None = None,
+    *,
+    allow_launch: bool = True,
 ) -> tuple[Session, bool]:
     """
-    Return (session, is_new).
-    If a session exists and the app is still running, refresh window state and return it.
-    If the process died, clean up and re-launch automatically.
-    is_new=True means the app was just launched this call.
-
-    PID recycle defence: a closed app's PID can be reused by an unrelated process
-    within seconds, so `os.kill(pid, 0)` alone is not enough — we also confirm
-    the session's window_id still belongs to that pid via CGWindowList. If the
-    window has vanished or now belongs to someone else, treat the session as
-    dead and re-launch.
+    Return (session, is_new), where new means attached or launched this call.
+    Reuse requires the original process start identity and selected CG window.
+    A missing live window fails without closing the app; a dead process releases
+    session resources before a new session follows the caller's launch policy.
     """
     from . import capture, launcher
 
     existing = registry.get_by_app(app)
     if existing is not None:
         if launcher.pid_alive(existing.pid):
+            identity = launcher.process_identity(existing.pid)
+            if existing.process_identity is None or identity != existing.process_identity:
+                raise RuntimeError("The app process identity changed or could not be verified; no input was sent. Close the stale session and inspect the app again.")
+            if existing.windowless:
+                # Windowless system apps never acquire a CG window number.
+                # Process identity, rather than a permanently missing window 0, is canonical.
+                return existing, False
             # Confirm the window is still ours. Cheap (~5 ms) and catches PID
             # recycling silently.
             win = capture.get_window_by_id(existing.window_id)
@@ -422,6 +459,7 @@ async def get_or_create_session(
         app_name=app,
         bundle_id=bundle_id,
         app_path=app_path,
+        allow_launch=allow_launch,
     )
     registry.register(session, app_key=app)
     # Session-lifecycle hook. Today this is a no-op (the dock-tile badge
@@ -445,37 +483,36 @@ def _close_session(session: Session) -> None:
     on a never-closed pipe), and unbounded template cache memory.
     """
     from . import launcher
-    # Kill the log/proc Popen FIRST, before touching the reader. Order matters:
-    # StderrReader's background thread sits in a blocking read on proc.stdout,
-    # holding that BufferedReader's internal lock for the syscall's duration.
-    # If reader.stop() (which calls proc.stdout.close()) runs while the
-    # process is still alive and producing no output, close() has to wait on
-    # that same lock — and since nothing is unblocking the read, it can stall
-    # for minutes (measured: 200s+ in isolation) instead of returning
-    # instantly. Killing the process first closes the pipe's WRITE end,
-    # which delivers EOF to the blocked read immediately, so the reader
-    # thread's loop exits and releases the lock before stop() ever needs it.
+    # Stop our log child first, then stop its nonblocking reader. An Electron
+    # application's process must pass the same stable-identity guard as a
+    # native app before any signal; the Popen wrapper alone is not identity.
     proc = getattr(session, "_log_proc", None)
+    app_process = proc is not None and getattr(proc, "pid", None) == session.pid
+    app_terminated = False
     if proc is not None:
-        try:
-            proc.terminate()
-        except Exception:
-            pass
+        if app_process:
+            if session.process_identity is not None:
+                app_terminated = launcher.terminate_pid(session.pid, expected_identity=session.process_identity)
+        else:
+            try:
+                proc.terminate()
+            except Exception:
+                pass
         # Best-effort wait so we don't leave a zombie. Short timeout — the
         # interpreter will reap on exit if this fails.
         try:
-            if hasattr(proc, "wait"):
+            if hasattr(proc, "wait") and (not app_process or app_terminated):
                 proc.wait(timeout=1.0)
         except Exception:
             try:
-                if hasattr(proc, "kill"):
+                if not app_process and hasattr(proc, "kill"):
                     proc.kill()
+                    proc.wait(timeout=1.0)
             except Exception:
                 pass
         session._log_proc = None
-    # Now that the process (and its stdout pipe's write end) is gone, the
-    # reader thread's blocking read has already returned EOF — stop() closes
-    # the read end and joins cleanly instead of waiting on the io lock.
+    # Reader shutdown remains bounded even if an Electron descendant inherited
+    # the stderr write end and outlived the parent.
     reader = getattr(session, "_log_reader", None)
     if reader is not None:
         try:
@@ -489,10 +526,18 @@ def _close_session(session: Session) -> None:
     except Exception:
         pass
     # Terminate the app itself (with escalation in terminate_pid).
-    launcher.terminate_pid(session.pid)
+    if app_process:
+        if not app_terminated and launcher.pid_alive(session.pid):
+            raise RuntimeError("The app was left running because its original process could not be safely verified or closed.")
+    elif session.process_identity is not None:
+        if not launcher.terminate_pid(session.pid, expected_identity=session.process_identity):
+            raise RuntimeError("The app could not be safely closed; its process identity or termination could not be verified.")
+    elif launcher.pid_alive(session.pid):
+        raise RuntimeError("The app was left running because this session has no verified process identity.")
 
 
 async def close_app(app: str) -> None:
+    """Close a tracked app only after identity checks, draining any cancelled cleanup worker."""
     session = registry.delete_by_app(app)
     if session:
         # Drop window labels so a relaunch doesn't inherit stale labels.
@@ -505,21 +550,17 @@ async def close_app(app: str) -> None:
             _visibility.detach(app)
         except Exception:
             pass
-        # _close_session's own logic is bounded (~4 s worst case: 1 s proc.wait
-        # + terminate_pid's 3 s SIGTERM/SIGKILL escalation), so 10 s is a
-        # generous ceiling that only fires under genuine executor-queue
-        # backup (see the matching comment in create_session), not normal
-        # variance. Cleanup is best-effort either way — a timeout here still
-        # means the app's own process was already signaled to terminate.
+        from . import computer
+        # Cancellation drains the bounded native cleanup before ownership can
+        # transfer. A timed-out worker must never continue closing an app after
+        # a new server has taken control.
         try:
             await asyncio.wait_for(
-                asyncio.get_event_loop().run_in_executor(
-                    None, lambda: _close_session(session)
-                ),
+                computer.run_input(lambda: _close_session(session)),
                 timeout=10.0,
             )
         except asyncio.TimeoutError:
-            log.warning(f"close_app cleanup for {app!r} exceeded 10 s ceiling — abandoning wait")
+            log.warning("App cleanup exceeded its time budget; the cleanup worker has finished.")
 
 
 def list_sessions() -> list[dict]:
