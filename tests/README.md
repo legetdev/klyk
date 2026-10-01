@@ -61,7 +61,7 @@ The checks cover these workflow groups:
 5. Unicode typing, command shortcuts, held keys, and clipboard paste.
 6. Clipboard restoration and independently observed text values.
 7. Menus, context menus, choices, sliders, and scrolling.
-8. Save, open, cancel, and absent-dialog refusal.
+8. Save, open, cancel, and absent-dialog refusal. The owned fixture independently reports attached sheets; bounded passive observations also require the exact next File-menu item to exist and be enabled before one new menu action. File creation alone does not prove the preceding sheet has finished closing, and the wait never repeats input.
 9. Pixel, grid, template, and bounded visual-wait tools.
 10. Window movement, closure, stale targeting, and surviving sibling windows.
 11. Native background delivery with measured cursor and focus preservation.

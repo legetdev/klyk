@@ -85,6 +85,51 @@ def fixture_input_unchanged(before, after):
     return all(field in before and field in after and before[field]==after[field] for field in fields)
 
 
+def fixture_file_menu_ready(state, pid, command, *, timeout=1):
+    """Observe a closed fixture sheet and its exact enabled menu before one new action."""
+    if (type(pid) is not int or pid<=0 or command not in ('Open Test File','Save Test File')
+            or not isinstance(timeout,(int,float)) or isinstance(timeout,bool) or not math.isfinite(timeout) or not 0<timeout<=1
+            or not isinstance(state,dict) or state.get('pid')!=pid or state.get('active') is not True):
+        return False
+    windows=state.get('windows')
+    if (not isinstance(windows,list) or len(windows)!=2
+            or any(not isinstance(window,dict) or window.get('visible') is not True
+                   or type(window.get('id')) is not int or window['id']<=0
+                   or window.get('attached_sheet') is not False for window in windows)
+            or len({window['id'] for window in windows})!=2
+            or {window.get('title') for window in windows}!={'Klyk Fixture A','Klyk Fixture B'}):
+        return False
+    target=f'menu item "{command}" of menu "File" of menu bar 1'
+    script=(f'tell application "System Events"\n'
+            f'tell (first process whose unix id is {pid})\n'
+            f'if not frontmost then return false\n'
+            f'if not (exists {target}) then return false\n'
+            f'return enabled of {target}\nend tell\nend tell')
+    try:
+        result=subprocess.run(['/usr/bin/osascript','-e',script],capture_output=True,text=True,timeout=timeout)
+        return result.returncode==0 and isinstance(result.stdout,str) and result.stdout.strip()=='true'
+    except (OSError,subprocess.TimeoutExpired):
+        return False
+
+
+def wait_for_fixture_file_menu(read_state, pid, command):
+    """Bound passive sheet/menu readiness to one deadline and retain the last owned observation."""
+    started=time.monotonic();deadline=started+3
+    evidence={'ready':False,'observations':0,'elapsed_ms':0,'fixture_state':None,
+              'command':command,'budget_seconds':3}
+    while time.monotonic()<deadline:
+        state=read_state();remaining=deadline-time.monotonic()
+        if remaining<=0:
+            break
+        ready=fixture_file_menu_ready(state,pid,command,timeout=min(1,remaining))
+        evidence.update(ready=ready,observations=evidence['observations']+1,fixture_state=state)
+        if ready:
+            break
+        time.sleep(min(.05,max(0,deadline-time.monotonic())))
+    evidence['elapsed_ms']=round((time.monotonic()-started)*1000)
+    return evidence
+
+
 def accurate_fixture_text(result, expected):
     """A positive accurate OCR call must independently recognize the selected fixture's real text."""
     if not isinstance(result,dict) or not isinstance(expected,str) or not expected:
@@ -454,6 +499,11 @@ def main():
             def current():
                 """Read independent AppKit state after asynchronous UI delivery settles."""
                 time.sleep(.15);return json.loads(state.read_text())
+            def file_menu_ready(command, stage):
+                """Retain bounded, passive handoff evidence without repeating native menu input."""
+                evidence=wait_for_fixture_file_menu(current,fixture.pid,command)
+                report.setdefault('file_panel_readiness',{})[stage]=evidence
+                return evidence['ready']
             label=next(e['label'] for e in elements if e.get('label','').startswith('Increment '))
             field_label=next(e['label'] for e in elements if e.get('label','').startswith('Input '))
             field_index=int(field_label.split()[-1]);button=point(label);field=point(field_label)
@@ -548,6 +598,7 @@ def main():
             call(client,'wait_for',text='Save As:',timeout=3)
             call(client,'handle_system_dialog',action='save')
             check('native save produced expected file',(work/'saved-fixture.txt').read_text()=='Klyk fixture saved')
+            check('native Save sheet closed and Open menu ready',file_menu_ready('Open Test File','after_save'))
             call(client,'click_menu',path=['File','Open Test File'])
             call(client,'wait_for',text='Open',timeout=3)
             opened=call(client,'handle_system_dialog',action='open',path=str(saved))
@@ -555,12 +606,14 @@ def main():
             if not opened_verified:
                 report['native_open_failure_diagnostic']=fixture_panel_diagnostic(computer,fixture.pid)
             check('native open read exact saved contents',opened_verified)
+            check('native Open sheet closed and Save menu ready',file_menu_ready('Save Test File','after_open'))
             missing_before=current()
             missing=call(client,'handle_system_dialog',action='save')
             check('missing save panel sends no input',not missing.get('ok') and fixture_input_unchanged(missing_before,current()))
             call(client,'click_menu',path=['File','Save Test File'])
             call(client,'wait_for',text='Save As:',timeout=3)
             call(client,'handle_system_dialog',action='cancel')
+            check('native cancelled sheet closed and File menu ready',file_menu_ready('Save Test File','after_cancel'))
             # Global media input is exercised as a reversible mute toggle.
             mute_before=subprocess.check_output(['osascript','-e','output muted of (get volume settings)'],text=True).strip()
             try:

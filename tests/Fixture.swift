@@ -158,7 +158,7 @@ final class FixtureDelegate: NSObject, NSApplicationDelegate, NSTextFieldDelegat
     func writeState() {
         let frames: [[String: Any]] = windows.map { window in
             let visible = window.screen?.visibleFrame ?? .zero
-            return ["id":window.windowNumber,"title":window.title,"visible":window.isVisible,
+            return ["id":window.windowNumber,"title":window.title,"visible":window.isVisible,"attached_sheet":window.attachedSheet != nil,
                 "x":window.frame.origin.x,"y":window.frame.origin.y,"width":window.frame.width,"height":window.frame.height,
                 "content_width":window.contentView?.bounds.width ?? 0,"content_height":window.contentView?.bounds.height ?? 0,
                 "screen_visible_frame":["x":visible.origin.x,"y":visible.origin.y,"width":visible.width,"height":visible.height]]
