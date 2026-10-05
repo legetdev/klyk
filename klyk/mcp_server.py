@@ -5992,8 +5992,8 @@ def _install_parent_death_watch() -> None:
 
 
 def _initialize_native_runtime() -> None:
-    """Load and verify computer facilities on the main thread only while enabled."""
-    global capture, computer, matcher, ocr, skylight, _native_initialized
+    """Load and preflight computer facilities on the main thread only while enabled."""
+    global capture, computer, matcher, ocr, skylight
     connection_gate.checkpoint()
     from . import computer as _computer, capture as _capture
     from . import matcher as _matcher, ocr as _ocr, skylight as _skylight
@@ -6005,16 +6005,6 @@ def _initialize_native_runtime() -> None:
         connection_gate.checkpoint()
         check()
     connection_gate.checkpoint()
-    try:
-        if skylight.is_available():
-            verified = skylight.self_test(timeout=0.4) or skylight.self_test(timeout=0.4)
-            if not verified and skylight.delivery_verified() is False:
-                log.warning("SkyLight delivery verification failed; visible fallback remains available.")
-    except connection_gate.policy.AccessDisabled:
-        raise
-    except Exception as error:
-        log.warning("SkyLight delivery self-test skipped (%s)", type(error).__name__)
-    connection_gate.checkpoint()
     from . import keycodes
     keycodes._carbon = connection_gate.protect_library(keycodes._carbon)
     try:
@@ -6023,6 +6013,11 @@ def _initialize_native_runtime() -> None:
         raise
     except Exception as error:
         log.warning("keyboard-layout warm skipped (%s)", type(error).__name__)
+
+
+def _finish_native_initialization() -> None:
+    """Claim control and start status/listening only after awaited delivery verification."""
+    global _native_initialized
     connection_gate.checkpoint()
     ownership.claim_ownership_if_unowned()
     computer._start_emergency_stop_tap()
@@ -6045,6 +6040,20 @@ async def _ensure_native_runtime() -> None:
         if not _native_initialized:
             await asyncio.get_running_loop().run_in_executor(
                 None, lambda: _ui.dispatch_sync(_initialize_native_runtime, timeout=10.0),
+            )
+            connection_gate.checkpoint()
+            try:
+                if skylight.is_available():
+                    verified = await skylight.self_test_async(timeout=0.4) or await skylight.self_test_async(timeout=0.4)
+                    if not verified and skylight.delivery_verified() is False:
+                        log.warning("SkyLight delivery verification failed; visible fallback remains available.")
+            except connection_gate.policy.AccessDisabled:
+                raise
+            except Exception as error:
+                log.warning("SkyLight delivery self-test skipped (%s)", type(error).__name__)
+            connection_gate.checkpoint()
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _ui.dispatch_sync(_finish_native_initialization, timeout=2.0),
             )
         connection_gate.checkpoint()
         computer._start_emergency_stop_tap()

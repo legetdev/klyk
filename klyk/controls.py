@@ -29,8 +29,10 @@ _native_types = None
 
 
 def configured_environments() -> tuple[str, ...]:
-    """Show core clients and configured environments without running any client CLI."""
+    """Show core, configured and saved-enabled clients without running any client CLI."""
     present = set(_PRIORITY)
+    present.update(key for key, row in policy.snapshot()["clients"].items()
+                   if row["enabled"] and key in clients.CLIENTS)
     for key, client in clients.CLIENTS.items():
         if key in _PRIORITY:
             continue
@@ -288,8 +290,9 @@ class Controls:
             status.setStringValue_("Saving…" if key in self.busy else ("On" if allowed else "Off"))
         self._quit.setEnabled_(not self.busy)
         self._footer.setStringValue_(error or "On allows screen reads and actions.")
-        count = sum(state["clients"][key]["enabled"] for key in self.keys)
-        self._item.button().setToolTip_("Klyk — all access off" if count == 0 else f"Klyk — {count} environments allowed")
+        count = sum(row["enabled"] for row in state["clients"].values())
+        noun = "environment" if count == 1 else "environments"
+        self._item.button().setToolTip_("Klyk — all access off" if count == 0 else f"Klyk — {count} {noun} allowed")
 
     def change(self, key: str, value: bool) -> None:
         """Persist user intent off the main thread, keeping switches responsive on I/O errors."""

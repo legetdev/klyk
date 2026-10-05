@@ -159,6 +159,25 @@ class ControlsTests(unittest.TestCase):
         self.panel.refresh()
         self.assertTrue(all(row[0].enabled for row in self.panel.rows.values()))
 
+    def test_saved_enabled_environment_remains_visible_after_config_removal(self):
+        """The owner can still turn off a saved permission whose client config disappeared."""
+        policy.set_enabled("cursor", True)
+        with patch.object(controls.clients, "current_entry", return_value=None):
+            self.assertIn("cursor", controls.configured_environments())
+        policy.set_enabled("cursor", False)
+        with patch.object(controls.clients, "current_entry", return_value=None):
+            self.assertNotIn("cursor", controls.configured_environments())
+
+    def test_status_counts_access_outside_the_panels_original_rows(self):
+        """A later external preference change cannot falsely report all access off."""
+        policy.set_enabled("cursor", True)
+        self.panel.refresh()
+        self.assertIn("1 environment allowed", self.panel._item.view.text)
+        self.assertNotIn("all access off", self.panel._item.view.text)
+        policy.set_enabled("cursor", False)
+        self.panel.refresh()
+        self.assertIn("all access off", self.panel._item.view.text)
+
     def test_discovery_never_runs_opencode_version_detection(self):
         """Config discovery cannot delay a switch with an unrelated CLI subprocess."""
         checked = []

@@ -66,7 +66,7 @@ Restart Claude Code (or whichever MCP client you use), then turn its switch **On
 
 ### Turn computer access on or off
 
-Click the Klyk switch icon in the menu bar. Codex, Claude Code and OpenCode each have their own switch; other configured clients also appear. **Off** blocks all Klyk tools for that environment, including screenshots, accessibility reads, clipboard operations and input. **On** permits normal use with the existing permissions, ownership checks and emergency stop. Connected clients stay connected, so switching does not require a restart.
+Click the Klyk switch icon in the menu bar. Codex, Claude Code and OpenCode each have their own switch; other configured or saved-enabled clients also appear at startup. **Off** blocks all Klyk tools for that environment, including screenshots, accessibility reads, clipboard operations and input. **On** permits normal use with the existing permissions, ownership checks and emergency stop. Connected clients stay connected, so switching does not require a restart.
 
 The settings are saved locally and shared by current Klyk installations under the same user account. New MCP connections start the controls in the background, including after a Mac restart. Run `klyk controls` to start them without waiting for a client connection. The panel stays closed until you click its icon; it never reads the screen or starts computer use itself. Quitting the controls leaves the saved access preferences in effect.
 

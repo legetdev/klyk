@@ -14,6 +14,12 @@ import threading
 import time
 
 
+def inhibit_stop_tap(computer, audit):
+    """Replace the native listener boundary without creating an unstarted Thread."""
+    computer._start_emergency_stop_tap = lambda: None
+    audit['substitutions'].append('direct global emergency-stop event tap startup')
+
+
 def main():
     """Inhibit every active desktop boundary before importing the production entry point."""
     options = sys.argv[3:]
@@ -168,6 +174,7 @@ def main():
             elif module_name == 'computer':
                 for method in ('_snapshot_pasteboard', '_restore_pasteboard', 'activate_app'):
                     setattr(module, method, forbidden(f'computer.{method}'))
+                inhibit_stop_tap(module, audit)
                 if inert_held_input:
                     prepare_held_input(module)
             elif module_name == 'skylight':
@@ -180,10 +187,9 @@ def main():
     original_start = threading.Thread.start
 
     def guarded_start(thread):
-        """Inhibit the global event-tap thread while retaining real SDK and policy workers."""
+        """Refuse any unexpected event-tap thread while retaining real SDK and policy workers."""
         if thread.name == 'klyk-stop':
-            audit['substitutions'].append('global emergency-stop event tap')
-            return
+            return forbidden('unexpected native emergency-stop thread startup')()
         return original_start(thread)
 
     threading.Thread.start = guarded_start

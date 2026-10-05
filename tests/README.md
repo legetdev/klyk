@@ -6,7 +6,7 @@ Run the portable regression suite with the installed project dependencies:
 python3 -B -m unittest discover -s tests
 ```
 
-The portable tests cover validation, batch failures, targeting, emergency-latch enforcement, input cleanup, Unicode and clipboard preservation, ownership, session limits, configuration editing, and publication privacy. Native boundaries are controlled fakes; these tests do not prove real macOS input delivery.
+The portable tests cover validation, batch failures, targeting, emergency-latch enforcement, input cleanup, Unicode and clipboard preservation, ownership, session limits, configuration editing, and publication privacy. Delivery-test regressions exercise the real request executor and main-thread queue with controlled native objects, including revocation, cancellation, timer cleanup and preservation of the existing AppKit loop. Native boundaries are controlled fakes; these tests do not prove real macOS input delivery.
 
 Focused regressions also exercise real subprocess pipes (large requests, noisy stderr, partial responses, timeouts, and cleanup), failed atomic configuration/cache writes, capture-scope refusal, cancelled click pairs, and save-result evidence. These run without opening apps or operating the desktop.
 
