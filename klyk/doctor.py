@@ -26,6 +26,7 @@ status the user can act on.
 from __future__ import annotations
 
 import importlib
+import ctypes
 import json
 import os
 import platform
@@ -210,6 +211,12 @@ def check_skylight_delivery() -> CheckResult:
     if sys.platform != "darwin":
         return CheckResult("SkyLight delivery", "warn", "skipped (not darwin)")
     try:
+        from . import connection_policy
+        if not connection_policy.enabled():
+            return CheckResult(
+                "SkyLight delivery", "warn", "skipped — Klyk access is off for this environment",
+                "Turn this environment on in the Klyk menu-bar controls before running the delivery self-test.",
+            )
         from . import skylight
         if not skylight.is_available():
             return CheckResult(
@@ -275,9 +282,12 @@ def check_accessibility_permission() -> CheckResult:
     if sys.platform != "darwin":
         return CheckResult("Accessibility permission", "warn", "skipped (not darwin)")
     try:
-        # Lazy import — computer.py is a heavy module.
-        from . import computer
-        trusted = computer._appserv.AXIsProcessTrustedWithOptions(None)
+        # Permission metadata is independent of access switches and the input runtime.
+        app_services = ctypes.CDLL("/System/Library/Frameworks/ApplicationServices.framework/ApplicationServices")
+        query = app_services.AXIsProcessTrustedWithOptions
+        query.argtypes = [ctypes.c_void_p]
+        query.restype = ctypes.c_bool
+        trusted = query(None)
     except Exception as e:
         return CheckResult(
             "Accessibility permission", "fail",
@@ -303,13 +313,26 @@ def check_accessibility_permission() -> CheckResult:
 
 
 def check_screen_recording_permission() -> CheckResult:
-    """Read the same native permission state as startup without taking a screenshot."""
+    """Query first-party permission metadata without capture, prompts or runtime imports."""
     if sys.platform != "darwin":
         return CheckResult("Screen Recording permission", "warn", "skipped (not darwin)")
     try:
-        from .capture import check_screen_recording
-        check_screen_recording()
+        graphics = ctypes.CDLL("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
+        preflight = graphics.CGPreflightScreenCaptureAccess
+        preflight.argtypes = []
+        preflight.restype = ctypes.c_bool
+        if not preflight():
+            raise RuntimeError(
+                "klyk needs Screen Recording permission to capture window contents "
+                "(used by screenshot / inspect / read_grid). Grant it:\n"
+                "  System Settings → Privacy & Security → Screen Recording\n"
+                "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
+                "Then run `klyk doctor` and restart the affected client process."
+            )
         return CheckResult("Screen Recording permission", "ok", "granted to this process")
+    except AttributeError:
+        return CheckResult("Screen Recording permission", "fail",
+                           "Screen Recording permission preflight is unavailable on this macOS version.")
     except RuntimeError as error:
         return CheckResult("Screen Recording permission", "fail", str(error))
     except Exception as error:
@@ -355,7 +378,7 @@ def check_klyk_log_writable() -> CheckResult:
 
 
 def check_mcp_client_entries() -> CheckResult:
-    """Verify every configured klyk client points at this exact installation."""
+    """Read launch settings and verify installation, import safety and client identity."""
     from . import clients
 
     valid: list[str] = []
@@ -408,14 +431,20 @@ def check_mcp_client_entries() -> CheckResult:
         if not matches:
             problems.append(f"{client.label}: entry points at a different klyk installation")
             repair_keys.append(client.key)
-            continue
         environment = entry.get("environment" if client.fmt == "opencode" else "env")
+        identity_matches = (isinstance(environment, dict)
+                            and environment.get("KLYK_CLIENT") == client.key)
+        if not identity_matches:
+            # Show only the canonical expected tag, never an untrusted env value.
+            problems.append(f"{client.label}: launch environment must set KLYK_CLIENT={client.key} for its on/off switch")
+            repair_keys.append(client.key)
         if (not isinstance(environment, dict) or "PYTHONPATH" not in environment
                 or not all(isinstance(value, str) for value in environment.values())):
             problems.append(f"{client.label}: launch environment does not explicitly control Python imports")
             repair_keys.append(client.key)
             continue
-        valid.append(client.label)
+        if matches and identity_matches:
+            valid.append(client.label)
 
     if problems:
         commands = ", ".join(f"`klyk install {key}`" for key in dict.fromkeys(repair_keys))

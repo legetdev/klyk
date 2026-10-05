@@ -135,7 +135,7 @@ def main():
             check('real permission preflight queries succeeded', permissions == required)
             check('persistent diagnostics exclude rejected request contents', sentinel not in (work / 'klyk.log').read_text())
             check('control state and logs are owner-only', all((work / name).stat().st_mode & 0o777 == 0o600
-                  for name in ('owner', 'klyk.log', 'boundaries.json')))
+                  for name in ('owner', 'klyk.log', 'boundaries.json', 'connections.json', 'connections.lock')))
             report['completed'] = True
     except Exception as error:
         report['error'] = f'{type(error).__name__}: {error}'

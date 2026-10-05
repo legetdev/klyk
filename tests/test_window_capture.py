@@ -17,7 +17,7 @@ from types import ModuleType, SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
-from test_input_cleanup import load_functions
+from test_input_cleanup import enabled_gate, load_functions
 from klyk.image_bounds import png_dimensions, validate_image_dimensions
 
 
@@ -181,6 +181,10 @@ class WindowCaptureCacheTests(unittest.TestCase):
         import klyk.window_capture as window_capture
 
         self.module = window_capture
+        # These legacy cache tests replace every native provider; policy is tested separately.
+        gate = patch.object(window_capture, "_connection_gate", enabled_gate(), create=True)
+        gate.start()
+        self.addCleanup(gate.stop)
         self._original_load = self.module._load
         self._original_capacity = self.module._CAPACITY
         self._original_ttl = self.module._TTL

@@ -94,7 +94,10 @@ class MenuBarController:
                 with self._lock:
                     self._installed = False
 
-        ui.dispatch(_do_install)
+        if not ui.dispatch(_do_install, guarded=False):
+            with self._lock:
+                self._installed = False
+            return False
         if not self._subscribed:
             self._subscribed = True
             activity.recorder.subscribe(self._on_activity)
@@ -110,7 +113,9 @@ class MenuBarController:
             if self._refresh_pending:
                 return
             self._refresh_pending = True
-        ui.dispatch(self._refresh)
+        if not ui.dispatch(self._refresh, guarded=False):
+            with self._refresh_lock:
+                self._refresh_pending = False
 
     # --- subscriber (writer threads call this) ----------------------------
 
@@ -184,15 +189,16 @@ class MenuBarController:
         """True only if THIS process is the recorded control owner — the one
         instance that shows its menu-bar eye. Read-only (never claims). Any
         other owner returns False, so a superseded session hides its eye and
-        exactly one eye is ever visible: the active driver. owner==0 (no token
-        written yet / degraded) shows the eye, so a lone klyk is never
-        eyeless."""
+        only the active driver's eye is visible. Off or unknown ownership hides
+        the activity eye; the independent access controls remain available."""
         try:
-            from . import ownership
+            from . import ownership, connection_policy
+            if not connection_policy.enabled():
+                return False
             owner = ownership.current_owner()
         except Exception:
-            return True
-        return owner == 0 or owner == os.getpid()
+            return False
+        return owner == os.getpid()
 
     def _apply_ownership_visibility(self) -> None:
         """Show the status item only when this process is the active driver,
@@ -210,7 +216,7 @@ class MenuBarController:
     def _start_ownership_watch(self) -> None:
         """Background poll: keep the eye's visibility in sync with ownership
         even when this session is idle, so a superseded session hides its eye
-        within ~2 s. Touches the UI only when the state flips — stable
+        within ~0.25 s. Touches the UI only when the state flips — stable
         ownership means zero menu work."""
         def _watch() -> None:
             last = None
@@ -218,15 +224,15 @@ class MenuBarController:
                 try:
                     cur = self._is_active_driver()
                     if cur != last:
-                        last = cur
-                        ui.dispatch(self._apply_ownership_visibility)
+                        if ui.dispatch(self._apply_ownership_visibility, guarded=False):
+                            last = cur
                         # A newly-visible eye may carry a menu built long ago
                         # (e.g. an update notice that has since resolved) —
                         # rebuild so it never shows stale state.
                         self.request_refresh()
                 except Exception:
                     pass
-                time.sleep(2.0)
+                time.sleep(0.25)
         threading.Thread(target=_watch, name="klyk-eye-watch", daemon=True).start()
 
     def _rebuild_locked(self) -> None:

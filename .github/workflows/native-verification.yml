@@ -61,6 +61,15 @@ jobs:
       - name: Recheck permissions with the fresh-installed interpreter before any UI
         if: env.FULL_SUITE == 'true'
         run: python -P -B tests/native_runner_probe.py --output .verification/installed-runner-probe.json
+      - name: Enable only the isolated runner's fixture environment on first use
+        if: env.FULL_SUITE == 'true'
+        run: |
+          python -P -B - <<'PY'
+          from klyk import connection_policy
+          connection_policy.initialize('other')
+          if not connection_policy.enabled('other'):
+              raise SystemExit('The isolated fixture environment is Off; no desktop suite may proceed.')
+          PY
       - name: Generated native OCR execution-mode diagnostic
         if: env.FULL_SUITE == 'true'
         continue-on-error: true

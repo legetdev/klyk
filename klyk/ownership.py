@@ -217,6 +217,31 @@ def claim_ownership_if_unowned() -> int:
         fh.close()
 
 
+def release_ownership_if_owned() -> bool:
+    """Clear only our token without waiting; retained input leases still guard cleanup."""
+    fh = _open()
+    if fh is None:
+        return False
+    released = False
+    try:
+        if _lock(fh, fcntl.LOCK_EX):
+            if _read_pid(fh) == _MY_PID:
+                _write_pid(fh, 0)
+            released = True
+    except (OSError, ValueError):
+        pass
+    finally:
+        try:
+            fcntl.flock(fh.fileno(), fcntl.LOCK_UN)
+        except (OSError, ValueError):
+            pass
+        try:
+            fh.close()
+        except (OSError, ValueError):
+            released = False
+    return released
+
+
 def is_owner() -> bool:
     """True if THIS process currently owns control. A dead or absent owner
     counts as 'no owner' and we transparently claim it — so a crashed prior

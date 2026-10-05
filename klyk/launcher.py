@@ -24,6 +24,14 @@ CHROMIUM_BROWSERS = {
 BROWSERS = CHROMIUM_BROWSERS | {"Safari", "Safari Technology Preview", "Firefox"}
 
 
+def _check_request_access() -> None:
+    """Stop later app/log/signal stages of a revoked request; CLI metadata stays independent."""
+    from . import connection_gate
+    request = connection_gate.current_scope()
+    if request is not None:
+        connection_gate.checkpoint(request)
+
+
 def is_browser(app_name: str | None) -> bool:
     """True if app_name matches a known browser."""
     return bool(app_name and app_name in BROWSERS)
@@ -144,6 +152,7 @@ def _quick_pid_for_app(bundle_id: str | None, app_name: str | None) -> int | Non
     if not bundle_id and not app_name:
         return None
     _validate_app_identifier(bundle_id or app_name, "bundle_id" if bundle_id else "app_name")
+    _check_request_access()
     try:
         from AppKit import NSRunningApplication, NSWorkspace
         if bundle_id:
@@ -203,6 +212,7 @@ def launch_native_app(
 
 def start_native_log_stream(pid: int) -> subprocess.Popen:
     """Start a log stream watcher for a native app's unified log output. Returns the Popen."""
+    _check_request_access()
     return subprocess.Popen(
         ["/usr/bin/log", "stream", "--predicate", f"processID == {pid}",
          "--level", "default", "--style", "compact"],
@@ -234,6 +244,7 @@ def _find_pid_for_app(
     """Wait only for native process registration, preserving lookup errors and ambiguity."""
     deadline = time.monotonic() + max(0.0, timeout)
     while True:
+        _check_request_access()
         pid = _quick_pid_for_app(bundle_id, app_name)
         if pid is not None:
             return pid
@@ -384,6 +395,7 @@ def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dic
     status = _process_status(pid, expected_identity)
     if status != "same":
         return status == "gone"
+    _check_request_access()
     try:
         os.kill(pid, signal.SIGTERM)
     except ProcessLookupError:
@@ -395,6 +407,7 @@ def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dic
 
     deadline = time.monotonic() + term_timeout
     while time.monotonic() < deadline:
+        _check_request_access()
         status = _process_status(pid, expected_identity)
         if status != "same":
             return status == "gone"  # Never signal a replacement or an unknown process.
@@ -410,6 +423,7 @@ def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dic
     status = _process_status(pid, expected_identity)
     if status != "same":
         return status == "gone"
+    _check_request_access()
     try:
         os.kill(pid, signal.SIGKILL)
     except ProcessLookupError:

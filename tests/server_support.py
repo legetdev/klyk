@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import jsonschema
 from mcp import types
 from klyk.private_files import open_private
+from test_input_cleanup import enabled_gate
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -34,6 +35,9 @@ def load_server():
     module.__dict__.update({name: value for name, value in globals().items() if not name.startswith('__')})
     module._jsonschema = jsonschema
     module.log = logging.getLogger('klyk.tests')
+    module.connection_gate = enabled_gate()
+    module.server = python_types.SimpleNamespace(
+        request_context=python_types.SimpleNamespace(request_id=None))
     for name in ('computer', 'capture', 'skylight', 'ownership', 'registry', 'activity',
                  'window_labels', 'reporter_mod', 'ocr', 'matcher', '_ui'):
         setattr(module, name, MagicMock())
@@ -65,6 +69,8 @@ def load_server():
     module._TOOL_SCHEMAS = {t.name: module._tool_input_schema(t) for t in module.TOOLS}
     module._TOOL_VALIDATORS = {n: jsonschema.validators.validator_for(s)(s) for n,s in module._TOOL_SCHEMAS.items()}
     module._refresh_menubar = MagicMock()
+    # Legacy dispatcher suites already provide native adapters; do not initialize the desktop.
+    module._ensure_native_runtime = AsyncMock(return_value=None)
     return module
 
 

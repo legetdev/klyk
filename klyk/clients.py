@@ -3,7 +3,7 @@
 Design goal: onboarding to any client should be as easy as adding an MCP to
 Claude. Clients that share a known shape need only one CLIENTS entry; a
 genuinely distinct format gets one focused adapter behind the same API. Every
-client reuses the exact stdio launch entry.
+client reuses the stdio command with its own reserved identity tag.
 
 Three on-disk shapes are handled:
   - "json"  : a JSON file with a top-level `mcpServers` map (Claude, Cursor,
@@ -36,7 +36,7 @@ from . import jsonc
 # Key under which klyk registers in every client's config.
 SERVER_KEY = "klyk"
 
-# The canonical stdio launch entry — identical for every MCP client.
+# The canonical stdio command; each client adds its own reserved identity tag.
 # command is THIS interpreter (sys.executable), not a bare "python3", so the
 # config points at the exact Python klyk is installed in — works whether klyk
 # was installed via pip (global), pipx, uv tool, or a dedicated venv. A bare
@@ -81,6 +81,15 @@ class Client:
     # to add a small klyk usage note there so the agent discovers the
     # `klyk-call` shell fallback if the client's own MCP never surfaces klyk.
     context_file: "Path | None" = None
+
+    def __post_init__(self):
+        """Give each launch its own environment and reserved canonical client tag."""
+        entry = dict(self.entry)
+        env_key = "environment" if self.fmt == "opencode" else "env"
+        environment = entry.get(env_key, {})
+        if isinstance(environment, dict):
+            entry[env_key] = {**environment, "KLYK_CLIENT": self.key}
+        object.__setattr__(self, "entry", entry)
 
 
 def _h(*parts) -> Path:
@@ -149,6 +158,55 @@ ALIASES = {"agy": "antigravity"}
 def get(key: str) -> Client | None:
     k = key.lower()
     return CLIENTS.get(ALIASES.get(k, k))
+
+
+def current_process_client() -> str | None:
+    """Identify this launch without reading configs or trusting process-name substrings."""
+    # Grouping metadata for trusted local launches, not an authentication boundary.
+    if "KLYK_CLIENT" in os.environ:
+        key = os.environ["KLYK_CLIENT"]
+        return key if key in CLIENTS else None
+    try:
+        from .launcher import process_identity
+        import pwd
+
+        parent = os.getppid()
+        identity = process_identity(parent, include_command=True)
+        if (not isinstance(identity, dict) or identity.get("pid") != parent
+                or identity.get("uid") != os.getuid() or parent != os.getppid()):
+            return "other"
+        executable = identity.get("executable")
+        argv = identity.get("argv")
+        if (not isinstance(executable, str) or not Path(executable).is_absolute()
+                or not isinstance(argv, list) or not argv or not isinstance(argv[0], str)):
+            return "other"
+        # Known native launchers only: shared node/python/shell parents stay Other.
+        home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+        launchers = {
+            "codex": (
+                Path("/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex"),
+                Path("/opt/homebrew/bin/codex"), Path("/usr/local/bin/codex"),
+            ),
+            "claude": (home / ".local/bin/claude", Path("/opt/homebrew/bin/claude"), Path("/usr/local/bin/claude")),
+            "opencode": (home / ".opencode/bin/opencode", Path("/opt/homebrew/bin/opencode"), Path("/usr/local/bin/opencode")),
+        }
+        matches = set()
+        for key, paths in launchers.items():
+            for path in paths:
+                resolved = str(path.resolve())
+                target = Path(resolved)
+                native_target = target.name == key
+                if key == "claude" and target.parent == (home / ".local/share/claude/versions").resolve():
+                    native_target = re.fullmatch(r"\d+\.\d+\.\d+(?:[-+][\w.-]+)?", target.name) is not None
+                if not native_target:
+                    continue
+                if executable == resolved and argv[0] in (str(path), resolved, key):
+                    matches.add(key)
+        if len(matches) == 1:
+            return matches.pop()
+    except (OSError, ValueError, KeyError, RuntimeError, ImportError):
+        pass
+    return "other"
 
 
 def is_present(client: Client) -> bool:
@@ -496,7 +554,8 @@ def _refreshed_entry(client: Client, existing) -> dict:
             or not all(isinstance(key, str) and isinstance(value, str)
                        for key, value in custom.items())):
         raise ConfigFormatError(f"{client.path}: {env_key} must be an object containing string variables")
-    result[env_key] = {**client.entry.get(env_key, {}), **custom}
+    result[env_key] = {**client.entry.get(env_key, {}), **custom,
+                       "KLYK_CLIENT": client.key}
     return result
 
 
@@ -660,6 +719,38 @@ def _checked_toml_edit(text: str, expected: dict, pattern: str, replacement) -> 
     return None
 
 
+def _toml_env_edit(text: str, expected: dict, environment: dict, key: str,
+                   value: str, newline: str) -> str | None:
+    """Edit one managed environment value only when full native parsing agrees."""
+    key_text = json.dumps(key, ensure_ascii=False)
+    value_text = json.dumps(value, ensure_ascii=False)
+    if key in environment:
+        # Reserved tags may be corrected; preserve their key, spacing and comment.
+        key_pattern = rf"(?:{re.escape(key)}|{re.escape(key_text)}|'{re.escape(key)}')"
+        string_value = r'''(?:"(?:[^"\\\r\n]|\\[^\r\n])*"|'[^'\r\n]*')'''
+        return _checked_toml_edit(text, expected,
+            rf"(?<![\w-])({key_pattern}[ \t]*=[ \t]*){string_value}",
+            lambda match: match[1] + value_text)
+    section = rf"^[ \t]*\[mcp_servers\.{re.escape(SERVER_KEY)}"
+    section_end = r"\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)"
+
+    def add_line(match, name):
+        """Insert after the real header, retaining its existing comment and newline."""
+        return match[0] + ("" if match[0].endswith("\n") else newline) + f'{name} = {value_text}{newline}'
+
+    edits = (
+        (section + r"\.env" + section_end, lambda match: add_line(match, key_text)),
+        (r'''^[ \t]*(?:env|"env"|'env')[ \t]*=[ \t]*\{''',
+         lambda match: match[0] + f'{key_text} = {value_text}' + (", " if environment else "")),
+        (section + section_end, lambda match: add_line(match, f'env.{key_text}')),
+    )
+    for pattern, replacement in edits:
+        candidate = _checked_toml_edit(text, expected, pattern, replacement)
+        if candidate is not None:
+            return candidate
+    return None
+
+
 def _write_toml(client: Client) -> str:
     """Migrate known generated launches while preserving all unrelated TOML text."""
     original = jsonc.read_snapshot(client.path, missing_ok=True)
@@ -682,41 +773,38 @@ def _write_toml(client: Client) -> str:
     if existing is not None:
         if existing == entry:
             return "unchanged"
+        migrated = dict(existing)
         if existing["args"] == legacy_args:
+            migrated["args"] = entry["args"]
             intermediate = {**data, "mcp_servers": {**data["mcp_servers"],
-                            SERVER_KEY: {**existing, "args": entry["args"]}}}
+                            SERVER_KEY: migrated}}
             # Insert only -P; even comments inside multiline arrays survive.
             updated = _checked_toml_edit(updated, intermediate,
                 r'''^[ \t]*(?:args|"args"|'args')[ \t]*=[ \t]*\[''',
                 lambda match: match[0] + '"-P", ')
         env = existing.get("env")
-        if updated is not None and env is not None and "PYTHONPATH" not in env:
-            section = rf"^[ \t]*\[mcp_servers\.{re.escape(SERVER_KEY)}"
-            section_end = r"\][ \t]*(?:#[^\r\n]*)?(?:\r?\n|$)"
-
-            def add_line(match, key):
-                """Insert a key after its header without changing the header's comment."""
-                return match[0] + ("" if match[0].endswith("\n") else newline) + f'{key} = ""{newline}'
-
-            edits = (
-                (section + r"\.env" + section_end, lambda match: add_line(match, '"PYTHONPATH"')),
-                (r'''^[ \t]*(?:env|"env"|'env')[ \t]*=[ \t]*\{''',
-                 lambda match: match[0] + '"PYTHONPATH" = ""' + (", " if env else "")),
-                (section + section_end, lambda match: add_line(match, 'env.PYTHONPATH')),
-            )
-            for pattern, replacement in edits:
-                candidate = _checked_toml_edit(updated, expected, pattern, replacement)
-                if candidate is not None:
-                    updated = candidate
+        if updated is not None and env is not None:
+            migrated["env"] = dict(env)
+            for key, value in entry["env"].items():
+                if migrated["env"].get(key) == value:
+                    continue
+                before = dict(migrated["env"])
+                migrated["env"][key] = value
+                intermediate = {**data, "mcp_servers": {**data["mcp_servers"], SERVER_KEY: migrated}}
+                updated = _toml_env_edit(updated, intermediate, before, key, value, newline)
+                if updated is None:
                     break
-            else:
-                updated = None
-        block = f'[mcp_servers.{SERVER_KEY}.env]{newline}"PYTHONPATH" = ""{newline}' if env is None else None
+        block = (f'[mcp_servers.{SERVER_KEY}.env]{newline}'
+                 + ''.join(f'{json.dumps(key, ensure_ascii=False)} = {json.dumps(value, ensure_ascii=False)}{newline}'
+                           for key, value in entry["env"].items())) if env is None else None
     else:
         block = snippet(client).replace("\n", newline)
     if updated is not None and block is not None:
         sep = "" if updated.endswith(newline * 2) or not updated else (newline if updated.endswith(newline) else newline * 2)
         updated = _checked_toml_edit(updated, expected, r"\Z", lambda match: sep + block)
+    if updated is not None:
+        # Never report a migration that omitted an owned field or touched other data.
+        updated = _checked_toml_edit(updated, expected, r"\Z", lambda match: "")
     if updated is None:
         raise ManualEditRequired(
             f"{client.path}: the klyk TOML entry could not be refreshed without changing other settings; "

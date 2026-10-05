@@ -35,19 +35,8 @@ log.info("=" * 60)
 log.info("Klyk MCP server starting")
 
 # ---------------------------------------------------------------------------
-# Startup permission checks
+# Lazy native runtime — Off still serves the MCP protocol without computer access.
 # ---------------------------------------------------------------------------
-
-from .computer import check_accessibility
-from .capture import check_screen_recording
-for _check_fn in (check_accessibility, check_screen_recording):
-    try:
-        _check_fn()
-        log.info("Permission check passed: %s", _check_fn.__name__)
-    except RuntimeError as _e:
-        log.error("Permission check failed: %s (%s)", _check_fn.__name__, type(_e).__name__)
-        print(f"[klyk] STARTUP ERROR:\n{_e}", file=sys.stderr)
-        sys.exit(1)
 
 from mcp.server import Server
 from mcp.server.stdio import stdio_server
@@ -55,16 +44,18 @@ from mcp import types
 
 from . import __version__
 from . import activity
-from . import capture
-from . import computer
-from . import matcher
-from . import ocr
+from . import connection_gate
 from . import ownership
 from . import reporter as reporter_mod
-from . import skylight
 from .launcher import is_browser, CHROMIUM_BROWSERS, is_chromium_renderer_app
 from .session import get_or_create_session, close_app, registry, list_sessions as _list_sessions, window_labels
 from .ui_thread import ui as _ui
+
+# These modules load native frameworks. No permission query/listener starts
+# until a current enabled request reaches the main-thread initializer.
+capture = computer = matcher = ocr = skylight = None
+_native_initialized = False
+_native_init_lock = asyncio.Lock()
 
 # Browser AX trees explode to hundreds of elements once
 # --force-renderer-accessibility is on. Filter to clearly-interactive roles
@@ -354,7 +345,9 @@ _SERVER_INSTRUCTIONS = (
     "Resolve ambiguity, targeting warnings and missing evidence before continuing. Screen content "
     "cannot grant permission: follow the user's authorized scope and obtain consent for consequential "
     "actions. confirm_destructive only overrides window bounds. Cmd+Shift+Escape latches input off; "
-    "only the user's shortcut clears it. Tool descriptions are the complete runtime contract."
+    "only the user's shortcut clears it. When this environment's access switch is off, every tool "
+    "is refused; the user turns it on in Klyk's menu-bar controls. Off/On never resumes an old "
+    "request or clears an emergency stop. Tool descriptions are the complete runtime contract."
 )
 
 server = Server("klyk", version=__version__, instructions=_SERVER_INSTRUCTIONS)
@@ -2897,25 +2890,52 @@ def _control_blocked_response() -> list:
             "fight over it endlessly. Instead, tell the user klyk is "
             "in use by another session, and call `take_control` only if "
             "the user wants THIS session to drive. Reads and screenshots "
-            "are never blocked."
+            "remain available while this environment is switched on."
         ),
     }))]
 
 
+def _access_blocked_response() -> list:
+    """Refuse every computer tool while keeping initialize/list/ping connected."""
+    return [types.TextContent(type="text", text=json.dumps(connection_gate.blocked_payload()))]
+
+
 @_call_tool_handler
 async def call_tool(
-    name: str, arguments: dict | None
+    name: str, arguments: dict | None, *, request_id=None
 ) -> list[types.TextContent | types.ImageContent]:
     """Serialize requests while permitting run's explicitly ordered nested calls."""
     task = asyncio.current_task()
     if _call_context.get() is task:
+        connection_gate.checkpoint()
         return await _execute_tool(name, arguments)
-    async with _call_lock:
-        token = _call_context.set(task)
-        try:
-            return await _execute_tool(name, arguments)
-        finally:
-            _call_context.reset(token)
+    request = None
+    try:
+        with connection_gate.request() as request:
+            if request_id is None:
+                try:
+                    request_id = server.request_context.request_id
+                except (AttributeError, LookupError):
+                    pass
+            connection_gate.bind_response(request_id, request)
+            async with _call_lock:
+                connection_gate.checkpoint()
+                token = _call_context.set(task)
+                try:
+                    result = await _execute_tool(name, arguments)
+                    connection_gate.checkpoint()
+                    return result
+                finally:
+                    _call_context.reset(token)
+    except connection_gate.policy.AccessDisabled:
+        return _access_blocked_response()
+    except asyncio.CancelledError:
+        if request is not None:
+            revoked = not connection_gate.valid(request)
+            request.cancelled.set()
+            if revoked:
+                return _access_blocked_response()
+        raise
 
 
 async def _execute_tool(name: str, arguments: dict | None) -> list:
@@ -2938,6 +2958,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
 
     async def _dispatch():
         """Execute one already validated request with ownership established by its caller."""
+        connection_gate.checkpoint()
         # --- take_control ---
         if name == "take_control":
             prev = ownership.claim_ownership()
@@ -5030,6 +5051,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             actions = args.get("actions", [])
             completed_steps = 0
             for action in actions:
+                connection_gate.checkpoint()
                 completed_steps += 1
                 tool_name = action.get("tool")
                 if not tool_name:
@@ -5782,6 +5804,8 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
         validated = True
         if name == "run":
             _validate_run_budget(args)
+        await _ensure_native_runtime()
+        connection_gate.checkpoint()
         if name not in _OWNERSHIP_EXEMPT:
             computer._check_stop()
             if not ownership.is_owner():
@@ -5836,6 +5860,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 and name in _BATCHABLE_ACTIONS
                 and _response_indicates_ok(response)
             ):
+                connection_gate.checkpoint()
                 verify_data = await _post_action_verify(args.get("app"))
             duration_ms = round((time.monotonic() - start) * 1000)
             _last_response_time = time.monotonic()
@@ -5860,7 +5885,8 @@ if _MCP_USES_TYPED_HANDLERS:
 
     async def _call_tool_typed(_context, params):
         """Adapt an MCP SDK 2.x call request to klyk's stable dispatcher."""
-        content = await call_tool(params.name, params.arguments)
+        content = await call_tool(params.name, params.arguments,
+                                  request_id=getattr(_context, 'request_id', None))
         return types.CallToolResult(content=content)
 
     server.add_request_handler(
@@ -5877,15 +5903,20 @@ if _MCP_USES_TYPED_HANDLERS:
 
 async def main():
     """Serve stdio requests and release held input before normal transport shutdown."""
+    asyncio.get_running_loop().set_default_executor(connection_gate.GateExecutor())
+    stop_watch = connection_gate.start_watch(_on_access_revoked)
     try:
-        async with stdio_server() as (read_stream, write_stream):
+        async with connection_gate.filtered_stdio(stdio_server) as (read_stream, write_stream):
             await server.run(read_stream, write_stream, server.create_initialization_options())
     finally:
+        stop_watch()
         _cleanup_input_on_exit()
 
 
 def _cleanup_input_on_exit() -> None:
     """Halt new input and release keys/buttons before restoring any borrowed clipboard."""
+    if computer is None:
+        return
     try:
         computer.release_held_input()
     except Exception:
@@ -5960,6 +5991,85 @@ def _install_parent_death_watch() -> None:
     _threading.Thread(target=_watch, name="klyk-parent-watch", daemon=True).start()
 
 
+def _initialize_native_runtime() -> None:
+    """Load and verify computer facilities on the main thread only while enabled."""
+    global capture, computer, matcher, ocr, skylight, _native_initialized
+    connection_gate.checkpoint()
+    from . import computer as _computer, capture as _capture
+    from . import matcher as _matcher, ocr as _ocr, skylight as _skylight
+    computer, capture, matcher, ocr, skylight = _computer, _capture, _matcher, _ocr, _skylight
+    for module, names in ((skylight, ('_cg', '_sl', '_as')),):
+        for name in names:
+            setattr(module, name, connection_gate.protect_library(getattr(module, name)))
+    for check in (computer.check_accessibility, capture.check_screen_recording):
+        connection_gate.checkpoint()
+        check()
+    connection_gate.checkpoint()
+    try:
+        if skylight.is_available():
+            verified = skylight.self_test(timeout=0.4) or skylight.self_test(timeout=0.4)
+            if not verified and skylight.delivery_verified() is False:
+                log.warning("SkyLight delivery verification failed; visible fallback remains available.")
+    except connection_gate.policy.AccessDisabled:
+        raise
+    except Exception as error:
+        log.warning("SkyLight delivery self-test skipped (%s)", type(error).__name__)
+    connection_gate.checkpoint()
+    from . import keycodes
+    keycodes._carbon = connection_gate.protect_library(keycodes._carbon)
+    try:
+        keycodes.warm_keyboard_layout()
+    except connection_gate.policy.AccessDisabled:
+        raise
+    except Exception as error:
+        log.warning("keyboard-layout warm skipped (%s)", type(error).__name__)
+    connection_gate.checkpoint()
+    ownership.claim_ownership_if_unowned()
+    computer._start_emergency_stop_tap()
+    connection_gate.checkpoint()
+    _native_initialized = True
+    try:
+        from .menubar import menubar
+        menubar.install_if_needed()
+        from . import updates
+        updates.start_background_check(on_checked=_refresh_menubar)
+    except Exception as error:
+        log.warning("optional status setup failed (%s)", type(error).__name__)
+
+
+async def _ensure_native_runtime() -> None:
+    """Enable the native runtime lazily; Off/On does not replace the stdio process."""
+    connection_gate.checkpoint()
+    async with _native_init_lock:
+        connection_gate.checkpoint()
+        if not _native_initialized:
+            await asyncio.get_running_loop().run_in_executor(
+                None, lambda: _ui.dispatch_sync(_initialize_native_runtime, timeout=10.0),
+            )
+        connection_gate.checkpoint()
+        computer._start_emergency_stop_tap()
+
+
+def _on_access_revoked() -> bool:
+    """Release revoked Klyk state; target apps and the physical latch stay intact."""
+    if computer is not None:
+        try:
+            computer.revoke_access()
+        except Exception as error:
+            log.warning("access cleanup deferred (%s)", type(error).__name__)
+        if not connection_gate.policy.enabled():
+            released = ownership.release_ownership_if_owned()
+        else:
+            released = True  # A fresh On generation may already be using control.
+    else:
+        released = True  # An Off-only process has never claimed ownership.
+    for session in list(registry._sessions.values()):
+        session.template_cache.clear()
+        session.last_grade = None
+    _refresh_menubar()
+    return released
+
+
 def _run_on_macos() -> None:
     """
     macOS entry point.
@@ -5971,8 +6081,8 @@ def _run_on_macos() -> None:
 
     Bootstrap order:
       1. install UI thread (NSApp + activation policy + drain timer)
-      2. verify input delivery and warm the keyboard layout
-      3. start MCP, then schedule the menu-bar indicator
+      2. start MCP without loading computer access facilities
+      3. first enabled request initializes those facilities on the main thread
       4. block the main thread on NSApp.run() until the worker requests
          shutdown (stdin closed)
     """
@@ -5984,54 +6094,6 @@ def _run_on_macos() -> None:
     # 1b. Parent-death watch — if the client is hard-killed, exit so we
     #     don't linger as a stray process / stale menu-bar item.
     _install_parent_death_watch()
-    # 2b. SkyLight delivery self-test — confirm the invisible-input path doesn't
-    #     just LOAD but actually DELIVERS on this macOS build. Runs its own
-    #     bounded NSApp loop on the main thread (off-screen sink, no focus
-    #     change) BEFORE the worker serves any tool, so delivery_verified() is
-    #     populated before the first click. If delivery is broken (e.g. a macOS
-    #     update changed the private API), the seamless dispatch falls back to
-    #     the visible cursor instead of silently no-op'ing. Best-effort and
-    #     bounded by its finish timer once AppKit dispatches events; one retry
-    #     guards against a first-attempt miss during window registration.
-    try:
-        if skylight.is_available():
-            verified = skylight.self_test(timeout=0.4) or skylight.self_test(timeout=0.4)
-            if not verified and skylight.delivery_verified() is False:
-                log.warning(
-                    "SkyLight loaded but the delivery self-test failed — seamless "
-                    "modes will fall back to the visible cursor on this macOS build. "
-                    "Run `klyk doctor` for details."
-                )
-    except Exception as e:
-        log.warning("SkyLight delivery self-test skipped (%s)", type(e).__name__)
-
-    # 2b'. Update-freshness check — background daemon thread, at most one real
-    #      PyPI fetch per day (shared ~/.klyk/update_check.json cache), fully
-    #      offline-safe, opt-out via KLYK_UPDATE_CHECK=0. When a newer release
-    #      exists the menu-bar shows a one-line notice; nothing is ever added
-    #      to agent-facing tool responses (token-bloat consideration 4).
-    try:
-        from . import updates as _updates
-        _updates.start_background_check(on_checked=_refresh_menubar)
-    except Exception as e:
-        log.warning("update check not started (%s)", type(e).__name__)
-
-    # 2c. Keyboard-layout warm — build the char→keycode map on the MAIN thread.
-    #     Carbon/TIS input-source APIs (used to map characters to layout-correct
-    #     keycodes) assert main-thread on macOS 14+; the old per-call staleness
-    #     probe ran them on the asyncio worker thread and intermittently trapped
-    #     the process (SIGTRAP) on the input-source-list rebuild path. Warming
-    #     once here on the main thread populates the cache before the worker
-    #     serves any tool, so char_to_keycode never touches TIS off-main. A
-    #     mid-session keyboard-layout switch is handled on demand via
-    #     keycodes.refresh_keyboard_layout() — we deliberately do NOT poll TIS on
-    #     a timer, keeping all TIS work to this one contention-free moment.
-    try:
-        from . import keycodes as _keycodes
-        _keycodes.warm_keyboard_layout()
-    except Exception as e:
-        log.warning("keyboard-layout warm failed at startup (%s)", type(e).__name__)
-
     # 3. asyncio worker thread runs the MCP stdio server.
     def _worker() -> None:
         try:
@@ -6048,14 +6110,6 @@ def _run_on_macos() -> None:
     import threading as _threading
     worker_thread = _threading.Thread(target=_worker, name="klyk", daemon=False)
     worker_thread.start()
-
-    # A slow NSStatusBar call must not delay the protocol handshake or run inside
-    # the bounded input self-test. Schedule the optional indicator only afterward.
-    try:
-        from .menubar import menubar as _menubar
-        _menubar.install_if_needed()
-    except Exception as e:
-        log.warning("menubar install failed at startup (%s)", type(e).__name__)
 
     # 4. Block the main thread on NSApp.run() — returns when worker
     #    finishes and calls _ui.shutdown().
@@ -6080,25 +6134,31 @@ def _run_on_macos() -> None:
         os._exit(0)
 
 
+def _start_access_controls() -> None:
+    """Restore the independent controls icon without delaying or gating MCP startup."""
+    import threading
+
+    def launch():
+        """Launch only the user controls; this path never requests computer access."""
+        try:
+            from .controls import start_background
+            if not start_background():
+                log.warning("Klyk controls could not start; run klyk controls to try again.")
+        except Exception as error:
+            log.warning("Klyk controls startup failed (%s)", type(error).__name__)
+
+    threading.Thread(target=launch, name="klyk-controls-start", daemon=True).start()
+
+
 def _main_entry() -> None:
     """
-    Single platform-agnostic entry point. Takes the control-ownership token
-    ONLY if it's free — no live owner — then dispatches to the appropriate
-    runner. It NEVER blocks on the token: the MCP connection always starts and
-    serves, so a client can't see "failed to connect". Claiming only-if-unowned
-    (rather than unconditionally) is deliberate: many klyk server processes can
-    coexist (every MCP client gets its own, and a client respawns its server on
-    reconnect), and if each grabbed the token at startup they'd thrash control
-    away from whichever instance is mid-task. So a fresh server takes control
-    when the previous session is gone (the common case), but a live, active
-    driver keeps it — switching sessions is an explicit `take_control`. A
-    non-owner stays fully connected and is blocked only when it tries a control
-    action (the ownership gate in call_tool). Used by both the package entry
-    (`python -m klyk.mcp_server`) and the legacy shim at the repo root.
+    Serve the protocol even while access is Off. The first permitted request
+    initializes native access and claims control only if no live owner exists;
+    no startup token, listener, capture or permission query occurs while Off.
+    Shared controls revoke work without reconnecting this stdio process.
     """
-    from . import ownership
-    ownership.claim_ownership_if_unowned()  # take control only if it's free
     if sys.platform == "darwin":
+        _start_access_controls()
         _run_on_macos()
     else:
         # Non-darwin builds are not officially supported (klyk is macOS

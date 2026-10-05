@@ -23,8 +23,16 @@ You should expect an acknowledgement within ~7 days. A fix or written dispositio
 Klyk runs entirely on the user's local Mac, with permissions granted by the user via macOS System Settings. The trust boundaries are:
 
 - **User → klyk:** the user grants Accessibility and Screen Recording via macOS Settings. `klyk doctor` reports the current state.
-- **Agent → klyk:** the agent (Claude / Cursor / Cline / etc.) drives klyk via the MCP protocol over stdio. Klyk executes the requested intent subject to code-enforced target-window bounds, duplicate-label rejection, the single-owner token, and the emergency latch; confirmation guidance and `confirm_destructive` are agent-cooperative, not user-consent enforcement. Run klyk only with agents you trust to act on your behalf.
+- **Agent → klyk:** the agent (Claude / Cursor / Cline / etc.) drives klyk via the MCP protocol over stdio. Klyk executes the requested intent only while that environment's saved access switch is On, subject to target-window bounds, duplicate-label rejection, the single-owner token and emergency latch. Confirmation guidance and `confirm_destructive` are agent-cooperative, not user-consent enforcement. Run klyk only with agents you trust to act on your behalf.
 - **Klyk → outside world:** klyk makes one optional once-daily HTTPS request for public PyPI package metadata. The check sends no captured screen data, OCR, or tool results, but normal network metadata such as the IP address is visible to PyPI and the network path. Tool results delivered to the calling agent/client may be transmitted onward to its model provider under that client's settings. Set `KLYK_UPDATE_CHECK=0` to disable the check and klyk makes no network calls itself.
+
+## Per-environment switches
+
+The separate native menu-bar controls persist access under `~/.klyk/connections.json`; they perform no computer-use reads or actions. Missing, malformed, overly broad permissions, links or special files fail closed. Every computer tool checks its environment before queuing work; queued workers, later native stages and the final tool reply retain the original generation. Turning Off cancels pending requests without disconnecting MCP, and turning On cannot revive earlier work. Discovery and ping remain available while Off.
+
+An operation already submitted to macOS may finish. Cleanup may release previously held input or restore a borrowed clipboard. Data already returned to a client cannot be withdrawn. Off does not close target apps or clear the physical emergency latch. Old versions must be upgraded and restarted once; they do not honor this policy.
+
+`KLYK_CLIENT` tags and conservative legacy parent identification group trusted local clients. They are not cryptographic identity: a process running as the same user can change the private file, choose a tag or bypass Klyk entirely. No MCP tool changes these switches, but an agent with separate shell access under the same account can edit them. The switches are a durable owner convenience and runtime refusal inside the existing trusted-local model, not an OS sandbox or a guarantee against prompt injection.
 
 ## Prompt injection & the confused-deputy risk
 

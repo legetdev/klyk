@@ -163,14 +163,16 @@ class StopAndReleaseTests(unittest.IsolatedAsyncioTestCase):
     def test_exit_signal_can_interrupt_held_stop_lock(self):
         """A real signal to our inert child cannot deadlock when cleanup re-enters the stop lock."""
         source = Path(__file__).resolve().parents[1] / "klyk" / "computer.py"
-        script = f'''import ast,os,signal,threading
+        script = f'''import ast,os,signal,sys,threading
 from pathlib import Path
+sys.path.insert(0,{str(source.parents[1] / "tests")!r})
+from test_input_cleanup import load_functions
 tree=ast.parse(Path({str(source)!r}).read_text())
-nodes=[node for node in tree.body if isinstance(node,ast.FunctionDef) and node.name=="release_held_input"]
-nodes += [node for node in tree.body if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=="_stop_lock" for target in node.targets)]
+nodes=[node for node in tree.body if isinstance(node,ast.Assign) and any(isinstance(target,ast.Name) and target.id=="_stop_lock" for target in node.targets)]
 releases=[]
 ns={{"threading":threading,"_stop_engaged":[False],"_held_lock":threading.RLock(),"_held_inputs":{{("inert",1):lambda:releases.append("up")}}}}
 exec(compile(ast.Module(body=nodes,type_ignores=[]),"<inert input cleanup>","exec"),ns)
+load_functions("computer.py",{{"release_held_input"}},ns)
 signal.signal(signal.SIGUSR1,lambda sig,frame:ns["release_held_input"]())
 with ns["_stop_lock"]:
  os.kill(os.getpid(),signal.SIGUSR1)

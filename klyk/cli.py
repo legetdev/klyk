@@ -23,6 +23,9 @@ gives them the `klyk` command, and from there:
                                    what it can (state dir, config entry).
     klyk restart            — stop the klyk instance currently driving the Mac
                                    (only needed to force a wedged one).
+    klyk controls           — open the quiet menu-bar controls. One switch per
+                                   environment allows or blocks Klyk access
+                                   without restarting the connected client.
     klyk uninstall [client] — remove klyk. No client → FULL removal (every
                                    client, state, binaries); a client name
                                    removes just that one.
@@ -63,7 +66,7 @@ def main() -> None:
     flags = {
         "install": {"--all", "--ambient", "--wait", "--list"},
         "uninstall": {"--all"}, "update": {"--check"},
-        "doctor": {"--fix", "--json"}, "restart": set(),
+        "doctor": {"--fix", "--json"}, "restart": set(), "controls": set(),
         "help": set(), "version": set(), "--version": set(), "-v": set(),
     }
     if cmd in flags:
@@ -83,6 +86,8 @@ def main() -> None:
         _doctor(rest)
     elif cmd == "restart":
         _restart()
+    elif cmd == "controls":
+        _controls()
     elif cmd in ("help", "--help", "-h"):
         _help()
     elif cmd in ("version", "--version", "-v"):
@@ -105,6 +110,18 @@ def _require_macos() -> None:
             file=sys.stderr,
         )
         sys.exit(1)
+
+
+def _controls() -> None:
+    """Start the native background switches without running computer-use probes."""
+    _require_macos()
+    from .controls import start_background
+    try:
+        start_background()
+    except (OSError, ValueError, RuntimeError):
+        print("Klyk controls could not start. Your saved access settings remain in effect.", file=sys.stderr)
+        sys.exit(1)
+    print("Klyk controls are in the menu bar.")
 
 
 # ---------------------------------------------------------------------------
@@ -317,6 +334,7 @@ def _restart() -> None:
     if identity is None:
         print("The recorded process could not be verified as this installation's klyk server. No process was stopped.", file=sys.stderr)
         sys.exit(1)
+
     print(f"Stopping the active klyk (pid {owner})…")
     if terminate_pid(owner, expected_identity=identity):
         print("✓ Stopped. The next session — or a take_control from another — becomes the driver.")
@@ -434,6 +452,18 @@ def _install(rest: list[str]) -> None:
         print(f"Configuration failed for: {names}.")
         print("Nothing was silently skipped. Fix the file issue above and re-run the same command.")
         sys.exit(1)
+
+    # First use stays Off until an owner explicitly enables an environment.
+    from . import connection_policy
+    from .controls import start_background
+    try:
+        connection_policy.initialize()
+        start_background()
+    except (OSError, ValueError, RuntimeError):
+        print("Klyk access stays off. Run `klyk controls` to open the controls after fixing the local settings.")
+        sys.exit(1)
+    print("Turn on the intended environment in the Klyk menu-bar controls when you want computer access.")
+    print()
 
     # Step 2 — macOS permissions (apply to the process running klyk, for any client).
     print("Step 2 — macOS permissions")

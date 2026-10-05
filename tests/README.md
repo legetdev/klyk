@@ -12,7 +12,7 @@ Focused regressions also exercise real subprocess pipes (large requests, noisy s
 
 ## Verification while the owner uses the Mac
 
-Portable tests operate on temporary files, controlled native adapters, and ordinary Python subprocesses. They do not launch apps, post input, or change the clipboard. A normal MCP launch installs a visible menu-bar item and performs an off-screen input self-test; a normal connection smoke check therefore does not meet an instruction to remain completely invisible.
+Portable tests operate on temporary files, controlled native adapters, and ordinary Python subprocesses. They do not launch apps, post input, or change the clipboard. Off MCP launches keep protocol discovery available without initializing computer access. The first permitted tool request installs the activity item and performs an off-screen input self-test; enabled desktop smoke checks require an isolated test Mac when the owner prohibits visible changes.
 
 The `silent_protocol_smoke.py` check runs the actual package entry point and installed MCP SDK through real subprocess pipes, with real metadata-only permission checks. Its external test bootstrap prevents AppKit initialization, the status item, event-tap installation, input delivery, clipboard access, app activation, subprocess launches, and screen capture. It can check tool discovery, screen metadata, rejected requests, diagnostic privacy, and process cleanup. It explicitly records every substituted boundary. This is protocol integration evidence and cannot satisfy native desktop acceptance.
 
@@ -28,6 +28,8 @@ After installing a candidate wheel in a fresh environment, add `--installed` to 
 Native ImageIO and Vision checks on generated, static images can run invisibly when they neither start AppKit nor capture the owner's screen. Existing `live_smoke.py`, `desktop_smoke.py`, and the development branch's `background_smoke.py` create real windows; none is suitable while an owner has prohibited visible or audible computer changes. Keep major desktop candidates unpublished until the required real acceptance can run within the owner's constraints.
 
 ## Real Mac verification
+
+On the isolated test Mac, explicitly turn **Other connections** On in Klyk's controls before running enabled native fixtures. Untagged fixture subprocesses use that environment. Do not change this switch on an owner's working Mac to make tests pass; use an isolated machine and return the switch Off afterward. The opt-in dedicated remote runner initializes only Other on first use after its permission preflight. Portable and silent checks keep their own disposable policy and require no owner switch changes.
 
 For a low-interruption pass, use the background-only suite:
 

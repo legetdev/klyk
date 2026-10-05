@@ -6,16 +6,23 @@ import ctypes
 import json
 import os
 from pathlib import Path
+import queue
 import runpy
 import subprocess
 import sys
 import threading
+import time
 
 
 def main():
     """Inhibit every active desktop boundary before importing the production entry point."""
-    inert_held_input = len(sys.argv) == 4 and sys.argv[3] == '--inert-held-input'
-    if sys.platform != 'darwin' or (len(sys.argv) != 3 and not inert_held_input):
+    options = sys.argv[3:]
+    inert_held_input = '--inert-held-input' in options
+    start_off = '--access-off' in options
+    pause_replies = '--pause-replies' in options
+    if (sys.platform != 'darwin' or len(sys.argv) < 3 or len(options) != len(set(options))
+            or set(options) - {'--inert-held-input', '--access-off', '--pause-replies'}
+            or (inert_held_input and start_off)):
         raise RuntimeError('This guarded child requires macOS, a source root, and a private work directory')
     source = Path(sys.argv[1]).resolve()
     work = Path(sys.argv[2]).resolve()
@@ -26,13 +33,20 @@ def main():
     os.environ['KLYK_OWNER_FILE'] = str(work / 'owner')
     os.environ['KLYK_UPDATE_CHECK'] = '0'
     os.environ['PYTHON_DOTENV_DISABLED'] = '1'
+    os.environ['KLYK_CLIENT'] = 'codex'
     audit = {'scope': 'real-entry protocol integration with inhibited desktop boundaries',
              'desktop_acceptance': False, 'blocked_attempts': [], 'permission_queries': [],
-             'substitutions': [], 'entry_completed': False}
+             'substitutions': [], 'entry_completed': False, 'started_access_off': start_off}
+    native_names = ('computer', 'capture', 'skylight', 'ocr', 'matcher')
+    audit_lock = threading.RLock()
 
     def save_audit():
         """Keep a private, content-free account of inhibited and attempted boundaries."""
-        (work / 'boundaries.json').write_text(json.dumps(audit, indent=2))
+        with audit_lock:
+            audit['loaded_native_modules'] = [name for name in native_names if f'klyk.{name}' in sys.modules]
+            temporary = work / 'boundaries.tmp'
+            temporary.write_text(json.dumps(audit, indent=2))
+            os.replace(temporary, work / 'boundaries.json')
 
     def forbidden(name):
         """Fail closed before any capture, input, activation, clipboard, or app-launch call."""
@@ -43,11 +57,11 @@ def main():
         return reject
 
     original_cdll = ctypes.CDLL
-    danger_prefixes = ('CGEventCreate', 'CGEventPost', 'CGEventTapCreate', 'CGWarpMouse',
+    danger_prefixes = ('CGEvent', 'CGWarpMouse',
                        'CGAssociateMouse', 'CGDisplayMoveCursor', 'CGDisplayHideCursor',
                        'CGDisplayShowCursor', 'CGDisplayCreateImage', 'CGWindowListCreateImage',
                        'CGRequest',
-                       'AXUIElementSetAttribute', 'AXUIElementPerformAction', 'SetFrontProcess',
+                       'AXUIElement', 'CGWindowListCopyWindowInfo', 'SetFrontProcess',
                        'SLEventPost', 'SLPS', '_SLPS')
     queried_permissions = {'AXIsProcessTrustedWithOptions', 'CGPreflightScreenCaptureAccess'}
 
@@ -74,6 +88,7 @@ def main():
                     native.argtypes = getattr(function, 'argtypes', native.argtypes)
                     result = native(*args, **kwargs)
                     audit['permission_queries'].append({'api': name, 'allowed': bool(result)})
+                    save_audit()
                     return result
             else:
                 return getattr(self.library, name)
@@ -85,6 +100,7 @@ def main():
     original_import = builtins.__import__
     real_nsapp = []
     guarded_frameworks = set()
+    guarded_runtime = set()
     guarded_ui_names = {'NSApplication', 'NSWindow', 'NSPanel', 'NSStatusBar', 'NSStatusItem',
                         'NSPasteboard', 'NSSound', 'NSWorkspace', 'NSEvent', 'NSCursor',
                         'NSAlert', 'NSOpenPanel', 'NSSavePanel', 'NSMenu', 'NSMenuItem', 'NSApp'}
@@ -139,13 +155,32 @@ def main():
                     setattr(framework, api_name, GuardedUIClass(f'{framework_name}.{api_name}'))
             audit['substitutions'].append(f'{framework_name} active capture/input/permission-request entry points')
             save_audit()
+        for module_name in native_names:
+            module = sys.modules.get(f'klyk.{module_name}')
+            if (module is None or module_name in guarded_runtime
+                    or getattr(module.__spec__, '_initializing', False)):
+                continue
+            guarded_runtime.add(module_name)
+            if module_name == 'capture':
+                for method in ('take_screenshot', 'take_display_screenshot'):
+                    if hasattr(module, method):
+                        setattr(module, method, forbidden(f'capture.{method}'))
+            elif module_name == 'computer':
+                for method in ('_snapshot_pasteboard', '_restore_pasteboard', 'activate_app'):
+                    setattr(module, method, forbidden(f'computer.{method}'))
+                if inert_held_input:
+                    prepare_held_input(module)
+            elif module_name == 'skylight':
+                module.is_available = lambda: False
+                audit['substitutions'].append('SkyLight availability, inhibiting its window/input self-test')
+            save_audit()
         return result
 
     builtins.__import__ = guarded_import
     original_start = threading.Thread.start
 
     def guarded_start(thread):
-        """Replace only the import-time global event-tap thread, retaining real SDK workers."""
+        """Inhibit the global event-tap thread while retaining real SDK and policy workers."""
         if thread.name == 'klyk-stop':
             audit['substitutions'].append('global emergency-stop event tap')
             return
@@ -173,17 +208,55 @@ def main():
     os.system = forbidden('os.system')
     os.startfile = forbidden('os.startfile')
 
-    from klyk import computer, capture, logs, skylight, ui_thread
+    from klyk import connection_gate, connection_policy, controls, logs, ui_thread
+    # Only this external adapter redirects policy; production accepts no test-path flag.
+    connection_policy.policy_path = lambda: work / 'connections.json'
+    connection_policy.initialize()
+    if not start_off:
+        connection_policy.set_enabled('codex', True)
     audit['loaded_package_path'] = sys.modules['klyk'].__file__
+    audit['isolated_policy_path'] = str(connection_policy.policy_path())
+    audit['startup_native_modules'] = [name for name in native_names if f'klyk.{name}' in sys.modules]
     original_logging = logs.configure_logging
     logs.configure_logging = lambda *args, **kwargs: original_logging(str(work / 'klyk.log'))
-    for method in ('take_screenshot', 'take_display_screenshot'):
-        if hasattr(capture, method):
-            setattr(capture, method, forbidden(f'capture.{method}'))
-    for method in ('_snapshot_pasteboard', '_restore_pasteboard', 'activate_app'):
-        setattr(computer, method, forbidden(f'computer.{method}'))
 
-    if inert_held_input:
+    def inert_controls_start():
+        """Keep the independent controls launcher thread, replacing only its UI process start."""
+        audit['controls_launch_inhibited'] = True
+        save_audit()
+        return True
+
+    controls.start_background = inert_controls_start
+    audit['substitutions'].append('independent UI-only controls process launcher')
+    if pause_replies:
+        original_write = connection_gate.GuardedWriter.write
+        paused = [False]
+
+        def pause_before_real_writer(writer, text):
+            """Hold one completed tool frame before the unchanged final generation check."""
+            if not paused[0] and (work / 'pause-next-tool-reply').is_file():
+                try:
+                    message = json.loads(text)
+                    is_tool_reply = isinstance(message.get('result', {}).get('content'), list)
+                except (ValueError, TypeError, AttributeError):
+                    is_tool_reply = False
+                if is_tool_reply:
+                    paused[0] = True
+                    audit['tool_reply_pauses'] = 1
+                    save_audit()
+                    (work / 'tool-reply-ready').write_text('ready')
+                    deadline = time.monotonic() + 8
+                    while not (work / 'release-tool-reply').is_file():
+                        if time.monotonic() >= deadline:
+                            raise TimeoutError('The external pre-write barrier was not released')
+                        threading.Event().wait(0.005)
+            return original_write(writer, text)
+
+        connection_gate.GuardedWriter.write = pause_before_real_writer
+        audit['substitutions'].append('private one-frame barrier before the unchanged final stdout generation check')
+
+    def prepare_held_input(computer):
+        """Seed only inert callbacks once lazy initialization imports the real input registry."""
         def marker(phase, kind=None):
             """Record only inert callbacks, so hard-exit cleanup remains independently observable."""
             item = {'phase': phase, 'kind': kind, 'stop_active': computer.emergency_stop_active(),
@@ -206,26 +279,39 @@ def main():
         computer._flush_clipboard_restore = lambda: marker('clipboard_cleanup')
         audit['substitutions'].append('inert held-input callbacks and clipboard cleanup marker')
 
-    # Replacing the UI coordinator keeps the real production bootstrap/SDK lifecycle intact.
+    # AppKit metadata is real; all active classes are guarded before production can use them.
+    import AppKit
+    guard_appkit(AppKit)
+
+    # Keep actual dispatch_sync generation checks, replacing only the native event-loop service.
     finished = threading.Event()
 
     def inert_install():
-        """Keep UI unavailable, so the real menu installer returns before creating a status item."""
+        """Permit the pure Python work queue without creating NSApplication or a menu item."""
+        ui_thread.ui._available = True
+        ui_thread.ui._ready_event.set()
         audit['substitutions'].append('AppKit main loop and status item')
         save_audit()
-        return False
+        return True
 
     def inert_loop():
-        """Wait for the real MCP worker to observe EOF without starting NSApplication."""
-        if not finished.wait(45):
-            raise TimeoutError('The real MCP worker did not stop within the test deadline')
+        """Service real guarded callbacks on main thread, with no Cocoa event processing."""
+        deadline = time.monotonic() + 45
+        while not finished.is_set():
+            if time.monotonic() >= deadline:
+                raise TimeoutError('The real MCP worker did not stop within the test deadline')
+            try:
+                callback = ui_thread.ui._queue.get(timeout=0.02)
+            except queue.Empty:
+                continue
+            callback()
+            save_audit()
 
     ui_thread.ui.install_on_main_thread = inert_install
     ui_thread.ui.run_blocking = inert_loop
     ui_thread.ui.shutdown = finished.set
-    skylight.is_available = lambda: False
-    audit['substitutions'].append('SkyLight availability, inhibiting its window/input self-test')
-    audit['substitutions'].append('private log and control-token paths; update check disabled')
+    ui_thread.ui.is_available = lambda: False
+    audit['substitutions'].append('private policy, log and control-token paths; update check disabled')
     audit['native_call_guard_installed'] = True
     save_audit()
     atexit.register(save_audit)

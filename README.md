@@ -55,14 +55,24 @@ klyk install
 
 `klyk install` is a turnkey first-run flow:
 
-1. Adds Klyk to `~/.claude.json` (so it appears in every Claude Code session).
+1. Adds Klyk to `~/.claude.json` and starts its small menu-bar controls. Computer access starts **Off** for every environment.
 2. Walks you through granting the two macOS permissions Klyk needs — opens the exact System Settings panes for **Accessibility** and **Screen Recording**, waits for you to add your terminal app, then **verifies the grant actually came through** before continuing.
-3. Runs a final `klyk doctor` pass to confirm every piece is green.
+3. Runs a final `klyk doctor` pass to verify setup and permissions. Input delivery remains untested while access is Off.
 4. Lists other detected AI clients. Use `klyk install --all` to configure them; verify permissions and the connection in each actual client.
 
 For clients that read a natural-language context file (Gemini CLI's `GEMINI.md`), `install --ambient` explicitly opts into a short, marked shell-fallback guide. Normal installation does not edit that file. The guide preserves surrounding content, is refreshed when `--ambient` is repeated, and is removable on uninstall.
 
-Restart Claude Code (or whichever MCP client you use) and klyk is live. Try `inspect Finder` to see it in action. To wire every detected client up front in one shot: `klyk install --all`.
+Restart Claude Code (or whichever MCP client you use), then turn its switch **On** in the Klyk menu bar. Try `inspect Finder` to see it in action. To configure every detected client in one shot: `klyk install --all`. Installation and repair preserve existing On/Off preferences.
+
+### Turn computer access on or off
+
+Click the Klyk switch icon in the menu bar. Codex, Claude Code and OpenCode each have their own switch; other configured clients also appear. **Off** blocks all Klyk tools for that environment, including screenshots, accessibility reads, clipboard operations and input. **On** permits normal use with the existing permissions, ownership checks and emergency stop. Connected clients stay connected, so switching does not require a restart.
+
+The settings are saved locally and shared by current Klyk installations under the same user account. New MCP connections start the controls in the background, including after a Mac restart. Run `klyk controls` to start them without waiting for a client connection. The panel stays closed until you click its icon; it never reads the screen or starts computer use itself. Quitting the controls leaves the saved access preferences in effect.
+
+Revocation cancels pending requests and rejects queued work and late replies. An operation already submitted to macOS may finish, and held keys/buttons or a temporarily borrowed clipboard are released/restored. Off cannot retract data already delivered to a client. Older Klyk versions do not enforce these switches and must be upgraded and restarted once.
+
+Generated client entries carry a `KLYK_CLIENT` environment tag. Untagged supported legacy launches use conservative parent-process identification; unknown launches use **Other connections**. A malformed explicit tag grants no access. These tags group trusted local connections; they are not authentication or protection against software running under your own account.
 
 **Troubleshooting: `klyk doctor`.** Run it any time something's off. Reports every dependency, permission, and config grant klyk needs as ✓ / ⚠ / ✗ with the exact next step on anything that's not green. `--json` gives a structured payload for tooling.
 
@@ -74,7 +84,7 @@ klyk update
 
 It detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected client that shares that installation loads the new version on its next tool call. Clients using pinned, bundled, or separate klyk installations need their own update.
 
-**Existing 0.5.x setups:** After upgrading, run `klyk doctor --fix` as a new command from the same installation, then restart your AI clients when ready. This migrates generated launch settings to `-P -m klyk.mcp_server` and clears inherited `PYTHONPATH`, so workspace files cannot replace the installed package. An updater started on the old version does not apply this repair automatically. Explicit custom `PYTHONPATH` remains a trusted override; customized TOML commands or arguments are preserved and require manual editing.
+**Existing setups:** After upgrading, run `klyk doctor --fix` as a new command from the same installation, then restart your AI clients when ready. This repairs generated launch settings to `-P -m klyk.mcp_server`, clears inherited `PYTHONPATH`, and adds the per-client `KLYK_CLIENT` tag. An updater started on an old version does not apply this repair automatically. Explicit custom `PYTHONPATH` remains a trusted override; customized TOML commands or arguments are preserved and require manual editing. Start `klyk controls` and explicitly enable the environments you want to use.
 
 You never have to wonder whether you're behind, either:
 
@@ -120,7 +130,7 @@ Klyk writes OpenCode's global local-MCP entry, so it is available in every works
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 
 ```json
-{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "" } } } }
+{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "", "KLYK_CLIENT": "other" } } } }
 ```
 
 Permissions, control ownership, and `klyk doctor` work identically regardless of which client launches klyk.
@@ -192,6 +202,7 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 | `matcher.py` | Pure-NumPy template matching (FFT + integral-image NCC) with template cache support |
 | `grader.py`, `reporter.py` | Verdict + UI grading helpers |
 | `clients.py`, `jsonc.py` | Multi-client setup plus atomic, comment-preserving OpenCode configuration |
+| `controls.py`, `connection_policy.py`, `connection_gate.py` | Native menu-bar access switches, private saved settings and live request revocation |
 | `updates.py` | Update awareness (daily cached PyPI check) + `klyk update` plumbing |
 | `keycodes.py`, `logs.py` | Low-level support |
 

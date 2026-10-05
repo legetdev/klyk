@@ -271,11 +271,15 @@ class SetupSecurityTests(unittest.TestCase):
 
     def test_doctor_uses_native_preflight_and_flags_missing_import_environment(self):
         """Diagnostics check permission without screenshots and detect incomplete launch hardening."""
-        capture = types.ModuleType("klyk.capture")
-        capture.check_screen_recording = mock.Mock()
-        with mock.patch.dict(sys.modules, {"klyk.capture": capture}), mock.patch.object(sys, "platform", "darwin"):
+        preflight = mock.Mock(return_value=True)
+        graphics = types.SimpleNamespace(CGPreflightScreenCaptureAccess=preflight)
+        with mock.patch.object(doctor.ctypes, "CDLL", return_value=graphics) as load, \
+             mock.patch.object(sys, "platform", "darwin"):
             self.assertEqual(doctor.check_screen_recording_permission().status, "ok")
-            capture.check_screen_recording.assert_called_once_with()
+            preflight.assert_called_once_with()
+            self.assertEqual(preflight.argtypes, [])
+            self.assertIs(preflight.restype, doctor.ctypes.c_bool)
+            load.assert_called_once_with("/System/Library/Frameworks/CoreGraphics.framework/CoreGraphics")
         with tempfile.TemporaryDirectory() as directory:
             client = replace(clients.get("cursor"), path=Path(directory) / "mcp.json")
             entry = {key: value for key, value in client.entry.items() if key != "env"}
@@ -310,7 +314,7 @@ class TomlMigrationTests(unittest.TestCase):
         expected = tomllib.loads(original)
         entry = expected["mcp_servers"]["klyk"]
         entry["args"] = ["-P", "-m", "klyk.mcp_server"]
-        entry["env"] = {"PYTHONPATH": "", **entry.get("env", {})}
+        entry["env"] = {"PYTHONPATH": "", **entry.get("env", {}), "KLYK_CLIENT": client.key}
         self.assertEqual(clients.write_entry(client), "updated")
         result = client.path.read_bytes()
         self.assertEqual(tomllib.loads(result.decode()), expected)
@@ -365,7 +369,7 @@ class TomlMigrationTests(unittest.TestCase):
             expected_text = source.replace('args = [\n', 'args = ["-P", \n', 1)
             expected_text = expected_text.replace(
                 '[mcp_servers.klyk.env] # real env\n',
-                '[mcp_servers.klyk.env] # real env\n"PYTHONPATH" = ""\n', 1)
+                '[mcp_servers.klyk.env] # real env\n"KLYK_CLIENT" = "codex"\n"PYTHONPATH" = ""\n', 1)
             self.assertEqual(result, expected_text)
 
     def test_inline_and_dotted_environment_settings_are_preserved(self):
@@ -393,7 +397,7 @@ class TomlMigrationTests(unittest.TestCase):
                        'KLYK_UPDATE_CHECK = "0"\n')
                 client, source = self._fixture(directory, extras=env)
                 result = self._assert_migrated(client, source)
-                self.assertTrue(result.endswith(env))
+                self.assertTrue(result.endswith(env.split("\n", 1)[1]))
                 self.assertEqual(clients.current_entry(client)["env"]["PYTHONPATH"], override)
 
     def test_differing_commands_or_custom_arguments_are_not_replaced(self):

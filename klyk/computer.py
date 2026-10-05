@@ -14,6 +14,7 @@ import threading
 import time
 
 from .keycodes import parse_key_combo, char_to_keycode, MODIFIER_FLAGS
+from . import connection_gate as _connection_gate
 
 # ---------------------------------------------------------------------------
 # Framework loading
@@ -270,6 +271,7 @@ _stop_lock        = threading.RLock()  # Signal cleanup may interrupt a stop che
 _worker_state = threading.local()
 _held_lock = threading.RLock()
 _held_inputs: dict[tuple, object] = {}
+_held_scopes: dict[tuple, object] = {}
 
 
 class EmergencyStop(RuntimeError):
@@ -281,7 +283,9 @@ def _begin_input(token: tuple, press, release) -> None:
     """Register release before a down event so exit cleanup cannot miss a held input."""
     with _held_lock:
         _check_stop()
+        request = _connection_gate.capture_scope()
         _held_inputs.setdefault(token, release)
+        _held_scopes.setdefault(token, request)
         try:
             press()
         except BaseException:
@@ -293,28 +297,33 @@ def _finish_input(token: tuple) -> bool:
     """Release one held input exactly once, even when stop or cancellation is active."""
     with _held_lock:
         release = _held_inputs.pop(token, None)
+        _held_scopes.pop(token, None)
         if release is None:
             return False
-        release()
+        with _connection_gate.cleanup():
+            release()
         return True
 
 
-def release_held_input() -> None:
-    """Halt new downs and release every held key/button before a hard process exit."""
-    with _stop_lock:
-        _stop_engaged[0] = True
+def release_held_input(*, engage_stop: bool = True, revoked_only: bool = False) -> None:
+    """Release registered input without turning an access switch into a physical stop."""
+    if engage_stop:
+        with _stop_lock:
+            _stop_engaged[0] = True
     with _held_lock:
-        pending = list(_held_inputs.values())
-        _held_inputs.clear()
-        for release in pending:
+        pending = [token for token in _held_inputs if not revoked_only
+                   or _held_scopes.get(token) is None
+                   or not _connection_gate.valid(_held_scopes[token])]
+        for token in pending:
             try:
-                release()
+                _finish_input(token)
             except Exception:
                 log.warning("A held input could not be released during exit cleanup.")
 
 
 def _check_stop() -> None:
     """Stop new input after a physical stop or cancellation of its owning request."""
+    _connection_gate.checkpoint()
     cancelled = getattr(_worker_state, 'cancelled', None)
     if cancelled is not None and cancelled.is_set():
         raise RuntimeError('Input request was cancelled; no further input will be sent.')
@@ -399,6 +408,7 @@ def _make_stop_callback():
     def _cb(proxy, etype, event, refcon):
         """Handle one event-tap notification without consuming the user's physical input."""
         try:
+            _connection_gate.checkpoint()
             if etype in (0xFFFFFFFE, 0xFFFFFFFF):
                 tap = _stop_tap[0]
                 if tap:
@@ -425,17 +435,39 @@ def _make_stop_callback():
 
 _tap_callback = _make_stop_callback()
 _stop_tap = [None]
+_stop_loop = [None]
+_stop_thread = [None]
+_stop_generation = [None]
+_tap_lock = threading.RLock()
 _cg.CGEventTapEnable.restype = None
 _cg.CGEventTapEnable.argtypes = [ctypes.c_void_p, ctypes.c_bool]
+_cf.CFRunLoopStop.restype = None
+_cf.CFRunLoopStop.argtypes = [ctypes.c_void_p]
+_cf.CFRunLoopRunInMode.restype = ctypes.c_int32
+_cf.CFRunLoopRunInMode.argtypes = [ctypes.c_void_p, ctypes.c_double, ctypes.c_bool]
 
 
 def _start_emergency_stop_tap() -> None:
-    """Install the listener on a daemon run loop and retain its handle for recovery."""
+    """Start one enabled-generation listener; Off removes it without clearing the latch."""
+    request = _connection_gate.Request(_connection_gate.policy.token())
+    with _tap_lock:
+        running = _stop_thread[0]
+        if running is not None and running.is_alive():
+            if _stop_generation[0] == request.token:
+                return
+    _stop_emergency_stop_tap()
+    with _tap_lock:
+        if _stop_thread[0] is not None and _stop_thread[0].is_alive():
+            raise RuntimeError("Klyk's previous listener is still stopping; retry shortly.")
+        _stop_generation[0] = request.token
+
     def _run():
         """Run the native listener without activating any application."""
         tap = src = rl = None
         try:
+            _connection_gate.checkpoint()
             common_modes = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopCommonModes").value
+            default_mode = ctypes.c_void_p.in_dll(_cf, "kCFRunLoopDefaultMode").value
             tap = _cg.CGEventTapCreate(
                 kCGSessionEventTap,
                 kCGHeadInsertEventTap,
@@ -447,32 +479,78 @@ def _start_emergency_stop_tap() -> None:
             if not tap:
                 log.warning("Emergency stop tap could not be created (Accessibility permission required)")
                 return
-            _stop_tap[0] = tap
+            with _tap_lock:
+                _stop_tap[0] = tap
             src = _cf.CFMachPortCreateRunLoopSource(None, ctypes.c_void_p(tap), 0)
             if not src:
                 log.warning("Emergency stop listener could not create its run-loop source.")
                 return
             rl  = _cf.CFRunLoopGetCurrent()
+            with _tap_lock:
+                _stop_loop[0] = rl
             _cf.CFRunLoopAddSource(ctypes.c_void_p(rl), ctypes.c_void_p(src), common_modes)
+            _connection_gate.checkpoint()
             log.info("Emergency stop tap active — Cmd+Shift+Escape will halt all input")
-            _cf.CFRunLoopRun()
+            # Stop can arrive before the native loop enters its first wait.
+            # Short runs make that early-stop race bounded without restarting stdio.
+            while _connection_gate.valid(request):
+                _cf.CFRunLoopRunInMode(default_mode, 0.05, False)
         except Exception as error:
             log.warning("Emergency stop listener failed (%s).", type(error).__name__)
         finally:
-            _stop_tap[0] = None
-            if src:
-                if rl:
-                    _cf.CFRunLoopRemoveSource(ctypes.c_void_p(rl), ctypes.c_void_p(src), common_modes)
-                _cf.CFRelease(ctypes.c_void_p(src))
-            if tap:
-                _cf.CFRelease(ctypes.c_void_p(tap))
+            with _tap_lock:
+                _stop_tap[0] = None
+                _stop_loop[0] = None
+                if src:
+                    if rl:
+                        _cf.CFRunLoopRemoveSource(ctypes.c_void_p(rl), ctypes.c_void_p(src), common_modes)
+                    _cf.CFRelease(ctypes.c_void_p(src))
+                if tap:
+                    _cf.CFRelease(ctypes.c_void_p(tap))
 
-    threading.Thread(target=_run, daemon=True, name="klyk-stop").start()
+    def _bound_run():
+        """Keep listener callbacks tied to their original enabled generation."""
+        with _connection_gate.scope(request):
+            _run()
+
+    with _tap_lock:
+        thread = threading.Thread(target=_bound_run, daemon=True, name="klyk-stop")
+        _stop_thread[0] = thread
+        thread.start()
+
+
+def _stop_emergency_stop_tap() -> None:
+    """Disable only our own listener and request bounded run-loop shutdown."""
+    with _tap_lock:
+        tap, loop, thread = _stop_tap[0], _stop_loop[0], _stop_thread[0]
+        # The listener clears/releases these handles under this same lock.
+        with _connection_gate.cleanup():
+            if tap:
+                _cg.CGEventTapEnable(ctypes.c_void_p(tap), False)
+            if loop:
+                _cf.CFRunLoopStop(ctypes.c_void_p(loop))
+    if thread is not None and thread is not threading.current_thread():
+        thread.join(timeout=0.1)
+
+
+def revoke_access() -> None:
+    """Drop revoked input/listening and borrowed clipboard state, preserving owner apps."""
+    release_held_input(engage_stop=False, revoked_only=True)
+    if _stop_generation[0] is not None and not _connection_gate.policy.allows(_stop_generation[0]):
+        _stop_emergency_stop_tap()
+    _flush_clipboard_restore(revoked_only=True)
 
 
 # ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
+
+def _run_process(*args, **kwargs):
+    """Do not begin a clipboard, menu or activation helper after access is revoked."""
+    _connection_gate.checkpoint()
+    # A paste must learn the completed write's change count before it restores
+    # borrowed state. Its caller and the worker still reject a revoked result.
+    return subprocess.run(*args, **kwargs)
 
 def _post(event_ptr: int) -> None:
     """Post and release one owned event; allocation failures must never reach native APIs."""
@@ -654,7 +732,7 @@ async def activate_app(pid: int) -> None:
     # Fallback: shortened osascript (no AXRaise, just frontmost)
     script = f'tell application "System Events" to set frontmost of (first process whose unix id is {pid}) to true'
     await run_input(
-        lambda: subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=3)
+        lambda: _run_process(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=3)
     )
     await asyncio.sleep(0.05)
 
@@ -2617,7 +2695,7 @@ def set_clipboard(text: str) -> None:
     _check_stop()
     # timeout so a contended/stuck pasteboard server (e.g. behind a modal sheet)
     # fails fast instead of hanging the tool for minutes (was unbounded).
-    subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+    _run_process(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
 
 
 def set_clipboard_image(image_path: str) -> str:
@@ -2628,7 +2706,7 @@ def set_clipboard_image(image_path: str) -> str:
     _check_stop()
     escaped = path.replace("\\", "\\\\").replace('"', '\\"')
     script = f'set the clipboard to (read (POSIX file "{escaped}") as «class PNGf»)'
-    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
+    result = _run_process(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"clipboard image write failed: {err}")
@@ -2638,7 +2716,7 @@ def set_clipboard_image(image_path: str) -> str:
 def get_clipboard() -> str:
     """Read clipboard text with a bounded subprocess timeout."""
     # timeout so a contended/stuck pasteboard server fails fast (was unbounded).
-    result = subprocess.run(["/usr/bin/pbpaste"], capture_output=True, check=True, timeout=5)
+    result = _run_process(["/usr/bin/pbpaste"], capture_output=True, check=True, timeout=5)
     return result.stdout.decode("utf-8", errors="replace")
 
 
@@ -2666,7 +2744,7 @@ def click_menu(pid: int, path: list[str]) -> None:
         f'tell application "System Events" to tell (first process whose unix id is {pid}) '
         f"to click {target}"
     )
-    result = subprocess.run(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
+    result = _run_process(["/usr/bin/osascript", "-e", script], capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         # AppleScript "Can't get menu item …" → the path was wrong.
@@ -2685,7 +2763,7 @@ def set_window_bounds(pid: int, x: int, y: int, width: int | None = None, height
         cmd.extend(["-e",
                     f'tell application "System Events" to tell (first process whose unix id is {pid}) '
                     f"to set size of window 1 to {{{width_expr}, {height_expr}}}"])
-    result = subprocess.run(cmd, capture_output=True, timeout=5)
+    result = _run_process(cmd, capture_output=True, timeout=5)
     if result.returncode != 0:
         err = result.stderr.decode("utf-8", errors="replace").strip()
         raise RuntimeError(f"set_window_bounds failed: {err}")
@@ -3566,6 +3644,7 @@ async def press_system_key(name: str) -> None:
 # the process exits inside the post-paste restore window. None = nothing pending.
 _clipboard_snapshot: list | None = None
 _clipboard_change_count: int | None = None
+_clipboard_scope = None
 
 
 def _snapshot_pasteboard() -> tuple[list, int] | None:
@@ -3576,17 +3655,25 @@ def _snapshot_pasteboard() -> tuple[list, int] | None:
     snapshot could not be captured; the caller then leaves the clipboard intact."""
     try:
         from AppKit import NSPasteboard, NSPasteboardItem  # lazy, like NSEvent
+        _connection_gate.checkpoint()
         pb = NSPasteboard.generalPasteboard()
+        _connection_gate.checkpoint()
         change_count = pb.changeCount()
         snapshot = []
+        _connection_gate.checkpoint()
         for item in (pb.pasteboardItems() or []):
+            _connection_gate.checkpoint()
             copy = NSPasteboardItem.alloc().init()
             for t in (item.types() or []):
+                _connection_gate.checkpoint()
                 data = item.dataForType_(t)
                 if data is not None:
                     copy.setData_forType_(data, t)
             snapshot.append(copy)
+        _connection_gate.checkpoint()
         return (snapshot, change_count) if pb.changeCount() == change_count else None
+    except _connection_gate.policy.AccessDisabled:
+        raise
     except Exception:
         return None
 
@@ -3598,6 +3685,7 @@ def _restore_pasteboard(snapshot: list | None) -> None:
     if snapshot is None:
         return
     try:
+        _connection_gate.checkpoint(allow_cleanup=True)
         from AppKit import NSPasteboard
         pb = NSPasteboard.generalPasteboard()
         pb.clearContents()
@@ -3607,19 +3695,22 @@ def _restore_pasteboard(snapshot: list | None) -> None:
         pass
 
 
-def _flush_clipboard_restore() -> None:
+def _flush_clipboard_restore(*, revoked_only: bool = False) -> None:
     """Best-effort synchronous restore for the narrow window where the process
     exits while a paste is awaiting clipboard restoration."""
-    global _clipboard_snapshot, _clipboard_change_count
+    global _clipboard_snapshot, _clipboard_change_count, _clipboard_scope
+    if revoked_only and _clipboard_scope is not None and _connection_gate.valid(_clipboard_scope):
+        return
     snapshot, change_count = _clipboard_snapshot, _clipboard_change_count
     # Detach pending state first so signal cleanup and atexit cannot restore twice.
-    _clipboard_snapshot = _clipboard_change_count = None
+    _clipboard_snapshot = _clipboard_change_count = _clipboard_scope = None
     if snapshot is None or change_count is None:
         return
     try:
-        from AppKit import NSPasteboard
-        if NSPasteboard.generalPasteboard().changeCount() == change_count:
-            _restore_pasteboard(snapshot)
+        with _connection_gate.cleanup():
+            from AppKit import NSPasteboard
+            if NSPasteboard.generalPasteboard().changeCount() == change_count:
+                _restore_pasteboard(snapshot)
     except Exception:
         pass
 
@@ -3630,7 +3721,7 @@ atexit.register(_flush_clipboard_restore)
 async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """Paste while preserving every clipboard type, including on failure or cancellation."""
     from AppKit import NSPasteboard
-    global _clipboard_snapshot, _clipboard_change_count
+    global _clipboard_snapshot, _clipboard_change_count, _clipboard_scope
     _check_stop()
     async with _input_lock:
         _check_stop()
@@ -3638,15 +3729,20 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
         if preserved is None:
             raise RuntimeError("Could not preserve the clipboard; use mode='keys' or try again.")
         snapshot, captured_count = preserved
+        _check_stop()
         pb = NSPasteboard.generalPasteboard()
+        _check_stop()
         change_count = pb.changeCount()
         if change_count != captured_count:
             raise RuntimeError("The clipboard changed before the paste; nothing was written. Try again or use mode='keys'.")
         _clipboard_snapshot = snapshot
+        _clipboard_scope = _connection_gate.capture_scope()
         _clipboard_change_count = None  # An in-flight pbcopy has no verified generation yet.
         try:
             _check_frontmost(expected_frontmost_pid)
-            subprocess.run(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            _run_process(["/usr/bin/pbcopy"], input=text.encode("utf-8"), check=True, timeout=5)
+            # A submitted pbcopy can finish after Off. Record only its generation
+            # so the borrowed clipboard can be restored; do not begin a paste.
             change_count = pb.changeCount()
             _clipboard_change_count = change_count
             await asyncio.sleep(0.005)
@@ -3657,10 +3753,10 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
             await asyncio.sleep(0.15)
         finally:
             # A real copy made by the user during the paste takes precedence.
-            if pb.changeCount() == change_count:
-                _restore_pasteboard(snapshot)
-            _clipboard_snapshot = None
-            _clipboard_change_count = None
+            with _connection_gate.cleanup():
+                if pb.changeCount() == change_count:
+                    _restore_pasteboard(snapshot)
+            _clipboard_snapshot = _clipboard_change_count = _clipboard_scope = None
 
 
 async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
@@ -3839,5 +3935,7 @@ async def scroll(x: int, y: int, direction: str, amount: int, modifiers: list[st
         _post(ev)
 
 
-# Start global emergency stop listener on import
-_start_emergency_stop_tap()
+# OS reads and posts are always generation-checked; CF release remains available.
+# The emergency listener starts explicitly only after the environment is enabled.
+_cg = _connection_gate.protect_library(_cg)
+_appserv = _connection_gate.protect_library(_appserv)

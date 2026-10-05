@@ -150,7 +150,7 @@ class ClientAdapterTests(unittest.TestCase):
             self.assertEqual(legacy.read_bytes(), original)
             migrated = clients.current_entry(client)
             self.assertEqual(migrated["command"], client.entry["command"])
-            self.assertEqual(migrated["env"], {"PYTHONPATH": "", **custom["env"]})
+            self.assertEqual(migrated["env"], {**client.entry["env"], **custom["env"]})
             self.assertEqual(migrated["enabledTools"], custom["enabledTools"])
             self.assertEqual(clients.write_entry(client), "unchanged")
             with mock.patch.object(clients, "CLIENTS", {"antigravity": client}):
@@ -173,7 +173,7 @@ class ClientAdapterTests(unittest.TestCase):
             self.assertEqual(updated["setting"], data["setting"])
             self.assertEqual(updated["mcpServers"]["other"], data["mcpServers"]["other"])
             self.assertTrue(updated["mcpServers"]["klyk"]["disabled"])
-            self.assertEqual(updated["mcpServers"]["klyk"]["env"], {"PYTHONPATH": "", "CUSTOM": "keep"})
+            self.assertEqual(updated["mcpServers"]["klyk"]["env"], {**client.entry["env"], "CUSTOM": "keep"})
             self.assertEqual(client.path.stat().st_mode & 0o777, 0o640)
             original = client.path.read_bytes()
             with mock.patch.object(clients, "legacy_antigravity_entry", side_effect=AssertionError("must not read legacy")):
@@ -342,7 +342,7 @@ class ClientAdapterTests(unittest.TestCase):
             written = selected.read_bytes()
             updated = clients.current_entry(client)
             self.assertEqual(updated["command"], client.entry["command"])
-            self.assertEqual(updated["environment"], {"PYTHONPATH": "", **native["environment"]})
+            self.assertEqual(updated["environment"], {**client.entry["environment"], **native["environment"]})
             for key in ("disabled", "cwd", "codemode", "timeout", "protocol"):
                 self.assertEqual(updated[key], native[key])
             self.assertIn(b"// Keep caf\xc3\xa9\r\n", written)
@@ -454,10 +454,11 @@ class ClientAdapterTests(unittest.TestCase):
             client.path.write_text(json.dumps({"mcpServers": {"klyk": old, "other": {"keep": True}}}))
             self.assertEqual(clients.write_entry(client), "updated")
             entry = clients.current_entry(client)
-            for key in ("disabled", "env", "disabledTools", "timeout"):
+            for key in ("disabled", "disabledTools", "timeout"):
                 self.assertEqual(entry[key], old[key])
+            self.assertEqual(entry["env"], {**old["env"], "KLYK_CLIENT": "cursor"})
             self.assertEqual(entry["args"], ["-P", "-m", "klyk.mcp_server"])
-            self.assertEqual(client.entry["env"], {"PYTHONPATH": ""})
+            self.assertEqual(client.entry["env"], {"PYTHONPATH": "", "KLYK_CLIENT": "cursor"})
 
     def test_strict_json_rejects_ambiguous_and_nonfinite_settings(self) -> None:
         """Ambiguous values fail without modifying existing credential-bearing files."""
@@ -593,7 +594,7 @@ class ClientAdapterTests(unittest.TestCase):
                      "env": {"PYTHONPATH": "", "LABEL": "café 🔒"}}
             client = replace(clients.get("codex"), path=Path(directory) / "config.toml", entry=entry)
             self.assertEqual(clients.write_entry(client), "added")
-            self.assertEqual(clients.current_entry(client), entry)
+            self.assertEqual(clients.current_entry(client), client.entry)
 
 
 if __name__ == "__main__":
