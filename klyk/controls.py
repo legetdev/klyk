@@ -246,7 +246,7 @@ class Controls:
         self._popover.setContentSize_((width, height))
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
         button = self._item.button()
-        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("switch.2", "Klyk controls")
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("cursorarrow.click.2", "Klyk controls")
         if image is not None:
             image.setTemplate_(True)
             button.setImage_(image)
