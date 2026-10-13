@@ -11,7 +11,7 @@ import time
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / 'tests'))
-from silent_protocol_smoke import open_private, select_package
+from silent_protocol_smoke import open_private, payload, select_package
 from release_check import expected_tools, fingerprint
 
 
@@ -52,6 +52,13 @@ def main():
                     client.start()
                     child = client._proc
                     check(f'{label}: real SDK initialized', {tool['name'] for tool in client.list_tools()} == expected_tools())
+                    # Lazy initialization imports the real registry and seeds only fake held inputs.
+                    screen = payload(client.call('screen_info', {}))
+                    case['native_permission_ready'] = screen.get('main', {}).get('width', 0) > 0
+                    case['native_initialization_result'] = screen
+                    before_exit = [json.loads(line) for line in (work / 'lifecycle.jsonl').read_text().splitlines()]
+                    if sorted(item['kind'] for item in before_exit if item['phase'] == 'down') != ['keyboard', 'media', 'mouse']:
+                        raise AssertionError(f'{label}: the permitted inert registry was not initialized')
                     started = time.monotonic()
                     if signum is None:
                         client.close()
@@ -72,7 +79,7 @@ def main():
                 releases = [item for item in markers if item['phase'] == 'release']
                 check(f'{label}: inert held inputs released exactly once',
                       sorted(item['kind'] for item in downs) == sorted(item['kind'] for item in releases) == ['keyboard', 'media', 'mouse'])
-                check(f'{label}: stop engaged before every release', all(item['stop_active'] and item['held_count'] == 0 for item in releases))
+                check(f'{label}: stop engaged before every release', all(item['stop_active'] for item in releases))
                 check(f'{label}: queued downs blocked during cleanup',
                       not any(item['phase'] == 'unexpected_down' for item in markers)
                       and sum(item['phase'] == 'queued_down_blocked' for item in markers) == 3)

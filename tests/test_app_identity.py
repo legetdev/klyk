@@ -90,6 +90,7 @@ class AppIdentityTests(unittest.TestCase):
         ns = {
             "__builtins__": native_builtins,
             "_validate_app_identifier": lambda value, field: None,
+            "_check_request_access": lambda: None,
         }
         load_functions("launcher.py", {"_quick_pid_for_app"}, ns)
         return ns["_quick_pid_for_app"]
@@ -135,6 +136,7 @@ class AppIdentityTests(unittest.TestCase):
         """A native discovery error must stop launch before any open command."""
         popen = MagicMock()
         ns = {
+            "_check_request_access": lambda: None,
             "_quick_pid_for_app": MagicMock(side_effect=RuntimeError("lookup failed")),
             "subprocess": SimpleNamespace(Popen=popen),
             "_find_pid_for_app": MagicMock(),
@@ -151,7 +153,8 @@ class AppIdentityTests(unittest.TestCase):
         """An immediately registered app returns without a launch sleep or another open."""
         clock = SimpleNamespace(monotonic=lambda: 1.0, sleep=MagicMock())
         popen = MagicMock()
-        ns = {"time": clock, "subprocess": SimpleNamespace(Popen=popen),
+        ns = {"_check_request_access": lambda: None,
+              "time": clock, "subprocess": SimpleNamespace(Popen=popen),
               "_quick_pid_for_app": MagicMock(side_effect=[None, 321]),
               "CHROMIUM_BROWSERS": {"Chromium"}}
         load_functions("launcher.py", {"launch_native_app", "_find_pid_for_app"}, ns)
@@ -170,7 +173,8 @@ class AppIdentityTests(unittest.TestCase):
             intervals.append(seconds)
             now[0] += seconds
 
-        ns = {"time": SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
+        ns = {"_check_request_access": lambda: None,
+              "time": SimpleNamespace(monotonic=lambda: now[0], sleep=sleep),
               "_quick_pid_for_app": MagicMock(return_value=None)}
         load_functions("launcher.py", {"_find_pid_for_app"}, ns)
 
@@ -182,7 +186,7 @@ class AppIdentityTests(unittest.TestCase):
     def test_registration_error_stops_polling_without_retry(self):
         """Ambiguous or failed identity lookup is never treated as absent registration."""
         clock = SimpleNamespace(monotonic=lambda: 1.0, sleep=MagicMock())
-        ns = {"time": clock,
+        ns = {"_check_request_access": lambda: None, "time": clock,
               "_quick_pid_for_app": MagicMock(side_effect=RuntimeError("ambiguous app"))}
         load_functions("launcher.py", {"_find_pid_for_app"}, ns)
 

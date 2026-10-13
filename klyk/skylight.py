@@ -57,10 +57,14 @@ from __future__ import annotations
 
 import ctypes
 import ctypes.util
+import asyncio
 import logging
 import struct
+import threading
 import time
 from ctypes import c_double, c_int32, c_int64, c_uint32, c_uint64, c_void_p
+
+from . import connection_gate as _connection_gate
 
 log = logging.getLogger("klyk.skylight")
 
@@ -418,7 +422,6 @@ def delivery_verified():
 # Self-test harness state. The AppKit sink/driver subclasses are defined lazily
 # (once per process) by _build_selftest_classes() so importing skylight stays a
 # pure-ctypes, AppKit-free operation until the self-test actually runs.
-_SELFTEST = {"hit": False, "pid": 0, "x": 0, "y": 0, "win": None, "w": 0, "app": None}
 _SINK_CLASS = None
 _DRIVER_CLASS = None
 
@@ -432,40 +435,50 @@ def _build_selftest_classes() -> None:
     from Foundation import NSObject
 
     class _SLSelfTestSink(NSView):
-        # acceptsFirstMouse → a click lands even when the window isn't key.
+        """Observe only delivery into this test's own retained offscreen window."""
+
         def acceptsFirstMouse_(self, _event):
+            """Allow the stamped click without activating or making the window key."""
             return True
 
         def mouseDown_(self, _event):
-            _SELFTEST["hit"] = True
+            """A stale sink callback must not verify a newer test generation."""
+            state = getattr(self, "_klyk_selftest", None)
+            if (state and state["active"] and not state["cancelled"].is_set()
+                    and _connection_gate.valid(state["request"])):
+                state["hit"] = True
 
     class _SLSelfTestDriver(NSObject):
-        # Fired by a timer once the run loop is live: resolve the window id
-        # (valid only once the window is actually on-screen under app.run())
-        # and post the stamped click through the real delivery path.
+        """Retain the original request through native timer callbacks and cleanup."""
+
         def post_(self, _timer):
+            """Post only to the retained own window while its request is still valid."""
+            state = getattr(self, "_klyk_selftest", None)
+            if not state or not state["active"] or state["cancelled"].is_set():
+                return
             try:
-                win = _SELFTEST.get("win")
-                wid = int(win.windowNumber()) if win is not None else 0
-                if wid <= 0:
-                    from . import capture
-                    for w in capture._list_all_windows():
-                        if w["pid"] == _SELFTEST["pid"] and abs(
-                            w["bounds"]["Width"] - _SELFTEST["w"]
-                        ) < 2:
-                            wid = w["window_id"]
-                            break
-                if wid > 0:
-                    post_mouse_click(
-                        _SELFTEST["pid"], wid, _SELFTEST["x"], _SELFTEST["y"]
-                    )
-            except Exception as e:  # never let a timer callback escape
-                log.warning("skylight.self_test post: %s: %s", type(e).__name__, e)
+                with _connection_gate.scope(state["request"]):
+                    _connection_gate.checkpoint()
+                    win = state["win"]
+                    wid = int(win.windowNumber()) if win is not None else 0
+                    _connection_gate.checkpoint()
+                    if wid > 0 and not state["cancelled"].is_set():
+                        state["sent"] = bool(post_mouse_click(state["pid"], wid, state["x"], state["y"]))
+            except _connection_gate.policy.AccessDisabled:
+                pass
+            except Exception as error:
+                log.warning("skylight.self_test post failed (%s)", type(error).__name__)
 
         def finish_(self, _timer):
-            app = _SELFTEST.get("app")
-            if app is None:
+            """Close this sink; only a standalone test may stop its own application loop."""
+            state = getattr(self, "_klyk_selftest", None)
+            if state is None:
                 return
+            if not state["own_loop"] or not state["active"]:
+                _close_self_test(state)
+                return
+            state["done"].set()
+            app = state["app"]
             # -[NSApplication stop:] only takes effect when run() next pulls an
             # event from the queue. Post a no-op application-defined event so the
             # loop wakes immediately and returns — without this, run() hangs
@@ -481,100 +494,186 @@ def _build_selftest_classes() -> None:
                     _APPDEF, NSMakePoint(0, 0), 0, 0.0, 0, None, 0, 0, 0
                 )
                 app.postEvent_atStart_(ev, True)
-            except Exception as e:
-                log.warning("skylight.self_test finish: %s: %s", type(e).__name__, e)
+            except Exception as error:
+                log.warning("skylight.self_test finish failed (%s)", type(error).__name__)
 
     _SINK_CLASS = _SLSelfTestSink
     _DRIVER_CLASS = _SLSelfTestDriver
 
 
-def self_test(timeout: float = 0.6) -> bool:
-    """
-    Verify that SkyLight actually DELIVERS a stamped click — not merely that the
-    framework loaded. Creates an in-process AppKit sink window, drives a bounded
-    `NSApp.run()` loop (the only context in which the WindowServer routes posted
-    events — manual run-loop pumping does not register the window), posts a
-    stamped click to the sink through the same SLEventPostToPid path real clicks
-    use, and returns True only if the sink's view actually received the click.
+def _prepare_self_test(timeout: float, *, own_loop: bool, cancelled=None):
+    """Build one main-thread sink and timers without running or stopping AppKit."""
+    cancelled = cancelled if cancelled is not None else threading.Event()
+    if cancelled.is_set():
+        return None
+    request = _connection_gate.capture_scope()
 
-    Why this exists: is_available() only confirms the private symbols loaded. If
-    a macOS update keeps the symbols but changes delivery semantics or the
-    required field-stamping, SLEventPostToPid silently drops the event — no
-    exception, the post reports success, nothing lands. This self-test catches
-    that exact case on the user's real macOS build (see ARCHITECTURE.md →
-    "Known Limitations & Risks" → silent-delivery-failure gap).
+    def checkpoint():
+        """Reject task cancellation even before its permission generation is revoked."""
+        if cancelled.is_set():
+            raise RuntimeError("Delivery verification was cancelled.")
+        _connection_gate.checkpoint(request)
 
-    Must be called ON THE MAIN THREAD with no other `NSApp.run()` already active
-    (it runs its own bounded loop and stops it). The sink is never activated, so
-    the test does not steal focus or move the cursor — empirically an in-process
-    sink receives the stamped click while klyk stays a background accessory app.
-    Never raises; returns False on failure and records the verdict in
-    delivery_verified() for callers to gate the seamless path on.
-    """
-    global _DELIVERY_VERIFIED
+    if threading.current_thread() is not threading.main_thread():
+        raise RuntimeError("Delivery verification must initialize on the main thread.")
     if not _AVAILABLE:
-        _DELIVERY_VERIFIED = False
-        return False
-    try:
-        import os as _os
-        from AppKit import (
-            NSApplication, NSWindow, NSBackingStoreBuffered,
-            NSMakeRect,
-        )
-        from Foundation import NSTimer
-        from .ui_thread import ui
-        # Doctor also calls this without the MCP bootstrap. Both paths must
-        # finish AppKit launch without activating before creating the sink.
-        if not ui.install_on_main_thread():
-            raise RuntimeError("Background AppKit initialization is unavailable")
-        _build_selftest_classes()
-    except Exception as e:
-        # No AppKit / harness can't be built → verdict unknown (fail open)
-        # rather than downgrading the seamless path on a missing import.
-        log.warning("skylight.self_test: harness unavailable (%s)", e)
-        _DELIVERY_VERIFIED = None
-        return False
-
+        return None
+    import os
+    from AppKit import NSApplication, NSWindow, NSBackingStoreBuffered, NSMakeRect
+    from Foundation import NSTimer
+    from .ui_thread import ui
+    if not ui.install_on_main_thread():
+        raise RuntimeError("Background AppKit initialization is unavailable")
+    app = NSApplication.sharedApplication()
+    if bool(app.isRunning()) == own_loop:
+        raise RuntimeError("Use asynchronous delivery verification with the running AppKit loop.")
+    _build_selftest_classes()
     w, h = 200, 160
-    win = None
+    state = dict(hit=False, sent=False, request=request, cancelled=cancelled,
+                 active=True, closed=False, own_loop=own_loop,
+                 done=threading.Event(), pid=os.getpid(), x=w // 2, y=h // 2,
+                 win=None, app=app, driver=None, timers=[], duration=0.2 + max(0.2, timeout))
     try:
-        app = NSApplication.sharedApplication()
-        # Parked far off any display so it is never visible, yet still gets a
-        # real CG window number under app.run() and receives the stamped click
-        # (both verified empirically). No flash, no focus change at startup.
+        checkpoint()
+        # The retained sink stays far outside every display and is never activated.
         win = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
             NSMakeRect(-30000.0, -30000.0, w, h), 0, NSBackingStoreBuffered, False
         )
+        state["win"] = win
+        win.setReleasedWhenClosed_(False)  # Python retains the sink until exact main-thread cleanup.
+        checkpoint()
         win.setTitle_("__klyk_sl_selftest__")
-        win.setContentView_(_SINK_CLASS.alloc().initWithFrame_(NSMakeRect(0, 0, w, h)))
+        sink = _SINK_CLASS.alloc().initWithFrame_(NSMakeRect(0, 0, w, h))
+        sink._klyk_selftest = state
+        win.setContentView_(sink)
+        checkpoint()
         win.orderFrontRegardless()
-
-        _SELFTEST.update(
-            hit=False, pid=_os.getpid(), x=w // 2, y=h // 2, win=win, w=w, app=app,
-        )
         driver = _DRIVER_CLASS.alloc().init()
-        # Post shortly after the loop goes live; stop the loop after `timeout`.
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.2, driver, "post:", None, False
-        )
-        NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
-            0.2 + max(0.2, timeout), driver, "finish:", None, False
-        )
-        app.run()  # returns when finish_ calls app.stop_()
-        _DELIVERY_VERIFIED = bool(_SELFTEST["hit"])
-        return _SELFTEST["hit"]
-    except Exception as e:
-        log.warning("skylight.self_test: %s: %s", type(e).__name__, e)
+        driver._klyk_selftest = state
+        state["driver"] = driver
+        for interval, selector in ((0.2, "post:"), (state["duration"], "finish:")):
+            checkpoint()
+            state["timers"].append(NSTimer.scheduledTimerWithTimeInterval_target_selector_userInfo_repeats_(
+                interval, driver, selector, None, False))
+        checkpoint()
+        return state
+    except BaseException:
+        _close_self_test(state)
+        raise
+
+
+def _close_self_test(state) -> None:
+    """Invalidate and close only the owned sink; cleanup never stops the outer loop."""
+    if state["closed"]:
+        return
+    state["active"] = False
+    state["closed"] = True
+    for timer in state["timers"]:
+        try:
+            timer.invalidate()
+        except Exception:
+            pass
+    state["timers"].clear()
+    win, state["win"] = state["win"], None
+    state["driver"] = state["app"] = None
+    if win is not None:
+        try:
+            win.close()
+        except Exception:
+            pass
+    state["done"].set()
+
+
+def self_test(timeout: float = 0.6) -> bool:
+    """Verify own-sink delivery on the main thread only when no AppKit loop is running."""
+    global _DELIVERY_VERIFIED
+    state = None
+    try:
+        state = _prepare_self_test(timeout, own_loop=True)
+        if state is None:
+            _DELIVERY_VERIFIED = False
+            return False
+        state["app"].run()
+        _connection_gate.checkpoint(state["request"])
+        _DELIVERY_VERIFIED = True if state["hit"] else (False if state["sent"] and state["done"].is_set() else None)
+        return _DELIVERY_VERIFIED is True
+    except _connection_gate.policy.AccessDisabled:
+        _DELIVERY_VERIFIED = None
+        raise
+    except Exception as error:
+        log.warning("skylight.self_test unavailable (%s)", type(error).__name__)
         _DELIVERY_VERIFIED = None
         return False
     finally:
-        _SELFTEST["win"] = None
-        _SELFTEST["app"] = None
-        if win is not None:
+        if state is not None:
+            _close_self_test(state)
+
+
+async def self_test_async(timeout: float = 0.6) -> bool:
+    """Await own-sink delivery using the existing AppKit loop without running or stopping it."""
+    global _DELIVERY_VERIFIED
+    from .ui_thread import ui
+    _DELIVERY_VERIFIED = None
+    request = _connection_gate.capture_scope()
+    prepared = []
+    cancelled = threading.Event()
+
+    def prepare():
+        """Retain cleanup state even if revocation rejects the callback's late result."""
+        state = _prepare_self_test(timeout, own_loop=False, cancelled=cancelled)
+        if state is not None:
+            prepared.append(state)
+            if cancelled.is_set():
+                _close_self_test(state)
+        return state
+
+    try:
+        state = await asyncio.get_running_loop().run_in_executor(
+            None, lambda: ui.dispatch_sync(prepare, timeout=2.0))
+        if state is None:
+            _DELIVERY_VERIFIED = False
+            return False
+        deadline = time.monotonic() + state["duration"] + 0.1
+        while not state["done"].is_set() and not state["hit"] and time.monotonic() < deadline:
+            _connection_gate.checkpoint(request)
+            await asyncio.sleep(0.01)
+        _connection_gate.checkpoint(request)
+        _DELIVERY_VERIFIED = True if state["hit"] else (False if state["sent"] and state["done"].is_set() else None)
+        return _DELIVERY_VERIFIED is True
+    except _connection_gate.policy.AccessDisabled:
+        _DELIVERY_VERIFIED = None
+        raise
+    except asyncio.CancelledError:
+        _DELIVERY_VERIFIED = None
+        raise
+    except Exception as error:
+        log.warning("skylight.self_test unavailable (%s)", type(error).__name__)
+        _DELIVERY_VERIFIED = None
+        return False
+    finally:
+        # A cancelled await does not stop a running executor/UI callback. Close
+        # late preparation on that callback's main thread, and forbid its post.
+        cancelled.set()
+        for state in prepared:
+            state["active"] = False
+            if not state["closed"]:
+                # Only this retained sink/timer cleanup is independent of access.
+                # Its finish timer also closes it if the bounded UI queue is full.
+                ui.dispatch(lambda state=state: _close_self_test(state), guarded=False)
+        cleanup_deadline = time.monotonic() + 0.2
+        cleanup_cancelled = False
+        while any(not state["closed"] for state in prepared) and time.monotonic() < cleanup_deadline:
             try:
-                win.close()
-            except Exception:
-                pass
+                await asyncio.sleep(0.01)
+            except asyncio.CancelledError:
+                cleanup_cancelled = True
+                continue  # The already-queued own-sink cleanup must survive repeated cancellation.
+        if not _connection_gate.valid(request):
+            _DELIVERY_VERIFIED = None
+            _connection_gate.checkpoint(request)
+        if cleanup_cancelled:
+            _DELIVERY_VERIFIED = None
+            raise asyncio.CancelledError
 
 
 def post_mouse_click(

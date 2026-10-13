@@ -9,6 +9,8 @@ from collections import OrderedDict
 import threading
 import time
 
+from . import connection_gate as _connection_gate
+
 _lock = threading.RLock()
 _classes = None
 _plans = OrderedDict()
@@ -57,9 +59,11 @@ def _complete(start, deadline):
         result.extend((value, error))
         finished.set()
 
+    _connection_gate.checkpoint()
     start(receive)
     if not finished.wait(max(0.0, deadline - time.monotonic())):
         raise TimeoutError('Window screenshot timed out.')
+    _connection_gate.checkpoint()
     value, error = result
     if error is not None or value is None:
         raise RuntimeError(f'Window screenshot unavailable: {error or "empty native result"}')

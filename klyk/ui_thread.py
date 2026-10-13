@@ -33,7 +33,10 @@ import logging
 import queue
 import sys
 import threading
+import time
 from typing import Callable
+
+from . import connection_gate as _connection_gate
 
 log = logging.getLogger("klyk.ui")
 
@@ -53,7 +56,7 @@ class UIThread:
         self._installed = False
         self._ready_event = threading.Event()
         self._available = False
-        self._queue: queue.Queue[Callable[[], None]] = queue.Queue()
+        self._queue: queue.Queue[Callable[[], None]] = queue.Queue(maxsize=256)
         # AppKit objects — set on the main thread only.
         self._app = None
         self._drain_timer = None
@@ -170,7 +173,7 @@ class UIThread:
             except Exception as e:
                 log.warning("ui_thread.shutdown _stop raised: %s", e)
 
-        self.dispatch(_stop)
+        self.dispatch(_stop, guarded=False)
 
     # --- any-thread API --------------------------------------------------
 
@@ -180,40 +183,79 @@ class UIThread:
     def wait_ready(self, timeout: float = 2.0) -> bool:
         return self._ready_event.wait(timeout) and self._available
 
-    def dispatch(self, fn: Callable[[], None]) -> None:
+    def dispatch(self, fn: Callable[[], None], *, guarded: bool = True) -> bool:
         """
         Run fn on the AppKit main thread. Non-blocking. Silent no-op if
         the UI thread isn't installed — instrumentation must never break
         the calling tool (independent failure surfaces).
         """
         if not self._available:
-            return
+            return False
         try:
-            self._queue.put_nowait(fn)
-        except Exception:
-            pass
+            request = _connection_gate.capture_scope() if guarded else None
 
-    def dispatch_sync(self, fn: Callable[[], object], timeout: float = 2.0) -> object:
+            def _run():
+                """Drop stale computer callbacks while independent status UI stays usable."""
+                if request is None:
+                    fn()
+                    return
+                with _connection_gate.scope(request):
+                    _connection_gate.checkpoint()
+                    fn()
+
+            self._queue.put_nowait(_run)
+            return True
+        except Exception:
+            return False
+
+    def dispatch_sync(self, fn: Callable[[], object], timeout: float = 2.0,
+                      *, guarded: bool = True) -> object:
         """
         Run fn on the AppKit main thread, BLOCK until it returns or
         raises. Raises TimeoutError if the queue drain falls behind.
         """
         if not self._available:
             raise RuntimeError("ui_thread not available")
+        request = _connection_gate.capture_scope() if guarded else None
+        if threading.current_thread() is threading.main_thread():
+            if request is None:
+                return fn()
+            with _connection_gate.scope(request):
+                _connection_gate.checkpoint()
+                result = fn()
+                _connection_gate.checkpoint()
+                return result
         slot: list = [None, None]
         done = threading.Event()
+        cancelled = threading.Event()
 
         def _wrapper() -> None:
+            """A timed-out or revoked queue item must never run later on the main thread."""
             try:
-                slot[0] = fn()
+                if cancelled.is_set():
+                    return
+                if request is None:
+                    slot[0] = fn()
+                else:
+                    with _connection_gate.scope(request):
+                        _connection_gate.checkpoint()
+                        slot[0] = fn()
+                        _connection_gate.checkpoint()
             except Exception as e:
                 slot[1] = e
             finally:
                 done.set()
 
-        self.dispatch(_wrapper)
-        if not done.wait(timeout):
-            raise TimeoutError("ui_thread.dispatch_sync timeout")
+        if not self.dispatch(_wrapper, guarded=False):
+            raise RuntimeError("Klyk's main-thread work queue is full; retry shortly.")
+        deadline = time.monotonic() + timeout
+        while not done.wait(max(0, min(0.05, deadline - time.monotonic()))):
+            if request is not None and not _connection_gate.valid(request):
+                cancelled.set()
+                _connection_gate.checkpoint(request)
+            if time.monotonic() >= deadline:
+                cancelled.set()
+                raise TimeoutError("ui_thread.dispatch_sync timeout")
         if slot[1] is not None:
             raise slot[1]
         return slot[0]

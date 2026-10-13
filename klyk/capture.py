@@ -13,11 +13,21 @@ import subprocess
 import tempfile
 import time
 
+from . import connection_gate as _connection_gate
+
 from .image_bounds import (
     png_dimensions,
     validate_image_dimensions as _validate_image_dimensions,
     validated_png_bytes as _validated_png_bytes,
 )
+
+
+def _run_process(*args, **kwargs):
+    """Check permission before each external capture/conversion stage and its result."""
+    _connection_gate.checkpoint()
+    result = subprocess.run(*args, **kwargs)
+    _connection_gate.checkpoint()
+    return result
 
 # ---------------------------------------------------------------------------
 # Framework loading
@@ -174,6 +184,8 @@ try:
     _cg.CGDisplayModeGetWidth.argtypes = [ctypes.c_void_p]
     _cg.CGDisplayModeRelease.restype = None
     _cg.CGDisplayModeRelease.argtypes = [ctypes.c_void_p]
+    # Keep only this deallocator outside the access gate for an already-owned mode.
+    _release_display_mode = _cg.CGDisplayModeRelease
     _HAS_DISPLAY_MODE = True
 except AttributeError:
     _HAS_DISPLAY_MODE = False
@@ -572,21 +584,27 @@ def get_scale_factor() -> float:
             display = _cg.CGMainDisplayID()
             mode = _cg.CGDisplayCopyDisplayMode(display)
             if mode:
-                pixel_w = _cg.CGDisplayModeGetPixelWidth(mode)
-                logical_w = _cg.CGDisplayModeGetWidth(mode)
-                _cg.CGDisplayModeRelease(mode)
+                try:
+                    pixel_w = _cg.CGDisplayModeGetPixelWidth(mode)
+                    logical_w = _cg.CGDisplayModeGetWidth(mode)
+                finally:
+                    _release_display_mode(mode)
                 if logical_w > 0:
                     return float(pixel_w) / float(logical_w)
+        except _connection_gate.policy.AccessDisabled:
+            raise
         except Exception:
             pass
     try:
-        result = subprocess.run(
+        result = _run_process(
             ["/usr/sbin/system_profiler", "SPDisplaysDataType"],
             capture_output=True, text=True, timeout=10
         )
         output = result.stdout.lower()
         if "retina" in output or "hidpi" in output:
             return 2.0
+    except _connection_gate.policy.AccessDisabled:
+        raise
     except Exception:
         pass
     return 1.0
@@ -1224,8 +1242,10 @@ def take_screenshot(
         if logical_width is None or logical_height is None:
             raise ValueError("Window capture requires both width and height.")
         _validate_image_dimensions(logical_width, logical_height)
+    _connection_gate.checkpoint()
     if settle_ms > 0:
         time.sleep(settle_ms / 1000)
+    _connection_gate.checkpoint()
 
     if window_id and logical_width and logical_height and _HAS_IMAGEIO:
         try:
@@ -1256,7 +1276,7 @@ def take_screenshot(
         else:
             cmd = ["/usr/sbin/screencapture", "-x", "-t", "png", raw_path]
 
-        result = subprocess.run(cmd, capture_output=True, timeout=10)
+        result = _run_process(cmd, capture_output=True, timeout=10)
 
         if result.returncode != 0 or not os.path.exists(raw_path) or os.path.getsize(raw_path) < 33:
             # Never widen a failed window/region request to the whole desktop:
@@ -1267,7 +1287,7 @@ def take_screenshot(
             )
 
         if logical_width and logical_height:
-            subprocess.run(
+            _run_process(
                 ["/usr/bin/sips", "-z", str(logical_height), str(logical_width), raw_path, "--out", out_path],
                 capture_output=True, timeout=10, check=True
             )
@@ -1275,7 +1295,7 @@ def take_screenshot(
             final_w, final_h = logical_width, logical_height
         else:
             scale = get_scale_factor()
-            info = subprocess.run(
+            info = _run_process(
                 ["/usr/bin/sips", "-g", "pixelWidth", "-g", "pixelHeight", raw_path],
                 capture_output=True, text=True, timeout=10, check=True
             )
@@ -1283,7 +1303,7 @@ def take_screenshot(
             final_w = int(pw / scale)
             final_h = int(ph / scale)
             if scale > 1.0:
-                subprocess.run(
+                _run_process(
                     ["/usr/bin/sips", "-Z", str(max(final_w, final_h)), raw_path, "--out", out_path],
                     capture_output=True, timeout=10, check=True
                 )
@@ -1338,3 +1358,8 @@ def check_screen_recording() -> None:
             "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
             "Then run `klyk doctor` and restart the affected client process."
         )
+
+
+# Native screen/window reads recheck the request even inside a running worker.
+_cg = _connection_gate.protect_library(_cg)
+_appserv = _connection_gate.protect_library(_appserv)

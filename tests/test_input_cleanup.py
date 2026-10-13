@@ -2,6 +2,8 @@
 import ast
 import asyncio
 import ctypes
+from concurrent.futures import ThreadPoolExecutor
+from contextlib import nullcontext
 from pathlib import Path
 import sys
 import threading
@@ -9,14 +11,30 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock, patch
 
+from klyk import connection_gate
+
+
+def enabled_gate():
+    """Keep legacy native-adapter tests enabled; policy tests supply the real isolated gate."""
+    return SimpleNamespace(checkpoint=lambda *args, **kwargs: None,
+        capture_scope=lambda: None, current_scope=lambda: None, valid=lambda value: True,
+        request=nullcontext, scope=lambda value: nullcontext(value), cleanup=nullcontext,
+        protect_library=lambda library: library, GateExecutor=ThreadPoolExecutor,
+        bind_response=lambda *args: None,
+        policy=SimpleNamespace(AccessDisabled=connection_gate.policy.AccessDisabled),
+        blocked_payload=connection_gate.blocked_payload)
+
 
 def load_functions(filename,names,namespace):
     """Compile unchanged functions with event bindings supplied by each test."""
     path=Path(__file__).resolve().parents[1]/'klyk'/filename
     tree=ast.parse(path.read_text())
     functions={n.name:n for n in tree.body if isinstance(n,(ast.FunctionDef,ast.AsyncFunctionDef))}
+    namespace.setdefault('_connection_gate',enabled_gate())
+    namespace.setdefault('connection_gate',namespace['_connection_gate'])
     namespace.setdefault('_held_lock',threading.RLock())
     namespace.setdefault('_held_inputs',{})
+    namespace.setdefault('_held_scopes',{})
     namespace.setdefault('_check_stop',lambda:None)
     namespace.setdefault('is_frontmost_app',lambda pid:False)
     namespace.setdefault('kCGMouseEventClickState',1)

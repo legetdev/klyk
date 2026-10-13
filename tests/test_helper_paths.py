@@ -8,6 +8,8 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
+from test_input_cleanup import load_functions
+
 ROOT = Path(__file__).resolve().parents[1]
 COMMANDS = {"open", "log", "osascript", "pbcopy", "pbpaste", "screencapture", "sips", "system_profiler"}
 
@@ -39,7 +41,7 @@ class HelperPathTests(unittest.TestCase):
                 return subprocess.CompletedProcess(command, 0, stdout=b"SAFE_NATIVE_RESULT", stderr=b"")
 
             namespace = {"subprocess": SimpleNamespace(run=run), "_check_stop": lambda: None}
-            exec(compile(ast.Module(body=functions, type_ignores=[]), "<unchanged clipboard helpers>", "exec"), namespace)
+            load_functions("computer.py", {"get_clipboard", "set_clipboard"}, namespace)
             with patch.dict(os.environ, {"PATH": directory}):
                 self.assertEqual(namespace["get_clipboard"](), "SAFE_NATIVE_RESULT")
                 namespace["set_clipboard"]("synthetic clipboard sentinel")
@@ -57,8 +59,9 @@ class HelperPathTests(unittest.TestCase):
                     continue
                 parent = parents.get(node)
                 direct = (isinstance(parent, ast.Call) and parent.args and parent.args[0] is node
-                          and isinstance(parent.func, ast.Attribute)
-                          and isinstance(parent.func.value, ast.Name) and parent.func.value.id == "subprocess")
+                          and ((isinstance(parent.func, ast.Attribute)
+                                and isinstance(parent.func.value, ast.Name) and parent.func.value.id == "subprocess")
+                               or (isinstance(parent.func, ast.Name) and parent.func.id == "_run_process")))
                 assigned = (isinstance(parent, ast.Assign) and any(isinstance(target, ast.Name)
                             and target.id in {"cmd", "command", "argv"} for target in parent.targets))
                 if not direct and not assigned:
