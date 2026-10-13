@@ -32,7 +32,7 @@ The separate native menu-bar controls persist access under `~/.klyk/connections.
 
 An operation already submitted to macOS may finish. Cleanup may release previously held input or restore a borrowed clipboard. Data already returned to a client cannot be withdrawn. Off does not close target apps or clear the physical emergency latch. Old versions must be upgraded and restarted once; they do not honor this policy.
 
-`KLYK_CLIENT` tags and conservative legacy parent identification group trusted local clients. They are not cryptographic identity: a process running as the same user can change the private file, choose a tag or bypass Klyk entirely. No MCP tool changes these switches, but an agent with separate shell access under the same account can edit them. The switches are a durable owner convenience and runtime refusal inside the existing trusted-local model, not an OS sandbox or a guarantee against prompt injection.
+`KLYK_CLIENT` tags and conservative legacy parent identification group trusted local clients. They are not cryptographic identity: a process running as the same user can change the private file, choose a tag or bypass Klyk entirely. No MCP tool changes these switches, but an agent with separate shell access under the same account can edit them. A reply that already passed its final access check when the switch turns Off is still delivered; anything captured after the switch is refused. The switches are a durable owner convenience and runtime refusal inside the existing trusted-local model, not an OS sandbox or a guarantee against prompt injection.
 
 ## Prompt injection & the confused-deputy risk
 

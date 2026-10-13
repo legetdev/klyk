@@ -230,6 +230,8 @@ class GuardedWriter:
                 _responses.pop(key, None)
             # A duplicate id remains poisoned for this transport. Removing it
             # after the first reply would let the other unidentified reply pass.
+        # Deliberate boundary: a reply valid here counts as delivered before any later Off.
+        # Holding Off saves until a stalled client drains stdout would let it block revocation.
         if value is not missing and (value is None or not valid(value)):
             message = {"jsonrpc": "2.0", "id": message.get("id"), "result": {
                 "content": [{"type": "text", "text": json.dumps(blocked_payload())}],
