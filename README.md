@@ -130,7 +130,7 @@ Klyk writes OpenCode's global local-MCP entry, so it is available in every works
 Any other MCP client works too — klyk speaks MCP natively. Add this entry to its config wherever it lives — use the **full path to the Python klyk is installed in** as `command` (run `python -c "import sys;print(sys.executable)"` in that env; `klyk install` fills this in automatically). A bare `python3` only works if klyk is in your global Python:
 
 ```json
-{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "", "KLYK_CLIENT": "other" } } } }
+{ "mcpServers": { "klyk": { "command": "/path/to/python", "args": ["-P", "-m", "klyk.mcp_server"], "env": { "PYTHONPATH": "" } } } }
 ```
 
 Permissions, control ownership, and `klyk doctor` work identically regardless of which client launches klyk.

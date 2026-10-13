@@ -727,8 +727,9 @@ def _uninstall(rest: list[str]) -> None:
         if controls_were_running:
             print("  ✓ stopped the menu-bar controls")
     else:
-        file_failures = True
         print("  ✗ could not stop the menu-bar controls; quit them from the menu bar, then re-run")
+        print("\nNo state was removed.")
+        sys.exit(1)
     for b in ("klyk", "klyk-call"):
         f = home / ".local" / "bin" / b
         if f.is_symlink() or f.exists():

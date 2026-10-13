@@ -73,6 +73,8 @@ class Session:
     process_identity: dict | None = field(default=None, repr=False)
     _log_proc: object = field(default=None, repr=False)    # log stream watcher (native) or app proc (electron)
     _log_reader: StderrReader | None = field(default=None, repr=False)
+    # A native log stream stopped by revocation restarts only for a permitted request.
+    _log_stream_suspended: bool = field(default=False, repr=False)
 
 
 class SessionRegistry:

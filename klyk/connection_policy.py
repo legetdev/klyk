@@ -80,7 +80,21 @@ def _validated(data: object) -> dict:
     return data
 
 
+class _ReplacedDuringRead(ValueError):
+    """The settings file was atomically replaced while it was being read."""
+
+
 def _read() -> dict:
+    """Read the settings, rereading a file that an atomic save replaced mid-read."""
+    for _ in range(4):
+        try:
+            return _read_once()
+        except _ReplacedDuringRead:
+            continue  # A concurrent save is not a broken file; read its replacement.
+    return _read_once()
+
+
+def _read_once() -> dict:
     """Read only an owned private regular file, with no symlinks, hard links or FIFOs."""
     path = policy_path()
     try:
@@ -98,7 +112,7 @@ def _read() -> dict:
         present = path.stat(follow_symlinks=False)
         identity = lambda value: (value.st_dev, value.st_ino, value.st_size, value.st_mtime_ns)
         if len(raw) > _MAX_BYTES or identity(info) != identity(after) or identity(info) != identity(present):
-            raise ValueError("Connection settings changed while being read")
+            raise _ReplacedDuringRead("Connection settings changed while being read")
         return _validated(json.loads(raw.decode("utf-8"), object_pairs_hook=_pairs))
     finally:
         os.close(fd)

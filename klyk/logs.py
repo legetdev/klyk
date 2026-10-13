@@ -293,6 +293,7 @@ class StderrReader:
         # While paused the pipe is still drained, so the writer never blocks,
         # but nothing is retained: output from a revoked interval is never stored.
         self._paused = threading.Event()
+        self._resume = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -307,6 +308,21 @@ class StderrReader:
                 os.set_blocking(fd, False)
             records = LogRecordBuffer()
             while not self._stop.is_set():
+                if self._paused.is_set() and self._resume.is_set():
+                    # Barrier: discard everything already queued before collecting again.
+                    ended = False
+                    while fd is not None and select.select([fd], [], [], 0)[0]:
+                        try:
+                            if not os.read(fd, 65536):
+                                ended = True
+                                break
+                        except BlockingIOError:
+                            break
+                    records = LogRecordBuffer()
+                    self._resume.clear()
+                    self._paused.clear()
+                    if ended:
+                        break
                 if fd is None:
                     raw = self._pipe.readline(_LOG_LINE_CAP + 1)
                 else:
@@ -340,11 +356,18 @@ class StderrReader:
 
     def pause(self) -> None:
         """Keep draining the pipe but discard everything until resumed."""
+        self._resume.clear()
         self._paused.set()
 
     def resume(self) -> None:
-        """Retain new output again for a currently permitted request."""
-        self._paused.clear()
+        """Retain output again once the reader has dropped every byte queued while paused."""
+        if self._paused.is_set():
+            self._resume.set()
+
+    @property
+    def paused(self) -> bool:
+        """True until the reader has passed the resume barrier."""
+        return self._paused.is_set()
 
     def stop(self) -> None:
         """Stop under a short bound without acquiring a blocked buffered-reader lock."""

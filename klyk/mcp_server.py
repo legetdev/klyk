@@ -27,7 +27,7 @@ import jsonschema as _jsonschema
 # ---------------------------------------------------------------------------
 
 LOG_PATH = os.path.expanduser("~/klyk.log")
-from .logs import configure_logging
+from .logs import StderrReader, configure_logging
 from .private_files import open_private
 
 log = configure_logging(LOG_PATH)
@@ -2926,7 +2926,10 @@ async def call_tool(
             async with _call_lock:
                 connection_gate.checkpoint()
                 for session in list(registry._sessions.values()):
-                    _set_session_logs(session, collecting=True)
+                    try:
+                        _set_session_logs(session, collecting=True)
+                    except Exception as error:
+                        log.warning("session logs not resumed (%s)", type(error).__name__)
                 token = _call_context.set(task)
                 try:
                     result = await _execute_tool(name, arguments)
@@ -6084,18 +6087,50 @@ def _on_access_revoked() -> bool:
     for session in list(registry._sessions.values()):
         session.template_cache.clear()
         session.last_grade = None
-        _set_session_logs(session, collecting=False)
+        try:
+            _set_session_logs(session, collecting=False)
+        except Exception as error:
+            log.warning("session logs not suspended (%s)", type(error).__name__)
+            session.log_buffer.clear()
     _refresh_menubar()
     return released
 
 
 def _set_session_logs(session, *, collecting: bool) -> None:
-    """Retain app logs only while access is On; revocation also forgets earlier lines."""
+    """Retain app logs only while access is On; revocation also forgets earlier lines.
+
+    A native `log stream` watcher is stopped and later restarted, because a fresh
+    stream reports only new entries. An Electron app's own stderr cannot be
+    restarted, so its reader drains and discards until a resume barrier passes.
+    """
+    from . import launcher
+    proc = getattr(session, "_log_proc", None)
     reader = getattr(session, "_log_reader", None)
+    native_stream = proc is not None and getattr(proc, "pid", None) != session.pid
     if not collecting:
-        if reader is not None:
+        if native_stream:
+            session._log_proc = None
+            session._log_reader = None
+            session._log_stream_suspended = True
+            try:
+                proc.terminate()
+                proc.wait(timeout=0.5)
+            except Exception:
+                try:
+                    proc.kill()
+                except Exception:
+                    pass
+            if reader is not None:
+                reader.stop()
+        elif reader is not None:
             reader.pause()
         session.log_buffer.clear()
+    elif session._log_stream_suspended:
+        session._log_stream_suspended = False
+        if session.process_identity is None or launcher.process_identity(session.pid) == session.process_identity:
+            fresh = launcher.start_native_log_stream(session.pid)
+            session._log_proc = fresh
+            session._log_reader = StderrReader(fresh.stdout, session.log_buffer)
     elif reader is not None:
         reader.resume()
 

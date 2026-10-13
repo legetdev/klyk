@@ -173,7 +173,13 @@ class StderrReaderLifecycleTests(unittest.TestCase):
             while time.monotonic() < deadline and select.select([read_fd], [], [], 0)[0]:
                 time.sleep(0.05)  # Wait until the paused reader has drained the pipe.
             time.sleep(0.1)
+            reader.pause()
+            os.write(write_fd, b"QUEUED_BEFORE_RESUME\n")  # Still in the pipe at resume time.
             reader.resume()
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and reader.paused:
+                time.sleep(0.01)
+            self.assertFalse(reader.paused)
             os.write(write_fd, b"visible after on\n")
             deadline = time.monotonic() + 2
             while time.monotonic() < deadline and not buffer.app_errors:

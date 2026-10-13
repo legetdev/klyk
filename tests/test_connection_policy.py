@@ -30,6 +30,24 @@ class ConnectionPolicyTests(unittest.TestCase):
         self.path.write_text(value if isinstance(value, str) else json.dumps(value))
         self.path.chmod(0o600)
 
+    def test_save_replacing_the_file_mid_read_does_not_revoke_access(self):
+        """An atomic save by another switch must never read as a broken all-off policy."""
+        policy.initialize()
+        policy.set_enabled("codex", True)
+        real = policy._read_once
+        calls = []
+
+        def replaced_once():
+            """Simulate the old inode being read while the new one is already in place."""
+            calls.append(1)
+            if len(calls) == 1:
+                raise policy._ReplacedDuringRead("Connection settings changed while being read")
+            return real()
+
+        with patch.object(policy, "_read_once", side_effect=replaced_once):
+            self.assertTrue(policy.enabled("codex"))
+        self.assertNotIn("error", policy.snapshot())
+
     def test_missing_policy_and_invalid_identity_deny_access(self):
         """A fresh or unrecognized client must not gain desktop access implicitly."""
         self.assertFalse(policy.enabled("codex"))
