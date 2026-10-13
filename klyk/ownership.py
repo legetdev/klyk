@@ -219,6 +219,8 @@ def claim_ownership_if_unowned() -> int:
 
 def release_ownership_if_owned() -> bool:
     """Clear only our token without waiting; retained input leases still guard cleanup."""
+    if not OWNER_PATH.exists():
+        return True  # No token means nothing to release; never recreate removed state.
     fh = _open()
     if fh is None:
         return False

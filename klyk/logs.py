@@ -294,6 +294,8 @@ class StderrReader:
         # but nothing is retained: output from a revoked interval is never stored.
         self._paused = threading.Event()
         self._resume = threading.Event()
+        # Pausing and appending share this lock, so no line can land after a pause.
+        self._lock = threading.Lock()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -319,8 +321,11 @@ class StderrReader:
                         except BlockingIOError:
                             break
                     records = LogRecordBuffer()
-                    self._resume.clear()
-                    self._paused.clear()
+                    with self._lock:
+                        # A pause during the drain cancels this resume.
+                        if self._resume.is_set():
+                            self._resume.clear()
+                            self._paused.clear()
                     if ended:
                         break
                 if fd is None:
@@ -340,12 +345,18 @@ class StderrReader:
                     continue
                 if not raw:
                     final = records.partial()
-                    if final:
-                        self._buffer.app_errors.append(final)
+                    with self._lock:
+                        if final and not self._paused.is_set():
+                            self._buffer.app_errors.append(final)
                     break
                 if isinstance(raw, str):
                     raw = raw.encode("utf-8", errors="replace")
-                self._buffer.app_errors.extend(records.feed(raw))
+                lines = records.feed(raw)
+                with self._lock:
+                    if self._paused.is_set():
+                        records = LogRecordBuffer()
+                        continue
+                    self._buffer.app_errors.extend(lines)
         except Exception:
             pass
         finally:
@@ -355,14 +366,20 @@ class StderrReader:
                 pass
 
     def pause(self) -> None:
-        """Keep draining the pipe but discard everything until resumed."""
-        self._resume.clear()
-        self._paused.set()
+        """Keep draining the pipe but discard everything until resumed.
+
+        Once this returns, no further line is appended, so a following buffer
+        clear removes everything collected before the pause.
+        """
+        with self._lock:
+            self._resume.clear()
+            self._paused.set()
 
     def resume(self) -> None:
         """Retain output again once the reader has dropped every byte queued while paused."""
-        if self._paused.is_set():
-            self._resume.set()
+        with self._lock:
+            if self._paused.is_set():
+                self._resume.set()
 
     @property
     def paused(self) -> bool:

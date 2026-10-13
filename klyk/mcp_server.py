@@ -6126,11 +6126,16 @@ def _set_session_logs(session, *, collecting: bool) -> None:
             reader.pause()
         session.log_buffer.clear()
     elif session._log_stream_suspended:
-        session._log_stream_suspended = False
         if session.process_identity is None or launcher.process_identity(session.pid) == session.process_identity:
             fresh = launcher.start_native_log_stream(session.pid)
+            try:
+                reader = StderrReader(fresh.stdout, session.log_buffer)
+            except Exception:
+                fresh.kill()
+                raise  # Stay suspended so the next permitted request retries.
             session._log_proc = fresh
-            session._log_reader = StderrReader(fresh.stdout, session.log_buffer)
+            session._log_reader = reader
+        session._log_stream_suspended = False
     elif reader is not None:
         reader.resume()
 

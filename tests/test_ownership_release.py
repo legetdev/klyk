@@ -27,6 +27,11 @@ class OwnershipReleaseTests(unittest.TestCase):
         owner_path.start()
         self.addCleanup(owner_path.stop)
 
+    def test_release_after_uninstall_never_recreates_removed_state(self):
+        """A server revoked by uninstall must not bring the deleted token file back."""
+        self.assertTrue(ownership.release_ownership_if_owned())
+        self.assertFalse(self.owner.exists())
+
     def test_release_ours_writes_zero_without_replacing_file_or_signalling(self):
         """Release is an atomic token update; the inode and separate lease stay intact."""
         self.owner.write_text(f"{ownership._MY_PID}\n")
