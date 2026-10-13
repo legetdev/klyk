@@ -102,6 +102,8 @@ def start_background() -> bool:
             except subprocess.TimeoutExpired:
                 child.kill()
                 child.wait(timeout=3)
+            if running():
+                return True  # A concurrent start won the singleton lease; the controls are up.
             raise RuntimeError("Klyk controls could not start. Check the private controls log.")
     finally:
         os.close(reader)
