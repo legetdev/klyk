@@ -141,6 +141,10 @@ def _types():
             if not self.controller.busy:
                 ui.shutdown()
 
+        def popoverDidClose_(self, notification):
+            """Stop watching outside clicks once the popover is gone, however it closed."""
+            self.controller.stop_outside_watch()
+
     class KlykControlsDocument(NSView):
         """Keep the first environment at the top of a scrollable native list."""
 
@@ -168,6 +172,7 @@ class Controls:
         self._footer = None
         self._quit = None
         self._timer = None
+        self._outside = None
 
     def build(self) -> None:
         """Create a quiet system-styled popover, leaving it closed at startup."""
@@ -242,6 +247,7 @@ class Controls:
         self._popover = NSPopover.alloc().init()
         self._popover.setBehavior_(NSPopoverBehaviorTransient)
         self._popover.setAnimates_(False)
+        self._popover.setDelegate_(self._delegate)
         self._popover.setContentViewController_(view_controller)
         self._popover.setContentSize_((width, height))
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
@@ -267,6 +273,24 @@ class Controls:
             return
         self.refresh()
         self._popover.showRelativeToRect_ofView_preferredEdge_(self._item.button().bounds(), self._item.button(), NSMinYEdge)
+        self._watch_outside_clicks()
+
+    def _watch_outside_clicks(self) -> None:
+        """Close on a click in any other app; Klyk never activates, so transient alone never fires."""
+        from AppKit import (NSEvent, NSEventMaskLeftMouseDown, NSEventMaskRightMouseDown,
+                            NSEventMaskOtherMouseDown)
+        self.stop_outside_watch()
+        mask = NSEventMaskLeftMouseDown | NSEventMaskRightMouseDown | NSEventMaskOtherMouseDown
+        # Global monitors only observe other apps' events; clicks inside the popover are unaffected.
+        self._outside = NSEvent.addGlobalMonitorForEventsMatchingMask_handler_(
+            mask, lambda event: self._popover.performClose_(None))
+
+    def stop_outside_watch(self) -> None:
+        """Remove the outside-click monitor so no observer outlives the open popover."""
+        if self._outside is not None:
+            from AppKit import NSEvent
+            NSEvent.removeMonitor_(self._outside)
+            self._outside = None
 
     def refresh(self) -> None:
         """Display confirmed file state rather than a switch's optimistic position."""
