@@ -3630,6 +3630,10 @@ async def press_system_key(name: str) -> None:
                 -1,
             )
             cg = ev.CGEvent()
+            if is_down:
+                # Quartz bypasses the protected ctypes library, so check the original generation here.
+                # The key-up stays cleanup-only, so a revoked press still releases.
+                _connection_gate.checkpoint()
             _Q.CGEventPost(_Q.kCGHIDEventTap, cg)
         token = ("system", code)
         _begin_input(token, lambda: emit(True), lambda: emit(False))
