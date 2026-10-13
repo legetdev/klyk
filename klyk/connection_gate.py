@@ -193,6 +193,16 @@ def bind_response(request_id, value: Request) -> None:
             raise policy.AccessDisabled("Klyk has too many pending replies; retry after they finish.")
 
 
+def unbind_response(request_id, value: Request) -> None:
+    """Drop a cancelled request's binding; MCP 2 writes no reply that would remove it."""
+    if request_id is None:
+        return
+    key = (type(request_id), request_id)
+    with _active_lock:
+        if _responses.get(key) is value:
+            _responses.pop(key, None)
+
+
 def blocked_payload() -> dict:
     """Return a fixed banner with no captured pixels, AX values or clipboard data."""
     return {"ok": False, "blocked": "access_off", "message": str(policy.AccessDisabled())}

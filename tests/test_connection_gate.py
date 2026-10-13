@@ -471,6 +471,17 @@ class WriterGateTests(IsolatedPolicy):
         writer.write('{"jsonrpc":"2.0","id":"init","result":{"protocolVersion":"test"}}\n')
         self.assertIn('protocolVersion', stream.getvalue())
 
+    def test_cancelled_valid_request_releases_its_reply_slot(self):
+        """MCP 2 sends no reply for a cancelled call, so its binding must not accumulate."""
+        request = self.enable()
+        for request_id in range(gate._MAX_REQUESTS + 5):
+            gate.bind_response(request_id, request)
+            gate.unbind_response(request_id, request)
+        self.assertEqual(gate._responses, {})
+        gate.bind_response('other', request)
+        gate.unbind_response('other', object())
+        self.assertIn((str, 'other'), gate._responses)
+
     def test_duplicate_ids_never_unpoison_a_later_sensitive_reply(self):
         """Both ambiguous replies are refused even when the first was already written."""
         request = self.enable()

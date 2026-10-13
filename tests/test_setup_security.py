@@ -15,7 +15,7 @@ from dataclasses import replace
 from pathlib import Path
 from unittest import mock
 
-from klyk import cli, clients, doctor, jsonc, updates
+from klyk import cli, clients, controls, doctor, jsonc, updates
 
 
 class SetupSecurityTests(unittest.TestCase):
@@ -31,6 +31,11 @@ class SetupSecurityTests(unittest.TestCase):
         errors.__enter__()
         self.addCleanup(errors.__exit__, None, None, None)
         self.addCleanup(output.__exit__, None, None, None)
+        # The controls lease lives at the real account home; never signal the owner's controller.
+        for name, value in (("stop_running", True), ("running", False)):
+            stub = mock.patch.object(controls, name, return_value=value)
+            stub.start()
+            self.addCleanup(stub.stop)
 
     def _identity(self, pid, argv=None, uid=None):
         """Build a stable synthetic process identity for restart selection."""

@@ -5,6 +5,7 @@ import contextlib
 import io
 import logging
 import os
+import select
 from pathlib import Path
 import subprocess
 import sys
@@ -157,6 +158,31 @@ class StderrReaderLifecycleTests(unittest.TestCase):
             self.assertTrue(pipe.closed)
             os.fstat(write_fd)
         finally:
+            os.close(write_fd)
+
+    def test_paused_reader_drains_but_never_retains_revoked_output(self):
+        """Output written while access is off is discarded; later output is kept again."""
+        read_fd, write_fd = os.pipe()
+        pipe = os.fdopen(read_fd, "rb")
+        buffer = LogBuffer()
+        reader = StderrReader(pipe, buffer)
+        try:
+            reader.pause()
+            os.write(write_fd, b"SECRET_WHILE_OFF\n")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and select.select([read_fd], [], [], 0)[0]:
+                time.sleep(0.05)  # Wait until the paused reader has drained the pipe.
+            time.sleep(0.1)
+            reader.resume()
+            os.write(write_fd, b"visible after on\n")
+            deadline = time.monotonic() + 2
+            while time.monotonic() < deadline and not buffer.app_errors:
+                time.sleep(0.05)
+            self.assertEqual(list(buffer.app_errors), ["visible after on"])
+            buffer.clear()
+            self.assertEqual(buffer.to_dict()["app_errors"], [])
+        finally:
+            reader.stop()
             os.close(write_fd)
 
     def test_parent_exit_with_inherited_writer_does_not_delay_stop(self):

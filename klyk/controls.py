@@ -110,6 +110,41 @@ def start_background() -> bool:
     return True
 
 
+def stop_running(timeout: float = 3.0) -> bool:
+    """Stop the controller holding the lease; True once no controller remains."""
+    import signal
+    import time
+    path = _lock_path()
+    if not path.exists():
+        return True
+    try:
+        with open_private(path, "a+") as handle:
+            try:
+                fcntl.flock(handle, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                fcntl.flock(handle, fcntl.LOCK_UN)
+                return True  # No live holder.
+            except BlockingIOError:
+                pass
+            handle.seek(0)
+            pid = int(handle.read().strip() or 0)
+    except (OSError, ValueError):
+        return False
+    if pid <= 1:
+        return False
+    try:
+        os.kill(pid, signal.SIGTERM)
+    except ProcessLookupError:
+        pass
+    except OSError:
+        return False
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if not running():
+            return True
+        time.sleep(0.1)
+    return not running()
+
+
 def _wait_ready(reader: int, child) -> bool:
     """Confirm the new interface was built rather than merely spawning a process."""
     readable, _, _ = select.select([reader], [], [], 3.0)
@@ -176,13 +211,38 @@ class Controls:
 
     def build(self) -> None:
         """Create a quiet system-styled popover, leaving it closed at startup."""
-        from AppKit import (NSFont, NSColor, NSImage, NSStatusBar, NSVariableStatusItemLength,
-                            NSView, NSViewController, NSPopover, NSPopoverBehaviorTransient,
-                            NSTextField, NSScrollView, NSSwitch, NSButton)
-        from Foundation import NSTimer, NSRunLoop, NSMakeRect
-        Actions, Document = _types()
+        from AppKit import NSImage, NSStatusBar, NSVariableStatusItemLength, NSPopover, NSPopoverBehaviorTransient
+        from Foundation import NSTimer, NSRunLoop
+        Actions, _ = _types()
         self._delegate = Actions.alloc().init()
         self._delegate.controller = self
+        self._popover = NSPopover.alloc().init()
+        self._popover.setBehavior_(NSPopoverBehaviorTransient)
+        self._popover.setAnimates_(False)
+        self._popover.setDelegate_(self._delegate)
+        self._build_content()
+        self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        button = self._item.button()
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("cursorarrow.click.2", "Klyk controls")
+        if image is not None:
+            image.setTemplate_(True)
+            button.setImage_(image)
+        else:
+            button.setTitle_("Klyk")
+        button.setToolTip_("Klyk — computer access")
+        button.setTarget_(self._delegate)
+        button.setAction_("showControls:")
+        self._timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.2, True, lambda timer: self.refresh())
+        NSRunLoop.currentRunLoop().addTimer_forMode_(self._timer, "NSEventTrackingRunLoopMode")
+        self.refresh()
+
+
+    def _build_content(self) -> None:
+        """Create one switch row per current environment inside the existing popover."""
+        from AppKit import NSFont, NSColor, NSView, NSViewController, NSTextField, NSScrollView, NSSwitch, NSButton
+        from Foundation import NSMakeRect
+        _, Document = _types()
+        self.rows = {}
         width, row_height = 320, 56
         body_height = min(448, len(self.keys) * row_height)
         height = body_height + 130
@@ -244,26 +304,9 @@ class Controls:
         content.addSubview_(self._quit)
         view_controller = NSViewController.alloc().init()
         view_controller.setView_(content)
-        self._popover = NSPopover.alloc().init()
-        self._popover.setBehavior_(NSPopoverBehaviorTransient)
-        self._popover.setAnimates_(False)
-        self._popover.setDelegate_(self._delegate)
         self._popover.setContentViewController_(view_controller)
         self._popover.setContentSize_((width, height))
-        self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
-        button = self._item.button()
-        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("cursorarrow.click.2", "Klyk controls")
-        if image is not None:
-            image.setTemplate_(True)
-            button.setImage_(image)
-        else:
-            button.setTitle_("Klyk")
-        button.setToolTip_("Klyk — computer access")
-        button.setTarget_(self._delegate)
-        button.setAction_("showControls:")
-        self._timer = NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.2, True, lambda timer: self.refresh())
-        NSRunLoop.currentRunLoop().addTimer_forMode_(self._timer, "NSEventTrackingRunLoopMode")
-        self.refresh()
+        self._last_state = None
 
     def show(self) -> None:
         """Show the user-requested panel without activating any other app or window."""
@@ -271,6 +314,11 @@ class Controls:
         if self._popover.isShown():
             self._popover.performClose_(None)
             return
+        current = configured_environments()
+        if current != self.keys and not self.busy:
+            # A client installed since startup gets its switch without restarting the controls.
+            self.keys = current
+            self._build_content()
         self.refresh()
         self._popover.showRelativeToRect_ofView_preferredEdge_(self._item.button().bounds(), self._item.button(), NSMinYEdge)
         self._watch_outside_clicks()
@@ -352,6 +400,10 @@ def run(ready_fd: int | None = None) -> None:
             fcntl.flock(lease, fcntl.LOCK_EX | fcntl.LOCK_NB)
         except BlockingIOError:
             return
+        # Record the lease holder so uninstall can stop exactly this controller.
+        lease.truncate(0)
+        lease.write(f"{os.getpid()}\n")
+        lease.flush()
         try:
             policy.initialize()
         except (OSError, ValueError):

@@ -1545,8 +1545,8 @@ TOOLS = [
             "control action returned blocked:'not_active_session' — if both "
             "sessions auto-reclaimed on every block they would fight over "
             "control endlessly. On a block, tell the user klyk is busy in "
-            "another session and let them choose which one drives. Reads and "
-            "screenshots are never blocked."
+            "another session and let them choose which one drives. Another "
+            "session's control never blocks reads and screenshots."
         ),
         inputSchema={"type": "object", "properties": {}},
     ),
@@ -2702,6 +2702,11 @@ def _tool_input_schema(tool: types.Tool) -> dict:
     return schema if schema is not None else tool.input_schema
 
 
+# Every tool shares the per-environment access gate, so each contract states it.
+_ACCESS_OFF_CONTRACT = (" Access off: returns blocked:'access_off' with no screen data; "
+                        "the user turns it on in Klyk's menu-bar controls.")
+for _tool in TOOLS:
+    _tool.description = (_tool.description or "").rstrip() + _ACCESS_OFF_CONTRACT
 _TOOL_SCHEMAS = {t.name: _tool_input_schema(t) for t in TOOLS}
 # Pre-build one validator per tool. The bare jsonschema.validate() convenience
 # function rebuilds (and re-check_schemas) the validator on EVERY call — ~1 ms
@@ -2920,6 +2925,8 @@ async def call_tool(
             connection_gate.bind_response(request_id, request)
             async with _call_lock:
                 connection_gate.checkpoint()
+                for session in list(registry._sessions.values()):
+                    _set_session_logs(session, collecting=True)
                 token = _call_context.set(task)
                 try:
                     result = await _execute_tool(name, arguments)
@@ -2935,6 +2942,8 @@ async def call_tool(
             request.cancelled.set()
             if revoked:
                 return _access_blocked_response()
+            # A still-valid reply carries no content worth guarding.
+            connection_gate.unbind_response(request_id, request)
         raise
 
 
@@ -6075,8 +6084,20 @@ def _on_access_revoked() -> bool:
     for session in list(registry._sessions.values()):
         session.template_cache.clear()
         session.last_grade = None
+        _set_session_logs(session, collecting=False)
     _refresh_menubar()
     return released
+
+
+def _set_session_logs(session, *, collecting: bool) -> None:
+    """Retain app logs only while access is On; revocation also forgets earlier lines."""
+    reader = getattr(session, "_log_reader", None)
+    if not collecting:
+        if reader is not None:
+            reader.pause()
+        session.log_buffer.clear()
+    elif reader is not None:
+        reader.resume()
 
 
 def _run_on_macos() -> None:

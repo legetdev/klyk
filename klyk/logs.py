@@ -222,6 +222,12 @@ class LogBuffer:
     network_failures: Deque[str] = field(default_factory=_new_buffer)
     app_errors: Deque[str] = field(default_factory=_new_buffer)
 
+    def clear(self) -> None:
+        """Forget every retained line, e.g. when the user revokes access."""
+        self.console_errors.clear()
+        self.network_failures.clear()
+        self.app_errors.clear()
+
     def to_dict(self, max_chars: int = 0) -> dict:
         # Convert to list at read time so JSON serialization stays trivial.
         channels = {
@@ -284,6 +290,9 @@ class StderrReader:
         self._pipe = pipe
         self._buffer = log_buffer
         self._stop = threading.Event()
+        # While paused the pipe is still drained, so the writer never blocks,
+        # but nothing is retained: output from a revoked interval is never stored.
+        self._paused = threading.Event()
         self._thread = threading.Thread(target=self._run, daemon=True)
         self._thread.start()
 
@@ -308,6 +317,11 @@ class StderrReader:
                         raw = os.read(fd, 65536)
                     except BlockingIOError:
                         continue
+                if self._paused.is_set():
+                    records = LogRecordBuffer()  # Never join a dropped fragment to later output.
+                    if not raw:
+                        break
+                    continue
                 if not raw:
                     final = records.partial()
                     if final:
@@ -323,6 +337,14 @@ class StderrReader:
                 self._pipe.close()
             except Exception:
                 pass
+
+    def pause(self) -> None:
+        """Keep draining the pipe but discard everything until resumed."""
+        self._paused.set()
+
+    def resume(self) -> None:
+        """Retain new output again for a currently permitted request."""
+        self._paused.clear()
 
     def stop(self) -> None:
         """Stop under a short bound without acquiring a blocked buffered-reader lock."""

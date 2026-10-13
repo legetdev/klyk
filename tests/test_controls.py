@@ -192,5 +192,17 @@ class ControlsTests(unittest.TestCase):
         self.assertNotIn("opencode", checked)
 
 
+class ControllerLifecycleTests(unittest.TestCase):
+    """Uninstall must be able to stop the controller without guessing process names."""
+
+    def test_stop_running_without_a_lease_is_a_no_op(self):
+        """No lease file means no controller to stop, and nothing is signalled."""
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(policy, "policy_path", return_value=Path(folder) / "connections.json"), \
+                patch("os.kill") as kill:
+            self.assertTrue(controls.stop_running(timeout=0.1))
+            kill.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()
