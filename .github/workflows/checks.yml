@@ -1,0 +1,12 @@
+# The required check: runs the shared pipeline from legetdev/agent-config on every pull request.
+# Repository-specific checks go in ci/check.sh, which the shared pipeline then runs instead.
+name: checks
+on: pull_request
+permissions:
+  contents: read
+concurrency:  # a new push cancels the run for the commit it replaces
+  group: checks-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+jobs:
+  checks:
+    uses: legetdev/agent-config/.github/workflows/project-checks.yml@main
