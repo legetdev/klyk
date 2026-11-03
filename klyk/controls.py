@@ -74,12 +74,15 @@ def running() -> bool:
     return False
 
 
-def start_background() -> bool:
-    """Start one detached controller with no window, Dock icon, terminal or sound."""
+def start_background(show: bool = False) -> bool:
+    """Start one detached controller with no Dock icon, terminal or sound.
+
+    With show, True means this controller confirmed its panel is open on screen.
+    """
     if sys.platform != "darwin":
         raise RuntimeError("Klyk controls are available on macOS.")
     if running():
-        return True
+        return not show
     private_directory(policy.policy_path().parent)
     safe_names = {"HOME", "USER", "LOGNAME", "TMPDIR", "PATH", "LANG", "LC_CTYPE", "__CF_USER_TEXT_ENCODING"}
     environment = {key: value for key, value in os.environ.items() if key in safe_names}
@@ -88,7 +91,8 @@ def start_background() -> bool:
     reader, writer = os.pipe()
     try:
         with open_private(policy.policy_path().parent / "controls.log", "a") as output:
-            child = subprocess.Popen([sys.executable, "-P", "-m", "klyk.controls", "--ready-fd", str(writer)],
+            command = [sys.executable, "-P", "-m", "klyk.controls", "--ready-fd", str(writer)]
+            child = subprocess.Popen([*command, "--show"] if show else command,
                                      stdin=subprocess.DEVNULL, stdout=output, stderr=output,
                                      env=environment, close_fds=True, pass_fds=(writer,), start_new_session=True)
         os.close(writer)
@@ -103,8 +107,9 @@ def start_background() -> bool:
                 child.kill()
                 child.wait(timeout=3)
             if running():
-                return True  # A concurrent start won the singleton lease; the controls are up.
+                return not show  # A concurrent start won the singleton lease; the controls are up.
             raise RuntimeError("Klyk controls could not start. Check the private controls log.")
+        return not show or _wait_shown(reader)
     finally:
         os.close(reader)
         if writer is not None:
@@ -112,8 +117,19 @@ def start_background() -> bool:
     return True
 
 
+def open_panel() -> bool:
+    """Open the panel from any state: replacing the controller also recovers a lost or frozen icon.
+
+    Saved switches live on disk, so a replacement never changes anyone's access.
+    """
+    for _ in range(2):  # A client connecting mid-replacement can win the lease once.
+        if stop_running(timeout=1.0) and start_background(show=True):
+            return True
+    return False
+
+
 def stop_running(timeout: float = 3.0) -> bool:
-    """Stop the controller holding the lease; True once no controller remains."""
+    """Stop the controller holding the lease, forcing a frozen one; True once none remains."""
     import signal
     import time
     path = _lock_path()
@@ -133,17 +149,18 @@ def stop_running(timeout: float = 3.0) -> bool:
         return False
     if pid <= 1:
         return False
-    try:
-        os.kill(pid, signal.SIGTERM)
-    except ProcessLookupError:
-        pass
-    except OSError:
-        return False
-    deadline = time.monotonic() + timeout
-    while time.monotonic() < deadline:
-        if not running():
-            return True
-        time.sleep(0.1)
+    for signal_number, wait in ((signal.SIGTERM, timeout), (signal.SIGKILL, 1.0)):
+        try:
+            os.kill(pid, signal_number)
+        except ProcessLookupError:
+            pass
+        except OSError:
+            return False
+        deadline = time.monotonic() + wait
+        while time.monotonic() < deadline:
+            if not running():
+                return True
+            time.sleep(0.05)
     return not running()
 
 
@@ -151,6 +168,12 @@ def _wait_ready(reader: int, child) -> bool:
     """Confirm the new interface was built rather than merely spawning a process."""
     readable, _, _ = select.select([reader], [], [], 3.0)
     return bool(readable and os.read(reader, 1) == b"1" and child.poll() is None)
+
+
+def _wait_shown(reader: int) -> bool:
+    """Confirm the requested panel is on screen, not merely that the controller started."""
+    readable, _, _ = select.select([reader], [], [], 3.0)
+    return bool(readable and os.read(reader, 1) == b"2")
 
 
 def _types():
@@ -181,6 +204,7 @@ def _types():
         def popoverDidClose_(self, notification):
             """Stop watching outside clicks once the popover is gone, however it closed."""
             self.controller.stop_outside_watch()
+            self.controller.release_anchor()
 
     class KlykControlsDocument(NSView):
         """Keep the first environment at the top of a scrollable native list."""
@@ -210,9 +234,10 @@ class Controls:
         self._quit = None
         self._timer = None
         self._outside = None
+        self._anchor = None
 
     def build(self) -> None:
-        """Create a quiet system-styled popover, leaving it closed at startup."""
+        """Create a quiet system-styled popover, closed until the user asks for it."""
         from AppKit import NSImage, NSStatusBar, NSVariableStatusItemLength, NSPopover, NSPopoverBehaviorTransient
         from Foundation import NSTimer, NSRunLoop
         Actions, _ = _types()
@@ -224,6 +249,8 @@ class Controls:
         self._popover.setDelegate_(self._delegate)
         self._build_content()
         self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        # Python apps share one preferences domain; a private name keeps another item's hidden state away.
+        self._item.setAutosaveName_("klyk.controls")
         button = self._item.button()
         image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("cursorarrow.click.2", "Klyk controls")
         if image is not None:
@@ -322,8 +349,69 @@ class Controls:
             self.keys = current
             self._build_content()
         self.refresh()
-        self._popover.showRelativeToRect_ofView_preferredEdge_(self._item.button().bounds(), self._item.button(), NSMinYEdge)
+        anchor = self._item.button() if self.in_menu_bar() else self._screen_anchor()
+        self._popover.showRelativeToRect_ofView_preferredEdge_(anchor.bounds(), anchor, NSMinYEdge)
         self._watch_outside_clicks()
+
+    def in_menu_bar(self) -> bool:
+        """Report whether the icon can really be seen, since macOS can hide it without saying so."""
+        from AppKit import NSWindowOcclusionStateVisible
+        window = self._item.button().window()
+        return bool(window is not None and window.isVisible() and window.screen() is not None
+                    and window.occlusionState() & NSWindowOcclusionStateVisible)
+
+    def open_when_placed(self, ready_fd: int | None) -> None:
+        """Open once macOS has placed the icon, or below the menu bar when it never appears."""
+        from Foundation import NSTimer
+        self._item.setVisible_(True)  # An explicit open undoes a Cmd-drag out of the menu bar.
+        remaining = [20]
+
+        def attempt(timer) -> None:
+            """Confirm the outcome to the waiting command only once the panel is really open."""
+            remaining[0] -= 1
+            if remaining[0] > 0 and not self.in_menu_bar():
+                return
+            timer.invalidate()
+            self.show()
+            if ready_fd is not None:
+                try:
+                    if self._popover.isShown():
+                        os.write(ready_fd, b"2")
+                    os.close(ready_fd)
+                except OSError:
+                    pass  # The command stopped waiting; the panel is still open.
+
+        NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.05, True, attempt)
+
+    def _screen_anchor(self):
+        """Give the panel an invisible anchor below the menu bar of the screen with the pointer."""
+        from AppKit import (NSBackingStoreBuffered, NSColor, NSEvent, NSScreen, NSStatusWindowLevel, NSWindow,
+                            NSWindowCollectionBehaviorCanJoinAllSpaces,
+                            NSWindowCollectionBehaviorFullScreenAuxiliary, NSWindowStyleMaskBorderless)
+        from Foundation import NSMakeRect, NSPointInRect
+        pointer = NSEvent.mouseLocation()
+        screen = next((value for value in NSScreen.screens() if NSPointInRect(pointer, value.frame())),
+                      NSScreen.mainScreen())
+        area = screen.visibleFrame()
+        self.release_anchor()
+        self._anchor = NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            NSMakeRect(area.origin.x + area.size.width - 190, area.origin.y + area.size.height - 1, 1, 1),
+            NSWindowStyleMaskBorderless, NSBackingStoreBuffered, False)
+        self._anchor.setReleasedWhenClosed_(False)
+        self._anchor.setOpaque_(False)
+        self._anchor.setBackgroundColor_(NSColor.clearColor())
+        self._anchor.setIgnoresMouseEvents_(True)
+        self._anchor.setLevel_(NSStatusWindowLevel)
+        self._anchor.setCollectionBehavior_(NSWindowCollectionBehaviorCanJoinAllSpaces
+                                            | NSWindowCollectionBehaviorFullScreenAuxiliary)
+        self._anchor.orderFrontRegardless()  # Never activates Klyk or takes focus from the user's app.
+        return self._anchor.contentView()
+
+    def release_anchor(self) -> None:
+        """Remove the invisible anchor once its panel has closed."""
+        if self._anchor is not None:
+            self._anchor.orderOut_(None)
+            self._anchor = None
 
     def _watch_outside_clicks(self) -> None:
         """Close on a click in any other app; Klyk never activates, so transient alone never fires."""
@@ -392,7 +480,7 @@ class Controls:
         threading.Thread(target=save, name="klyk-switch", daemon=True).start()
 
 
-def run(ready_fd: int | None = None) -> None:
+def run(ready_fd: int | None = None, show: bool = False) -> None:
     """Hold the singleton lease and run only the native control interface."""
     if sys.platform != "darwin":
         raise RuntimeError("Klyk controls are available on macOS.")
@@ -417,7 +505,10 @@ def run(ready_fd: int | None = None) -> None:
         controller.build()
         if ready_fd is not None:
             os.write(ready_fd, b"1")
-            os.close(ready_fd)
+            if not show:
+                os.close(ready_fd)
+        if show:
+            controller.open_when_placed(ready_fd)
         ui.run_blocking()
         fcntl.flock(lease, fcntl.LOCK_UN)
 
@@ -426,4 +517,6 @@ if __name__ == "__main__":
     import argparse
     parser = argparse.ArgumentParser(description="Klyk background access controls")
     parser.add_argument("--ready-fd", type=int, default=None, help=argparse.SUPPRESS)
-    run(parser.parse_args().ready_fd)
+    parser.add_argument("--show", action="store_true", help=argparse.SUPPRESS)
+    arguments = parser.parse_args()
+    run(arguments.ready_fd, arguments.show)
