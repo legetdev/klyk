@@ -1,5 +1,9 @@
 """Inert native-view doubles verify that switches report saved access truth."""
 
+import os
+import signal
+import subprocess
+import sys
 import tempfile
 import time
 import unittest
@@ -91,6 +95,30 @@ class ControlsTests(unittest.TestCase):
                 controls.start_background()
             launch.return_value.terminate.assert_called_once()
             launch.return_value.wait.assert_called_once_with(timeout=3)
+
+    def test_requested_panel_must_be_confirmed_on_screen(self):
+        """Starting the controller is not enough when the user asked to see the panel."""
+        with patch.object(controls.sys, "platform", "darwin"), \
+                patch.object(controls, "running", return_value=False), \
+                patch.object(controls.subprocess, "Popen") as launch, \
+                patch.object(controls, "_wait_ready", return_value=True), \
+                patch.object(controls, "_wait_shown", return_value=False) as shown:
+            self.assertFalse(controls.start_background(show=True))
+            self.assertEqual(launch.call_args.args[0][-1], "--show")
+            shown.assert_called_once()
+            shown.reset_mock()
+            self.assertTrue(controls.start_background())
+            self.assertNotIn("--show", launch.call_args.args[0])
+            shown.assert_not_called()
+
+    def test_running_controller_cannot_satisfy_a_request_to_show(self):
+        """An existing controller may have a lost icon, so it must never count as open."""
+        with patch.object(controls.sys, "platform", "darwin"), \
+                patch.object(controls, "running", return_value=True), \
+                patch.object(controls.subprocess, "Popen") as launch:
+            self.assertFalse(controls.start_background(show=True))
+            self.assertTrue(controls.start_background())
+            launch.assert_not_called()
 
     def test_periodic_refresh_recovers_a_full_ui_queue(self):
         """A saved switch must leave Saving even when its immediate callback is dropped."""
@@ -202,6 +230,112 @@ class ControllerLifecycleTests(unittest.TestCase):
                 patch("os.kill") as kill:
             self.assertTrue(controls.stop_running(timeout=0.1))
             kill.assert_not_called()
+
+    def hold_lease(self, folder: str, ignore_stop: bool = False) -> subprocess.Popen:
+        """Run a real process that holds the controller lease as a live controller does."""
+        program = ("import fcntl,os,signal,sys,time\n"
+                   f"{'signal.signal(signal.SIGTERM,signal.SIG_IGN)' if ignore_stop else ''}\n"
+                   "f=open(sys.argv[1],'a+');fcntl.flock(f,fcntl.LOCK_EX);f.truncate(0)\n"
+                   "f.write(str(os.getpid()));f.flush();print('held',flush=True);time.sleep(60)\n")
+        child = subprocess.Popen([sys.executable, "-c", program, str(Path(folder) / "controls.lock")],
+                                 stdout=subprocess.PIPE, text=True)
+        self.addCleanup(child.stdout.close)
+        self.addCleanup(child.wait)
+        self.addCleanup(lambda: child.poll() is None and child.kill())
+        self.assertEqual(child.stdout.readline().strip(), "held")
+        return child
+
+    def test_stop_running_stops_a_live_controller(self):
+        """An ordinary controller exits on the polite signal and releases its lease."""
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(policy, "policy_path", return_value=Path(folder) / "connections.json"):
+            child = self.hold_lease(folder)
+            self.assertTrue(controls.running())
+            self.assertTrue(controls.stop_running(timeout=2))
+            self.assertEqual(child.wait(timeout=2), -signal.SIGTERM)
+            self.assertFalse(controls.running())
+
+    def test_stop_running_forces_a_frozen_controller(self):
+        """A frozen controller ignores the polite signal and must still never block the panel."""
+        with tempfile.TemporaryDirectory() as folder, \
+                patch.object(policy, "policy_path", return_value=Path(folder) / "connections.json"):
+            child = self.hold_lease(folder, ignore_stop=True)
+            self.assertTrue(controls.stop_running(timeout=0.2))
+            self.assertEqual(child.wait(timeout=2), -signal.SIGKILL)
+            self.assertFalse(controls.running())
+
+    def test_open_panel_replaces_whatever_is_running(self):
+        """Opening always replaces the controller, so a lost icon cannot survive the command."""
+        with patch.object(controls, "stop_running", return_value=True) as stop, \
+                patch.object(controls, "start_background", return_value=True) as start:
+            self.assertTrue(controls.open_panel())
+            stop.assert_called_once()
+            start.assert_called_once_with(show=True)
+
+    def test_open_panel_survives_a_client_winning_the_lease_once(self):
+        """A client connecting mid-replacement costs one retry rather than a false failure."""
+        with patch.object(controls, "stop_running", return_value=True), \
+                patch.object(controls, "start_background", side_effect=[False, True]) as start:
+            self.assertTrue(controls.open_panel())
+            self.assertEqual(start.call_count, 2)
+
+    def test_open_panel_reports_failure_when_a_controller_cannot_be_stopped(self):
+        """Never start a second controller or claim success while an old one holds the lease."""
+        with patch.object(controls, "stop_running", return_value=False), \
+                patch.object(controls, "start_background") as start:
+            self.assertFalse(controls.open_panel())
+            start.assert_not_called()
+
+    def test_cli_only_claims_open_after_confirmation(self):
+        """The command's words must match what actually happened on screen."""
+        from klyk import cli
+        with patch.object(cli, "_require_macos"), patch.object(controls, "open_panel", return_value=True), \
+                patch("builtins.print") as said:
+            cli._controls()
+            said.assert_called_once_with("Klyk controls are open.")
+        for failure in ({"return_value": False}, {"side_effect": RuntimeError("no")}):
+            with patch.object(cli, "_require_macos"), patch.object(controls, "open_panel", **failure), \
+                    patch("builtins.print") as said, self.assertRaises(SystemExit) as stopped:
+                cli._controls()
+            self.assertEqual(stopped.exception.code, 1)
+            self.assertIn("could not open", said.call_args.args[0])
+
+
+class IconVisibilityTests(unittest.TestCase):
+    """The panel must choose a real position even when macOS hides the icon."""
+
+    def panel(self, *, window=True, visible=True, screen=True, occlusion=8194):
+        """Build a controller whose status button reports one window state."""
+        class Window:
+            def isVisible(self):
+                return visible
+
+            def screen(self):
+                return object() if screen else None
+
+            def occlusionState(self):
+                return occlusion
+
+        class Button:
+            def window(self):
+                return Window() if window else None
+
+        class StatusItem:
+            def button(self):
+                return Button()
+
+        panel = controls.Controls(("claude",))
+        panel._item = StatusItem()
+        return panel
+
+    def test_visible_icon_is_recognised(self):
+        """A placed, unoccluded icon anchors the panel as it does for a click."""
+        self.assertTrue(self.panel().in_menu_bar())
+
+    def test_every_hidden_state_uses_the_fallback(self):
+        """No window, a hidden window, no screen and an occluded item all count as not visible."""
+        for state in ({"window": False}, {"visible": False}, {"screen": False}, {"occlusion": 8192}):
+            self.assertFalse(self.panel(**state).in_menu_bar(), state)
 
 
 if __name__ == "__main__":

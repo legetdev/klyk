@@ -23,8 +23,9 @@ gives them the `klyk` command, and from there:
                                    what it can (state dir, config entry).
     klyk restart            — stop the klyk instance currently driving the Mac
                                    (only needed to force a wedged one).
-    klyk controls           — open the quiet menu-bar controls. One switch per
-                                   environment allows or blocks Klyk access
+    klyk controls           — open the access panel from any state, restoring
+                                   a missing or frozen menu-bar icon. One switch
+                                   per environment allows or blocks Klyk access
                                    without restarting the connected client.
     klyk uninstall [client] — remove klyk. No client → FULL removal (every
                                    client, state, binaries); a client name
@@ -113,15 +114,17 @@ def _require_macos() -> None:
 
 
 def _controls() -> None:
-    """Start the native background switches without running computer-use probes."""
+    """Open the native switches from any state, without running computer-use probes."""
     _require_macos()
-    from .controls import start_background
+    from .controls import open_panel
     try:
-        start_background()
+        opened = open_panel()
     except (OSError, ValueError, RuntimeError):
-        print("Klyk controls could not start. Your saved access settings remain in effect.", file=sys.stderr)
+        opened = False
+    if not opened:
+        print("Klyk controls could not open. Your saved access settings remain in effect.", file=sys.stderr)
         sys.exit(1)
-    print("Klyk controls are in the menu bar.")
+    print("Klyk controls are open.")
 
 
 # ---------------------------------------------------------------------------
