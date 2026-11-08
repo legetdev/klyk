@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 
+from . import settings_names as _panes
 from .keycodes import parse_key_combo, char_to_keycode, MODIFIER_FLAGS
 from . import connection_gate as _connection_gate
 
@@ -706,7 +707,7 @@ def check_accessibility() -> None:
         raise RuntimeError(
             "klyk needs Accessibility permission to read the AX tree and post "
             "keyboard events. Grant it:\n"
-            "  System Settings → Privacy & Security → Accessibility\n"
+            "  System Settings → Privacy & Security → " + _panes.accessibility_pane() + "\n"
             "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
             "Then `klyk doctor` to verify, and restart your MCP client."
         )

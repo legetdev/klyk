@@ -452,3 +452,17 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
                                                      "width": 10, "height": 10, "_ref": 1000}]
         result = payload(await self.s._execute_tool("inspect", {"app": "Fixture"}))
         self.assertEqual(result["ax_elements"][0]["element"], 1, "the same element keeps its number")
+
+
+class SettingsNameTests(unittest.TestCase):
+    """Setup messages name the pane the running macOS actually shows."""
+
+    def test_pane_names_follow_the_macos_version(self):
+        from klyk import settings_names
+        for version, accessibility, screen in (("27.0.1", "Device Control and Data Access", "Screen & System Audio Recording"),
+                                               ("15.4", "Accessibility", "Screen & System Audio Recording"),
+                                               ("14.6", "Accessibility", "Screen Recording"),
+                                               ("", "Accessibility", "Screen Recording")):
+            with self.subTest(version=version), mock.patch("platform.mac_ver", return_value=(version, ("", "", ""), "")):
+                self.assertEqual(settings_names.accessibility_pane(), accessibility)
+                self.assertEqual(settings_names.screen_recording_pane(), screen)

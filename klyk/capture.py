@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 
+from . import settings_names as _panes
 from . import connection_gate as _connection_gate
 
 from .image_bounds import (
@@ -1443,7 +1444,7 @@ def check_screen_recording() -> None:
         raise RuntimeError(
             "klyk needs Screen Recording permission to capture window contents "
             "(used by screenshot / inspect / read_grid). Grant it:\n"
-            "  System Settings → Privacy & Security → Screen Recording\n"
+            "  System Settings → Privacy & Security → " + _panes.screen_recording_pane() + "\n"
             "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
             "Then run `klyk doctor` and restart the affected client process."
         )

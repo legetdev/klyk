@@ -47,6 +47,7 @@ klyk/                   # Runtime package
 ├── ui_thread.py         # Main-thread AppKit dispatch
 ├── cli.py               # Install, uninstall, doctor, update, and restart
 ├── doctor.py            # Health and permission diagnostics
+├── settings_names.py    # System Settings pane names for the running macOS
 ├── clients.py           # Supported-client registry and config editing
 ├── controls.py          # Native per-environment switches, independent of MCP
 ├── connection_policy.py # Private saved switches and generations
