@@ -529,3 +529,29 @@ class PasteHoldTests(unittest.IsolatedAsyncioTestCase):
         await wait(None, "text")
         await wait(42, "   ")
         self.assertEqual(calls, [])
+
+
+class ZoomSizingTests(unittest.TestCase):
+    """Zoom never asks for a capture beyond the image limits and fits the model budget."""
+
+    def test_zoom_capture_sizes_stay_within_limits(self):
+        from unittest.mock import patch
+        from klyk import capture, image_bounds
+        requested = []
+
+        def fake_take(window_id, width, height, crop=None):
+            image_bounds.validate_image_dimensions(width, height)
+            requested.append((width, height, crop))
+            return "", crop[2], crop[3]
+
+        fake_module = SimpleNamespace(take=fake_take)
+        with patch.object(capture, "_HAS_IMAGEIO", True), patch.dict("sys.modules", {"klyk.window_capture": fake_module}), \
+                patch.object(__import__("klyk"), "window_capture", fake_module, create=True):
+            for size, region in (((1919, 1081), (10, 10, 60, 40)), ((1920, 1080), (0, 0, 1920, 1080)),
+                                 ((3000, 2000), (100, 100, 400, 300)), ((800, 600), (5, 5, 6, 6))):
+                with self.subTest(size=size, region=region):
+                    _, width, height, magnification = capture.zoom_window(7, *size, region, (1568, 1568))
+                    self.assertLessEqual(max(width, height), 1568)
+                    self.assertLessEqual(math.ceil(width / 28) * math.ceil(height / 28), 1568)
+                    self.assertLessEqual(magnification, 4.0)
+        self.assertEqual(len(requested), 4)

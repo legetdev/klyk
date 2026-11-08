@@ -1392,8 +1392,9 @@ def zoom_window(window_id: int, logical_width: int, logical_height: int,
     max_edge, max_tiles = budget
     fit_edge = max_edge / max(region_w, region_h)
     fit_area = math.sqrt(max_tiles * 28 * 28 / (region_w * region_h))
-    memory = min(math.sqrt(16_000_000 / (logical_width * logical_height)),
-                 8192 / max(logical_width, logical_height))
+    # Stay just inside the 16-megapixel / 8192-pixel capture limits after rounding.
+    memory = 0.99 * min(math.sqrt(16_000_000 / (logical_width * logical_height)),
+                        8192 / max(logical_width, logical_height))
     magnification = max(0.1, min(fit_edge, fit_area, 4.0, memory))
     while True:
         full = (max(1, int(round(logical_width * magnification))),
