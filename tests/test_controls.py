@@ -10,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from klyk import connection_policy as policy, controls
+from klyk import connection_policy as policy, controls, presence
 from klyk.ui_thread import ui
 
 
@@ -21,6 +21,8 @@ class View:
         self.state = None
         self.enabled = True
         self.text = ""
+        self.image = None
+        self.title = ""
 
     def setState_(self, value):
         """Observe the confirmed switch position."""
@@ -37,6 +39,14 @@ class View:
     def setToolTip_(self, value):
         """Observe the menu-bar access summary."""
         self.text = value
+
+    def setImage_(self, value):
+        """Observe which state symbol the menu bar shows."""
+        self.image = value
+
+    def setTitle_(self, value):
+        """Observe the text fallback for a missing symbol."""
+        self.title = value
 
 
 class Item:
@@ -66,7 +76,12 @@ class ControlsTests(unittest.TestCase):
         self.panel.rows = {key: (View(), View()) for key in self.panel.keys}
         self.panel._footer = View()
         self.panel._quit = View()
+        self.panel._all_off = View()
         self.panel._item = Item()
+        # Symbols are AppKit images; inert names keep these tests portable to Linux.
+        symbols = patch.object(controls, "_symbol", side_effect=lambda kind: "symbol-" + kind)
+        symbols.start()
+        self.addCleanup(symbols.stop)
         self.pending = []
         def dispatch_controls(callback, *, guarded):
             """Independent controls must remain usable when all computer access is Off."""
@@ -206,6 +221,173 @@ class ControlsTests(unittest.TestCase):
         self.panel.refresh()
         self.assertIn("all access off", self.panel._item.view.text)
 
+    def live(self, **rows):
+        """Show chosen environments as connected or active in the panel's presence view."""
+        result = {key: {"connected": False, "active": False, "app": None} for key in policy.CLIENT_KEYS}
+        result.update(rows)
+        return patch.object(presence, "summary", return_value=result)
+
+    def test_turn_all_off_switches_everything_in_one_save(self):
+        """One click revokes every environment, including ones the panel does not list."""
+        for key in ("codex", "claude", "cursor"):
+            policy.set_enabled(key, True)
+        self.panel.refresh()
+        self.assertTrue(self.panel._all_off.enabled)
+        with patch.object(policy, "set_enabled", side_effect=AssertionError("one combined save")):
+            self.panel.turn_all_off()
+            self.assertFalse(self.panel._all_off.enabled)
+            self.assertEqual(self.panel.rows["codex"][1].text, "Saving…")
+            self.assertEqual(self.panel.rows["other"][1].text, "Off")
+            self.assertFalse(any(row[0].enabled for row in self.panel.rows.values()))
+            self.complete_write()
+        self.assertFalse(any(row["enabled"] for row in policy.snapshot()["clients"].values()))
+        self.assertTrue(all(row[0].state == 0 and row[0].enabled for row in self.panel.rows.values()))
+        self.assertFalse(self.panel._all_off.enabled)
+        self.assertIn("all access off", self.panel._item.view.text)
+        self.assertEqual(self.panel._item.view.image, "symbol-off")
+
+    def test_turn_all_off_is_disabled_when_nothing_is_on(self):
+        """The control is greyed out rather than offering a click that changes nothing."""
+        self.panel.refresh()
+        self.assertFalse(self.panel._all_off.enabled)
+        policy.set_enabled("cursor", True)
+        self.panel.refresh()
+        self.assertTrue(self.panel._all_off.enabled)
+
+    def test_turn_all_off_and_single_switches_never_overlap(self):
+        """A pending switch finishes first, and no switch can be saved while all are turning Off."""
+        policy.set_enabled("codex", True)
+        self.panel.busy.add("claude")
+        with patch.object(self.panel, "_save") as save:
+            self.panel.turn_all_off()
+            save.assert_not_called()
+        self.panel.busy = {controls._ALL}
+        self.panel.refresh()
+        self.panel.rows["claude"][0].state = 1  # The native switch moved before its click was refused.
+        with patch.object(self.panel, "_save") as save:
+            self.panel.change("claude", True)
+            save.assert_not_called()
+        self.assertEqual(self.panel.rows["claude"][0].state, 0)
+        self.assertFalse(self.panel._quit.enabled)
+        self.assertFalse(self.panel.rows["claude"][0].enabled)
+        self.assertEqual(self.panel.rows["codex"][1].text, "Saving…")
+
+    def test_failed_turn_all_off_shows_truth_and_can_be_retried(self):
+        """A failed save says so plainly, keeps the real On state and allows another try."""
+        policy.set_enabled("codex", True)
+        with patch.object(policy, "disable_all", side_effect=RuntimeError("busy")):
+            self.panel.turn_all_off()
+            self.complete_write()
+        self.assertEqual(self.panel.rows["codex"][0].state, 1)
+        self.assertIn("Could not turn access off", self.panel._footer.text)
+        self.assertTrue(self.panel._all_off.enabled)
+        self.panel.turn_all_off()
+        self.complete_write()
+        self.assertEqual(self.panel.rows["codex"][0].state, 0)
+        self.assertEqual(self.panel._footer.text, controls._FOOTER)
+
+    def test_status_lines_show_live_presence(self):
+        """Each row says whether its environment is connected and where it is working."""
+        policy.set_enabled("codex", True)
+        policy.set_enabled("claude", True)
+        self.panel.keys = ("codex", "claude", "opencode", "other")
+        self.panel.rows = {key: (View(), View()) for key in self.panel.keys}
+        with self.live(claude={"connected": True, "active": True, "app": "Safari"},
+                       opencode={"connected": True, "active": False, "app": None}):
+            self.panel.refresh()
+        texts = {key: row[1].text for key, row in self.panel.rows.items()}
+        self.assertEqual(texts, {"codex": "On · not connected", "claude": "On · working in Safari",
+                                 "opencode": "Off · connected", "other": "Off"})
+        self.assertEqual(self.panel._item.view.text, "Klyk — Claude Code working in Safari")
+        self.assertEqual(self.panel._item.view.image, "symbol-busy")
+
+    def test_status_text_covers_every_state(self):
+        """The wording is plain and never implies access that the saved switch denies."""
+        connected = {"connected": True, "active": False, "app": None}
+        working = {"connected": True, "active": True, "app": "Notes"}
+        self.assertEqual(controls.status_text(False, None), "Off")
+        self.assertEqual(controls.status_text(False, working), "Off · connected")
+        self.assertEqual(controls.status_text(True, None), "On · not connected")
+        self.assertEqual(controls.status_text(True, connected), "On · connected")
+        self.assertEqual(controls.status_text(True, working), "On · working in Notes")
+        self.assertEqual(controls.status_text(True, {**working, "app": None}), "On · working")
+        self.assertEqual(controls.status_text(True, working, saving=True), "Saving…")
+
+    def test_presence_is_read_at_most_once_per_second(self):
+        """The 0.2 s refresh stays cheap; opening the panel reads fresh presence at once."""
+        clock = [100.0]
+        with self.live() as summary, patch.object(controls.time, "monotonic", side_effect=lambda: clock[0]):
+            for _ in range(5):
+                self.panel.refresh()
+                clock[0] += 0.19
+            self.assertEqual(summary.call_count, 1)
+            clock[0] += 0.1
+            self.panel.refresh()
+            self.assertEqual(summary.call_count, 2)
+
+    def test_menu_bar_symbol_and_tooltip_follow_state(self):
+        """Off, on and working are distinguishable at a glance and summarised in words."""
+        state = policy._default()
+        idle = {key: {"connected": False, "active": False, "app": None} for key in policy.CLIENT_KEYS}
+        self.assertEqual(controls.menu_summary(state, idle), ("off", "Klyk — all access off"))
+        state["clients"]["codex"]["enabled"] = True
+        self.assertEqual(controls.menu_summary(state, idle), ("on", "Klyk — 1 environment allowed"))
+        # An Off environment that acted moments ago is not shown as working.
+        busy = {**idle, "claude": {"connected": True, "active": True, "app": "Safari"}}
+        self.assertEqual(controls.menu_summary(state, busy)[0], "on")
+        for key in ("claude", "cursor", "gemini"):
+            state["clients"][key]["enabled"] = True
+        busy.update(codex={"connected": True, "active": True, "app": None},
+                    cursor={"connected": True, "active": True, "app": "Mail"},
+                    gemini={"connected": True, "active": True, "app": "Notes"})
+        icon, tip = controls.menu_summary(state, busy)
+        self.assertEqual(icon, "busy")
+        self.assertTrue(tip.startswith("Klyk — "))
+        self.assertTrue(tip.endswith(" and 2 more"))
+        self.assertEqual(tip.count(" working"), 2)
+
+    def test_symbol_swaps_only_on_change_with_a_text_fallback(self):
+        """The image is replaced only when the state changes; missing symbols still leave a visible item."""
+        with patch.object(controls, "_symbol", return_value=None):
+            self.panel.refresh()
+        self.assertEqual(self.panel._item.view.title, "Klyk")
+        panel = controls.Controls(("codex",))
+        panel.rows, panel._footer, panel._quit, panel._all_off = {}, View(), View(), View()
+        panel._item = Item()
+        shown = []
+        panel._item.view.setImage_ = shown.append
+        panel.refresh()
+        panel._last_state = None
+        panel.refresh()
+        self.assertEqual(shown, ["symbol-off"])
+        policy.set_enabled("codex", True)
+        panel.refresh()
+        self.assertEqual(shown, ["symbol-off", "symbol-on"])
+
+    def test_refresh_never_needs_appkit(self):
+        """The periodic update stays portable: only view objects it was given are touched."""
+        policy.set_enabled("codex", True)
+        with patch.dict(sys.modules, {"AppKit": None, "Foundation": None}):
+            self.panel.refresh()
+            self.panel.turn_all_off()
+            self.complete_write()
+        self.assertEqual(self.panel.rows["codex"][0].state, 0)
+
+    def test_footer_explains_that_changes_need_no_restart(self):
+        """The one sentence under the switches tells the owner switching takes effect at once."""
+        self.panel.refresh()
+        self.assertEqual(self.panel._footer.text, controls._FOOTER)
+        self.assertIn("immediately", controls._FOOTER)
+        self.assertIn("without restarting", controls._FOOTER)
+
+    def test_connected_environment_is_listed_without_a_saved_entry(self):
+        """A client that is connecting right now always gets its own switch."""
+        with patch.object(controls.clients, "current_entry", return_value=None), \
+                self.live(windsurf={"connected": True, "active": False, "app": None}):
+            self.assertIn("windsurf", controls.configured_environments())
+        with patch.object(controls.clients, "current_entry", return_value=None), self.live():
+            self.assertNotIn("windsurf", controls.configured_environments())
+
     def test_discovery_never_runs_opencode_version_detection(self):
         """Config discovery cannot delay a switch with an unrelated CLI subprocess."""
         checked = []
@@ -301,6 +483,72 @@ class ControllerLifecycleTests(unittest.TestCase):
             self.assertIn("could not open", said.call_args.args[0])
 
 
+class EnsureRunningTests(unittest.TestCase):
+    """Servers bring back a quit or crashed controller cheaply and never open the panel."""
+
+    def setUp(self):
+        """Reset the per-process rate limit and keep every start inert."""
+        for name, value in (("_ensure_checked", None), ("_ensure_thread", None)):
+            reset = patch.object(controls, name, value)
+            reset.start()
+            self.addCleanup(reset.stop)
+        self.clock = [500.0]
+        for target, attribute, value in ((controls.time, "monotonic", lambda: self.clock[0]),
+                                         (controls.sys, "platform", "darwin")):
+            stub = patch.object(target, attribute, value)
+            stub.start()
+            self.addCleanup(stub.stop)
+
+    def wait_for_start(self):
+        """Join the background starter this call created."""
+        controls._ensure_thread.join(timeout=2)
+        self.assertFalse(controls._ensure_thread.is_alive())
+
+    def test_starts_quietly_in_the_background_only_when_stopped(self):
+        """A missing controller is started with its panel closed; a running one is left alone."""
+        with patch.object(controls, "running", return_value=False), \
+                patch.object(controls, "start_background", return_value=True) as start:
+            self.assertTrue(controls.ensure_running())
+            self.wait_for_start()
+            start.assert_called_once_with(show=False)
+        self.clock[0] += 11
+        with patch.object(controls, "running", return_value=True), \
+                patch.object(controls, "start_background") as start:
+            self.assertFalse(controls.ensure_running())
+            start.assert_not_called()
+
+    def test_checks_the_lease_at_most_every_ten_seconds(self):
+        """Busy servers pay for one lease check per ten seconds, not one per tool call."""
+        with patch.object(controls, "running", return_value=True) as check:
+            for _ in range(20):
+                controls.ensure_running()
+                self.clock[0] += 0.4
+            self.assertEqual(check.call_count, 1)
+            self.clock[0] += 2.1
+            controls.ensure_running()
+            self.assertEqual(check.call_count, 2)
+
+    def test_never_raises_or_blocks_the_request(self):
+        """A broken lease or failed start is logged at most and retried on a later request."""
+        with patch.object(controls, "running", side_effect=OSError("fixture")):
+            self.assertFalse(controls.ensure_running())
+        self.clock[0] += 11
+        with patch.object(controls, "running", return_value=False), \
+                patch.object(controls, "start_background", side_effect=RuntimeError("no")), \
+                self.assertLogs("klyk.controls", "WARNING") as logged:
+            self.assertTrue(controls.ensure_running())
+            self.wait_for_start()
+        self.assertIn("could not restart", logged.output[0])
+
+    def test_does_nothing_off_macos(self):
+        """Linux test and CI runs never try to start native controls."""
+        with patch.object(controls.sys, "platform", "linux"), \
+                patch.object(controls, "running") as check, patch.object(controls, "start_background") as start:
+            self.assertFalse(controls.ensure_running())
+            check.assert_not_called()
+            start.assert_not_called()
+
+
 class IconVisibilityTests(unittest.TestCase):
     """The panel must choose a real position even when macOS hides the icon."""
 
@@ -336,6 +584,12 @@ class IconVisibilityTests(unittest.TestCase):
         """No window, a hidden window, no screen and an occluded item all count as not visible."""
         for state in ({"window": False}, {"visible": False}, {"screen": False}, {"occlusion": 8192}):
             self.assertFalse(self.panel(**state).in_menu_bar(), state)
+
+    def test_visibility_check_needs_no_appkit(self):
+        """The occlusion flag is a constant, so this check also runs on Linux CI."""
+        self.assertEqual(controls._OCCLUSION_VISIBLE, 2)  # NSWindowOcclusionStateVisible.
+        with patch.dict(sys.modules, {"AppKit": None}):
+            self.assertTrue(self.panel().in_menu_bar())
 
 
 if __name__ == "__main__":

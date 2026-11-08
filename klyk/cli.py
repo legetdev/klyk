@@ -14,11 +14,12 @@ gives them the `klyk` command, and from there:
                                    client's context file), --wait (poll until you
                                    grant permissions), --list (show all clients).
     klyk update             — update klyk to the latest release. Detects how
-                                   klyk was installed (pipx / uv / pip) and runs
+                                   klyk was installed (uv / pipx / pip) and runs
                                    the matching upgrade, then restarts the
-                                   running server so every connected agent gets
-                                   the new version on its next call.
-                                   --check only reports if an update exists.
+                                   running servers and menu-bar controls so every
+                                   connected agent gets the new version on its
+                                   next call. --check only reports if an update
+                                   exists.
     klyk doctor [--fix]     — green/yellow/red health check; --fix auto-repairs
                                    what it can (state dir, config entry).
     klyk restart            — stop the klyk instance currently driving the Mac
@@ -28,11 +29,11 @@ gives them the `klyk` command, and from there:
                                    per environment allows or blocks Klyk access
                                    without restarting the connected client.
     klyk uninstall [client] — remove klyk. No client → FULL removal (every
-                                   client, state, binaries); a client name
-                                   removes just that one.
+                                   client, running servers and controls, state,
+                                   binaries); a client name removes just that one.
     klyk help / version     — show this message / print the package version.
 
-Goal: a brand-new Mac user runs `pip install klyk && klyk install` — one
+Goal: a brand-new Mac user runs `uv tool install klyk && klyk install` — one
 command, no prompts (just a one-time, two-click macOS permission grant) — and
 klyk works, for any client and any AI.
 """
@@ -266,6 +267,7 @@ def _update(rest: list[str]) -> None:
         return
     print(f"✓ Updated klyk {before} → {after}.")
     _restart_after_update()
+    _restart_controls_after_update()
 
 
 def _installation_process(pid: int):
@@ -286,9 +288,8 @@ def _installation_process(pid: int):
     return identity
 
 
-def _restart_after_update() -> None:
-    """Restart only verified servers using this installation, rechecking PID identity."""
-    from .launcher import terminate_pid
+def _installation_servers() -> list[tuple[int, dict]]:
+    """List running servers of exactly this installation, each with its verified identity."""
     try:
         candidates = subprocess.run(
             ["/usr/bin/pgrep", "-u", str(os.getuid()), "-f", "klyk[.]mcp_server"],
@@ -297,22 +298,50 @@ def _restart_after_update() -> None:
         pids = {int(line) for line in candidates.stdout.splitlines() if line.isdigit()}
     except (OSError, subprocess.TimeoutExpired):
         pids = set()
-    restarted = 0
-    failed = 0
+    servers = []
     for pid in sorted(pids):
         identity = _installation_process(pid)
-        if identity is None:
-            continue
+        if identity is not None:
+            servers.append((pid, identity))
+    return servers
+
+
+def _stop_installation_servers() -> tuple[int, int]:
+    """Stop verified servers of this installation, rechecking PID identity; (stopped, failed)."""
+    from .launcher import terminate_pid
+    stopped = failed = 0
+    for pid, identity in _installation_servers():
         if terminate_pid(pid, expected_identity=identity):
-            restarted += 1
+            stopped += 1
         else:
             failed += 1
+    return stopped, failed
+
+
+def _restart_after_update() -> None:
+    """Restart only verified servers using this installation, rechecking PID identity."""
+    restarted, failed = _stop_installation_servers()
     if restarted:
         print(f"  ✓ Restarted {restarted} verified klyk server(s) using this installation.")
     else:
         print("  No matching server was stopped. New sessions load the updated installation.")
     if failed:
         print("  ⚠ Some servers could not be stopped safely. Restart their AI clients to load the update.")
+
+
+def _restart_controls_after_update() -> None:
+    """Replace a running menu-bar controller with the updated one, keeping its panel closed."""
+    from . import controls
+    try:
+        if not controls.running():
+            return
+        restarted = controls.stop_running() and controls.start_background(show=False)
+    except (OSError, ValueError, RuntimeError):
+        restarted = False
+    if restarted:
+        print("  ✓ Restarted the menu-bar controls on the new version. Saved access is unchanged.")
+    else:
+        print("  ⚠ The menu-bar controls could not be restarted. Run `klyk controls` to reopen them.")
 
 
 # ---------------------------------------------------------------------------
@@ -724,6 +753,14 @@ def _uninstall(rest: list[str]) -> None:
     print("\nFiles:")
     home = Path.home()
     file_failures = False
+    # Stop servers first: a running server would restart the controls and recreate state.
+    stopped, failed = _stop_installation_servers()
+    if stopped:
+        print(f"  ✓ stopped {stopped} running klyk server(s)")
+    if failed:
+        print(f"  ✗ could not stop {failed} running klyk server(s); quit the AI apps using klyk, then re-run")
+        print("\nNo state was removed.")
+        sys.exit(1)
     from . import controls
     controls_were_running = controls.running()
     if controls.stop_running():

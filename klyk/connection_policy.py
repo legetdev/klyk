@@ -189,6 +189,24 @@ def set_enabled(client: str, value: bool) -> dict:
         return data
 
 
+def disable_all() -> dict:
+    """Atomically switch every enabled environment Off in one save; unchanged ones keep their tokens."""
+    with _writer():
+        original = jsonc.read_snapshot(policy_path(), missing_ok=True)
+        data = _read()
+        changed = [key for key, state in data["clients"].items() if state["enabled"]]
+        if not changed and original.identity is not None:
+            return data
+        if changed:
+            if data["revision"] >= _MAX_GENERATION:
+                raise RuntimeError("Connection settings need recovery; access stays off.")
+            data["revision"] += 1
+            for key in changed:
+                data["clients"][key] = {"enabled": False, "generation": data["revision"]}
+        jsonc.atomic_write(policy_path(), json.dumps(data, separators=(",", ":")) + "\n", expected=original)
+        return data
+
+
 def initialize(client: str | None = None) -> dict:
     """Create first-use state without ever changing an existing user's preference."""
     if client is not None and client not in CLIENT_KEYS:
