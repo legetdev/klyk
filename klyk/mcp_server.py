@@ -6150,10 +6150,16 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     e.get("role") == "AXButton" and _normalize_label(e.get("label", "")) in ("open", "choose")
                     for e in observed
                 ):
-                    return [types.TextContent(type="text", text=json.dumps({
-                        "ok": False, "action": action,
-                        "error": "An Open or Choose button was not found; no input was sent.",
-                    }))]
+                    # A file panel's tree is large; the bounded overview above can stop
+                    # before its bottom buttons. Use the panel's own targeted button
+                    # search (the one that will press it), sending nothing yet.
+                    found = await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose"), press=False))
+                    if not found:
+                        return [types.TextContent(type="text", text=json.dumps({
+                            "ok": False, "action": action,
+                            "error": "An Open or Choose button was not found; no input was sent.",
+                        }))]
             if action == "cancel":
                 pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Cancel",)))
                 return [types.TextContent(type="text", text=json.dumps({

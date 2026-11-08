@@ -2391,11 +2391,12 @@ def ax_navigate_save_panel(pid: int, target_dir: str) -> str | None:
         return None
 
 
-def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False) -> str | None:
+def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False, press: bool = True) -> str | None:
     """Press a button inside an open sheet (save/open panel or alert) by title,
     via AX (focus-independent). `titles` is tried in order; `substring=True`
     matches when a wanted string is contained in a button title (for variable
-    labels like 'Use ".txt"'). Returns the matched button's title, else None."""
+    labels like 'Use ".txt"'). Returns the matched button's title, else None.
+    press=False only confirms that exactly one such button exists, sending nothing."""
     _check_stop()
     wanted = [t.lower() for t in titles]
     candidates = []
@@ -2455,6 +2456,8 @@ def ax_press_panel_button(pid: int, titles: tuple, substring: bool = False) -> s
             _check_stop()
             if _ax_str(element, b"AXRole") != "AXButton" or _ax_str(element, b"AXTitle") != title:
                 return None
+            if not press:
+                return title
             return title if _ax_press(element) else None
         finally:
             for element, title in candidates:
