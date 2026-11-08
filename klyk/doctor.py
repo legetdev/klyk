@@ -304,7 +304,7 @@ def check_accessibility_permission() -> CheckResult:
     return CheckResult(
         "Accessibility permission", "fail", "NOT granted",
         "Without Accessibility, klyk can't read the AX tree (no "
-        "inspect/click_element targeting) or post keyboard events. Grant it:\n"
+        "inspect and element targeting) or post keyboard events. Grant it:\n"
         "  1. System Settings → Privacy & Security → " + _panes.accessibility_pane() + "\n"
         "  2. Click + and add the terminal app you launch your MCP client from "
         "(Ghostty, Terminal, iTerm2, or the MCP client itself if it embeds Python).\n"

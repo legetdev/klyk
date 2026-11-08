@@ -335,8 +335,8 @@ def _check_stop() -> None:
             return
     raise EmergencyStop(
         "Emergency stop is ACTIVE — all Klyk input is blocked. It can be cleared "
-        "ONLY by the user pressing Cmd+Shift+Escape again; the resume tool cannot "
-        "clear it. Tell the user to press the chord to resume."
+        "ONLY by the user pressing Cmd+Shift+Escape again; no Klyk tool can clear "
+        "it. Tell the user to press the chord to resume."
     )
 
 
@@ -3887,6 +3887,53 @@ def _flush_clipboard_restore(*, revoked_only: bool = False) -> None:
 atexit.register(_flush_clipboard_restore)
 
 
+_PASTE_CONFIRM_SECONDS = 0.85  # Extra hold after the first 150 ms, at most.
+
+
+def _focused_value_has(pid: int, probe: str) -> bool:
+    """True when the app's focused element already shows probe; False when unknown."""
+    app_ptr = _appserv.AXUIElementCreateApplication(int(pid))
+    if not app_ptr:
+        return False
+    try:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app_ptr), _AX_MESSAGING_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        focused = _ax_read_attr_ptr(app_ptr, b"AXFocusedUIElement")
+        if not focused:
+            return False
+        try:
+            value = _ax_str_attr(focused, b"AXValue")
+        except ValueError:
+            return False
+        finally:
+            _cf.CFRelease(ctypes.c_void_p(focused))
+        return probe in value.replace("\r\n", "\n").replace("\r", "\n")
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(app_ptr))
+
+
+async def _await_paste_landed(pid: int | None, text: str) -> None:
+    """Keep the borrowed clipboard until the target shows the pasted text, bounded.
+
+    Returns as soon as the focused field contains the text's first line; unreadable
+    targets (secure fields, canvases) wait the full bound. Never sends input.
+    """
+    probe = next((line.strip() for line in text.splitlines() if line.strip()), "")[:80]
+    if not pid or not probe:
+        return
+    deadline = time.monotonic() + _PASTE_CONFIRM_SECONDS
+    loop = asyncio.get_running_loop()
+    while time.monotonic() < deadline:
+        try:
+            if await loop.run_in_executor(None, lambda: _focused_value_has(pid, probe)):
+                return
+        except Exception:
+            pass  # Unknown is treated as not yet visible; the bound still applies.
+        await asyncio.sleep(0.05)
+
+
 async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """Paste while preserving every clipboard type, including on failure or cancellation."""
     from AppKit import NSPasteboard
@@ -3920,6 +3967,9 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
             # Finish restoration before the next tool can intentionally replace
             # the clipboard. This also bounds cleanup after cancelled pastes.
             await asyncio.sleep(0.15)
+            # A busy app can read the clipboard after 150 ms; restoring first would
+            # paste the user's own clipboard. Hold it until the text shows up.
+            await _await_paste_landed(expected_frontmost_pid or pid, text)
         finally:
             # A real copy made by the user during the paste takes precedence.
             with _connection_gate.cleanup():

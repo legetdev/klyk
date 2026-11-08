@@ -325,7 +325,7 @@ async def _nearby_ax_hint(session, x: int, y: int, radius: int = 20) -> dict | N
                 "label": label.strip()[:80],
                 "role": elem.get("role", ""),
                 "distance_px": round(dist, 1),
-                "suggestion": "Prefer click_element(label=...) over click(x, y) when a label exists.",
+                "suggestion": "Prefer click(element=N) from inspect, or click(label=...), over coordinates when a control has a label.",
             }
     return best
 
@@ -4448,7 +4448,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                             f"AX list capped at {AX_CAP}"
                             + (" (slim mode — re-call without detail='slim' for the full list)"
                                if slim
-                               else f" — call ax_snapshot for the full tree if the target isn't here.")
+                               else " — call inspect with detail='all' for the full list if the target isn't here.")
                         )
                 except Exception as e:
                     log.warning("inspect AX read failed (%s)", type(e).__name__)
@@ -4481,7 +4481,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 ):
                     meta["ax_empty_hint"] = (
                         "No accessibility controls were returned. Use the image for visual "
-                        "targets or read_text for visible text; click_element can fall back to OCR."
+                        "targets or read_text for visible text; click with label can fall back to OCR."
                     )
 
             # Optional disk write. On success, omit the inline image to save tokens.
@@ -5394,7 +5394,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 template_b64 = cached
             elif not template_b64:
                 return [types.TextContent(type="text", text=json.dumps({
-                    "error": "wait_for_visual requires either 'template_id' or 'template_b64'.",
+                    "error": "Waiting for an image needs template_id or template_b64 from get_template.",
                 }))]
             present = bool(args.get("present", True))
             threshold = float(args.get("threshold", 0.8))
@@ -6335,7 +6335,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 return [types.TextContent(type="text", text=json.dumps({
                     "ok": False,
                     "emergency_stop": "active",
-                    "message": "An emergency stop is active and can be cleared ONLY by the user pressing Cmd+Shift+Escape again. Ask them to press the chord to resume — the resume tool cannot clear it.",
+                    "message": "An emergency stop is active and can be cleared ONLY by the user pressing Cmd+Shift+Escape again. Ask them to press the chord to resume; no Klyk tool can clear it.",
                 }))]
             return [types.TextContent(type="text", text=json.dumps({"ok": True, "emergency_stop": "inactive", "message": "No emergency stop is active."}))]
 
@@ -6633,10 +6633,9 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             payload: dict = {"ok": True, "mode": new_mode, "previous_mode": previous}
             if new_mode == "autonomous":
                 payload["note"] = (
-                    "Autonomous mode (the default): klyk auto-escalates to cursor-warp "
-                    "when the invisible path can't deliver. Every escalation is logged on "
-                    "the session — review later via list_sessions, the menu-bar status "
-                    "item dropdown, or get_escalation_log."
+                    "Autonomous mode (the default): klyk uses visible input only when the "
+                    "invisible path can't deliver. Every escalation is logged on the "
+                    "session; review it with status(app=...) or in the menu bar."
                 )
             return [types.TextContent(type="text", text=json.dumps(payload))]
 
@@ -7005,7 +7004,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                             "matches": best_matches[:match_limit],
                             "suggestion": (
                                 "Inspect the candidate coordinates and dimensions, then call "
-                                "click_element again with an explicit 0-based index."
+                                "click again with the same label and an explicit 0-based index."
                             ),
                         }
                         if len(best_matches) > match_limit:
@@ -7045,13 +7044,13 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     payload["hint"] = (
                         "Closest on-screen text is listed above (x/y are "
                         "window-relative pixels). If your target is among them "
-                        "under a different spelling, call click_element again with "
+                        "under a different spelling, call click again with "
                         "that exact text, or click(x, y) at its coordinates. "
-                        "Otherwise call ax_snapshot() to list interactive elements."
+                        "Otherwise call inspect with detail='all' to list controls."
                     )
                 else:
                     payload["hint"] = (
-                        "Call ax_snapshot() to see available elements, or "
+                        "Call inspect with detail='all' to see available controls, or "
                         "get_template + find_template for pixel-based targeting."
                     )
                 return [types.TextContent(type="text", text=json.dumps(payload))]
@@ -7059,7 +7058,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             return [types.TextContent(type="text", text=json.dumps({
                 "error": (
                     f"No element found matching '{args['label']}' in the accessibility "
-                    "tree or in visible on-screen text. Call ax_snapshot() to see what is "
+                    "tree or in visible on-screen text. Call inspect with detail='all' to see what is "
                     "available, or use get_template + find_template for pixel-based targeting."
                 ),
             }))]

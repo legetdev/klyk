@@ -273,6 +273,32 @@ class PublicRoutingTests(unittest.IsolatedAsyncioTestCase):
             for word in hidden:
                 self.assertNotIn(word, tool.description, f"{tool.name} mentions hidden {word.strip()}")
 
+    def test_runtime_messages_name_only_public_tools(self):
+        """Hints and errors returned to agents never point at tools agents cannot see."""
+        import ast
+        from pathlib import Path
+        source = (Path(__file__).resolve().parents[1] / "klyk/mcp_server.py").read_text()
+        tree = ast.parse(source)
+        hidden = ("click_element", "ax_snapshot", "get_escalation_log", "list_sessions", "wait_for_visual",
+                  "drag_to_element", "close_apps", "resume tool", "get_pixel(")
+        internal_end = next(node.end_lineno for node in tree.body if isinstance(node, ast.Assign)
+                            and any(getattr(t, "id", "") == "_INTERNAL_TOOLS" for t in node.targets))
+        skip = set()
+        for node in ast.walk(tree):
+            body = getattr(node, "body", None)
+            if isinstance(body, list) and body and isinstance(body[0], ast.Expr) \
+                    and isinstance(body[0].value, ast.Constant):
+                skip.add(id(body[0].value))  # Docstrings are for maintainers.
+            if isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute) \
+                    and getattr(node.func.value, "id", "") == "log":
+                skip.update(id(arg) for arg in node.args)  # Private diagnostics, never returned.
+        offenders = []
+        for node in ast.walk(tree):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str) and node.lineno > internal_end \
+                    and id(node) not in skip and " " in node.value and any(word in node.value for word in hidden):
+                offenders.append((node.lineno, node.value[:80]))
+        self.assertEqual(offenders, [])
+
     async def test_click_targets_route_to_one_handler(self):
         self.session.width, self.session.height = 800, 600
         await self.call("click", {"app": "Fixture", "label": "Save"})
@@ -466,3 +492,40 @@ class SettingsNameTests(unittest.TestCase):
             with self.subTest(version=version), mock.patch("platform.mac_ver", return_value=(version, ("", "", ""), "")):
                 self.assertEqual(settings_names.accessibility_pane(), accessibility)
                 self.assertEqual(settings_names.screen_recording_pane(), screen)
+
+
+class PasteHoldTests(unittest.IsolatedAsyncioTestCase):
+    """The borrowed clipboard is kept until a slow app has actually pasted."""
+
+    def load(self, seen):
+        import asyncio as real_asyncio
+        import time as real_time
+        from test_input_cleanup import load_functions
+        calls = []
+
+        def has(pid, probe):
+            calls.append((pid, probe))
+            return seen(len(calls))
+        ns = {"asyncio": real_asyncio, "time": real_time, "_focused_value_has": has,
+              "_PASTE_CONFIRM_SECONDS": 0.3}
+        load_functions("computer.py", {"_await_paste_landed"}, ns)
+        return ns["_await_paste_landed"], calls
+
+    async def test_returns_once_the_field_shows_the_text(self):
+        wait, calls = self.load(lambda count: count >= 2)
+        started = __import__("time").monotonic()
+        await wait(42, "  \nHello world\nsecond line")
+        self.assertLess(__import__("time").monotonic() - started, 0.25)
+        self.assertEqual(calls[0], (42, "Hello world"))
+
+    async def test_unconfirmed_paste_waits_the_bound(self):
+        wait, calls = self.load(lambda count: False)
+        started = __import__("time").monotonic()
+        await wait(42, "text")
+        self.assertGreaterEqual(__import__("time").monotonic() - started, 0.28)
+
+    async def test_no_target_or_blank_text_returns_immediately(self):
+        wait, calls = self.load(lambda count: False)
+        await wait(None, "text")
+        await wait(42, "   ")
+        self.assertEqual(calls, [])
