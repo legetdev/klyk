@@ -173,6 +173,49 @@ class ConnectionPolicyTests(unittest.TestCase):
             with self.subTest(value=value):
                 self.assertFalse(policy.allows(value))
 
+    def test_disable_all_revokes_every_environment_in_one_save(self):
+        """One click must turn everything Off at once and invalidate every in-flight request."""
+        policy.set_enabled("codex", True)
+        policy.set_enabled("cursor", True)
+        policy.set_enabled("claude", True)
+        policy.set_enabled("claude", False)
+        before = policy.snapshot()
+        tokens = [policy.token("codex"), policy.token("cursor")]
+        with patch.object(policy.jsonc, "atomic_write", wraps=policy.jsonc.atomic_write) as write:
+            after = policy.disable_all()
+        write.assert_called_once()
+        self.assertFalse(any(row["enabled"] for row in after["clients"].values()))
+        self.assertEqual(after["revision"], before["revision"] + 1)
+        for key in ("codex", "cursor"):
+            self.assertEqual(after["clients"][key]["generation"], after["revision"])
+        # An environment that was already Off keeps its token; nothing else is touched.
+        self.assertEqual(after["clients"]["claude"], before["clients"]["claude"])
+        self.assertEqual(after["clients"]["gemini"], before["clients"]["gemini"])
+        self.assertFalse(any(policy.allows(value) for value in tokens))
+        self.assertEqual(policy.snapshot(), after)
+        self.assertEqual(self.path.stat().st_mode & 0o777, 0o600)
+
+    def test_disable_all_is_idempotent_and_creates_off_state_when_missing(self):
+        """Repeating the click writes nothing, and a missing file becomes an explicit all-Off file."""
+        self.assertFalse(self.path.exists())
+        created = policy.disable_all()
+        self.assertTrue(self.path.exists())
+        self.assertEqual(created, policy._default())
+        policy.set_enabled("opencode", True)
+        policy.disable_all()
+        settled = self.path.read_bytes()
+        with patch.object(policy.jsonc, "atomic_write") as write:
+            self.assertEqual(policy.disable_all(), json.loads(settled))
+        write.assert_not_called()
+        self.assertEqual(self.path.read_bytes(), settled)
+
+    def test_disable_all_fails_closed_on_unreadable_settings(self):
+        """Unreadable settings already deny access and must never be overwritten blindly."""
+        self.write("broken")
+        with self.assertRaises(ValueError):
+            policy.disable_all()
+        self.assertEqual(self.path.read_text(), "broken")
+
     def test_controller_starts_without_secret_environment_or_native_imports(self):
         """A background controller must not inherit credentials or execute desktop probes."""
         with patch.object(controls.sys, "platform", "darwin"), patch.object(controls, "running", return_value=False), \

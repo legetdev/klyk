@@ -36,6 +36,11 @@ class SetupSecurityTests(unittest.TestCase):
             stub = mock.patch.object(controls, name, return_value=value)
             stub.start()
             self.addCleanup(stub.stop)
+        # This interpreter may be the owner's installation; never find or stop its real servers.
+        self.find_servers = cli._installation_servers
+        servers = mock.patch.object(cli, "_installation_servers", return_value=[])
+        servers.start()
+        self.addCleanup(servers.stop)
 
     def _identity(self, pid, argv=None, uid=None):
         """Build a stable synthetic process identity for restart selection."""
@@ -118,6 +123,7 @@ class SetupSecurityTests(unittest.TestCase):
         fake = types.ModuleType("klyk.launcher")
         fake.terminate_pid = mock.Mock(side_effect=(True, False))
         with mock.patch.dict(sys.modules, {"klyk.launcher": fake}), \
+             mock.patch.object(cli, "_installation_servers", self.find_servers), \
              mock.patch.object(cli.subprocess, "run", return_value=mock.Mock(stdout="11\n22\n33\n11\n", returncode=0)) as enumerate_processes, \
              mock.patch.object(cli, "_installation_process", side_effect=lambda pid: {11: first, 33: third}.get(pid)):
             cli._restart_after_update()
@@ -208,6 +214,92 @@ class SetupSecurityTests(unittest.TestCase):
             with self.assertRaises(SystemExit):
                 cli._update([])
             restart.assert_not_called()
+
+    def updated(self, version="99.0.0"):
+        """Run a successful pip upgrade to the given version with every process inert."""
+        with mock.patch.object(updates, "install_method", return_value="pip"), \
+             mock.patch.object(cli.subprocess, "run", side_effect=(mock.Mock(returncode=0, stdout="", stderr=""),
+                                                                    mock.Mock(returncode=0, stdout=version, stderr=""))), \
+             mock.patch.object(updates, "check", return_value={"latest": version}), \
+             mock.patch.object(cli, "_restart_after_update") as servers:
+            cli._update([])
+        return servers
+
+    def test_update_restarts_running_controls_on_the_new_version(self):
+        """The menu shows the updated controller at once, quietly and with the panel closed."""
+        with mock.patch.object(controls, "running", return_value=True), \
+             mock.patch.object(controls, "stop_running", return_value=True) as stop, \
+             mock.patch.object(controls, "start_background", return_value=True) as start:
+            servers = self.updated()
+        servers.assert_called_once()
+        stop.assert_called_once()
+        start.assert_called_once_with(show=False)
+        self.assertIn("Restarted the menu-bar controls", self.output.getvalue())
+
+    def test_update_leaves_stopped_controls_and_unchanged_versions_alone(self):
+        """No controller appears that the owner had quit, and a no-op update changes nothing."""
+        import klyk
+        with mock.patch.object(controls, "start_background") as start:
+            self.updated()
+            start.assert_not_called()
+        with mock.patch.object(klyk, "__version__", "99.0.0"), \
+             mock.patch.object(controls, "running", return_value=True), \
+             mock.patch.object(controls, "start_background") as start:
+            servers = self.updated("99.0.0")
+            start.assert_not_called()
+            servers.assert_not_called()
+        self.assertIn("no version change was needed", self.output.getvalue())
+
+    def test_update_reports_a_controller_that_could_not_restart(self):
+        """A failed restart points to the one command that brings the controls back."""
+        for failure in ({"return_value": False}, {"side_effect": RuntimeError("no")}):
+            with self.subTest(failure=failure), \
+                 mock.patch.object(controls, "running", return_value=True), \
+                 mock.patch.object(controls, "start_background", **failure):
+                self.updated()
+            self.assertIn("Run `klyk controls`", self.output.getvalue())
+
+    def test_full_uninstall_stops_servers_before_removing_state(self):
+        """Running servers stop first, so none can recreate state, and presence goes with ~/.klyk."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".klyk"
+            (state / "presence").mkdir(parents=True)
+            (state / "presence" / "4242.json").write_text("{}")
+            identity = self._identity(4242)
+            order = []
+            fake = types.ModuleType("klyk.launcher")
+            fake.terminate_pid = mock.Mock(side_effect=lambda pid, **_: order.append(("server", state.exists())) or True)
+            with mock.patch.dict(sys.modules, {"klyk.launcher": fake}), \
+                 mock.patch.object(Path, "home", return_value=home), \
+                 mock.patch.object(clients, "CLIENTS", {}), \
+                 mock.patch.object(cli, "_installation_servers", return_value=[(4242, identity)]), \
+                 mock.patch.object(controls, "stop_running", side_effect=lambda: order.append(("controls", True)) or True):
+                cli._uninstall([])
+            fake.terminate_pid.assert_called_once_with(4242, expected_identity=identity)
+            self.assertEqual(order, [("server", True), ("controls", True)])
+            self.assertFalse(state.exists())
+        self.assertIn("stopped 1 running klyk server", self.output.getvalue())
+
+    def test_full_uninstall_keeps_state_when_a_server_cannot_be_stopped(self):
+        """A server that survives could recreate files, so nothing is removed and the owner is told why."""
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            state = home / ".klyk"
+            state.mkdir()
+            fake = types.ModuleType("klyk.launcher")
+            fake.terminate_pid = mock.Mock(return_value=False)
+            with mock.patch.dict(sys.modules, {"klyk.launcher": fake}), \
+                 mock.patch.object(Path, "home", return_value=home), \
+                 mock.patch.object(clients, "CLIENTS", {}), \
+                 mock.patch.object(cli, "_installation_servers", return_value=[(4242, self._identity(4242))]), \
+                 mock.patch.object(controls, "stop_running") as stop_controls:
+                with self.assertRaises(SystemExit) as exit_status:
+                    cli._uninstall([])
+            self.assertEqual(exit_status.exception.code, 1)
+            stop_controls.assert_not_called()
+            self.assertTrue(state.is_dir())
+        self.assertIn("No state was removed", self.output.getvalue())
 
     def test_full_uninstall_retains_runtime_when_client_cleanup_fails(self):
         """An unreadable config cannot be left pointing at binaries that were just removed."""
