@@ -595,24 +595,18 @@ class PasteHoldTests(unittest.IsolatedAsyncioTestCase):
 class ZoomSizingTests(unittest.TestCase):
     """Zoom never asks for a capture beyond the image limits and fits the model budget."""
 
-    def test_zoom_capture_sizes_stay_within_limits(self):
-        from unittest.mock import patch
-        from klyk import capture, image_bounds
-        requested = []
-
-        def fake_take(window_id, width, height, crop=None):
-            image_bounds.validate_image_dimensions(width, height)
-            requested.append((width, height, crop))
-            return "", crop[2], crop[3]
-
-        fake_module = SimpleNamespace(take=fake_take)
-        with patch.object(capture, "_HAS_IMAGEIO", True), patch.dict("sys.modules", {"klyk.window_capture": fake_module}), \
-                patch.object(__import__("klyk"), "window_capture", fake_module, create=True):
-            for size, region in (((1919, 1081), (10, 10, 60, 40)), ((1920, 1080), (0, 0, 1920, 1080)),
-                                 ((3000, 2000), (100, 100, 400, 300)), ((800, 600), (5, 5, 6, 6))):
-                with self.subTest(size=size, region=region):
-                    _, width, height, magnification = capture.zoom_window(7, *size, region, (1568, 1568))
-                    self.assertLessEqual(max(width, height), 1568)
-                    self.assertLessEqual(math.ceil(width / 28) * math.ceil(height / 28), 1568)
-                    self.assertLessEqual(magnification, 4.0)
-        self.assertEqual(len(requested), 4)
+    def test_zoom_plans_stay_within_limits(self):
+        from klyk import image_bounds
+        for size, region in (((1919, 1081), (10, 10, 60, 40)), ((1920, 1080), (0, 0, 1920, 1080)),
+                             ((3000, 2000), (100, 100, 400, 300)), ((800, 600), (5, 5, 6, 6)),
+                             ((5120, 2880), (0, 0, 5120, 2880)), ((400, 300), (390, 290, 900, 900))):
+            with self.subTest(size=size, region=region):
+                magnification, full, crop = frames.zoom_plan(*size, region, (1568, 1568))
+                image_bounds.validate_image_dimensions(*full)
+                self.assertLessEqual(max(crop[2], crop[3]), 1568)
+                self.assertLessEqual(math.ceil(crop[2] / 28) * math.ceil(crop[3] / 28), 1568)
+                self.assertLessEqual(crop[0] + crop[2], full[0])
+                self.assertLessEqual(crop[1] + crop[3], full[1])
+                self.assertLessEqual(magnification, 4.0)
+        with self.assertRaises(ValueError):
+            frames.zoom_plan(400, 300, (500, 500, 600, 600), (1568, 1568))

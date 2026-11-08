@@ -65,6 +65,38 @@ def fit(width: int, height: int, max_edge: int | None = None, max_tiles: int | N
     return best
 
 
+def zoom_plan(width: int, height: int, region, budget: tuple[int, int]):
+    """Plan a magnified window capture of region (x1, y1, x2, y2 in logical points).
+
+    Returns (magnification, full_size, crop) where full_size is the whole window
+    rendered at that magnification and crop = (x, y, w, h) in its pixels. The crop
+    fits the model budget; magnification is at most 4 and the full capture stays
+    inside the 16-megapixel / 8192-pixel image limits.
+    """
+    x1, y1, x2, y2 = (int(v) for v in region)
+    x1, y1 = max(0, x1), max(0, y1)
+    x2, y2 = min(int(width), x2), min(int(height), y2)
+    if x2 - x1 < 1 or y2 - y1 < 1:
+        raise ValueError("The zoom region has no area inside the window; check its corners.")
+    region_w, region_h = x2 - x1, y2 - y1
+    max_edge, max_tiles = budget
+    fit_edge = max_edge / max(region_w, region_h)
+    fit_area = math.sqrt(max_tiles * _PATCH * _PATCH / (region_w * region_h))
+    # Stay just inside the capture limits after rounding.
+    memory = 0.99 * min(math.sqrt(16_000_000 / (width * height)), 8192 / max(width, height))
+    magnification = max(0.1, min(fit_edge, fit_area, 4.0, memory))
+    while True:
+        full = (max(1, int(round(width * magnification))), max(1, int(round(height * magnification))))
+        left = min(int(math.floor(x1 * magnification)), full[0] - 1)
+        top = min(int(math.floor(y1 * magnification)), full[1] - 1)
+        crop = (left, top,
+                max(1, min(int(round(region_w * magnification)), full[0] - left)),
+                max(1, min(int(round(region_h * magnification)), full[1] - top)))
+        if _fits(crop[2], crop[3], max_edge, max_tiles) or magnification <= 0.1:
+            return round(magnification, 3), full, crop
+        magnification = max(0.1, magnification * 0.97)
+
+
 @dataclass(frozen=True)
 class Frame:
     """Map between a window's logical points and its agent-facing image pixels."""

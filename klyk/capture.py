@@ -1380,33 +1380,9 @@ def zoom_window(window_id: int, logical_width: int, logical_height: int,
     width, height, magnification) where magnification is image pixels per
     logical point, at most 4, chosen so the image fits budget.
     """
-    import math
     from . import frames as _frames
     _validate_image_dimensions(logical_width, logical_height)
-    x1, y1, x2, y2 = (int(v) for v in region)
-    x1, y1 = max(0, x1), max(0, y1)
-    x2, y2 = min(int(logical_width), x2), min(int(logical_height), y2)
-    if x2 - x1 < 1 or y2 - y1 < 1:
-        raise ValueError("The zoom region has no area inside the window; check its corners.")
-    region_w, region_h = x2 - x1, y2 - y1
-    max_edge, max_tiles = budget
-    fit_edge = max_edge / max(region_w, region_h)
-    fit_area = math.sqrt(max_tiles * 28 * 28 / (region_w * region_h))
-    # Stay just inside the 16-megapixel / 8192-pixel capture limits after rounding.
-    memory = 0.99 * min(math.sqrt(16_000_000 / (logical_width * logical_height)),
-                        8192 / max(logical_width, logical_height))
-    magnification = max(0.1, min(fit_edge, fit_area, 4.0, memory))
-    while True:
-        full = (max(1, int(round(logical_width * magnification))),
-                max(1, int(round(logical_height * magnification))))
-        left = min(int(math.floor(x1 * magnification)), full[0] - 1)
-        top = min(int(math.floor(y1 * magnification)), full[1] - 1)
-        crop = (left, top,
-                max(1, min(int(round(region_w * magnification)), full[0] - left)),
-                max(1, min(int(round(region_h * magnification)), full[1] - top)))
-        if _frames._fits(crop[2], crop[3], max_edge, max_tiles) or magnification <= 0.1:
-            break
-        magnification = max(0.1, magnification * 0.97)
+    magnification, full, crop = _frames.zoom_plan(logical_width, logical_height, region, budget)
     if not _HAS_IMAGEIO:
         raise RuntimeError("Zoom needs ImageIO and ScreenCaptureKit (macOS 14 or later).")
     from . import window_capture
