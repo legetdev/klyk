@@ -610,3 +610,39 @@ class ZoomSizingTests(unittest.TestCase):
                 self.assertLessEqual(magnification, 4.0)
         with self.assertRaises(ValueError):
             frames.zoom_plan(400, 300, (500, 500, 600, 600), (1568, 1568))
+
+
+class OwnershipLockTests(unittest.TestCase):
+    """A reader holding the owner lock for a moment never makes the driver look like a stranger."""
+
+    def test_brief_contention_waits_instead_of_refusing(self):
+        import fcntl
+        import tempfile
+        import threading
+        import time as real_time
+        from pathlib import Path
+        from klyk import ownership
+        with tempfile.TemporaryDirectory() as folder:
+            path = Path(folder) / "owner"
+            path.write_text(f"{os.getpid()}\n")
+            path.chmod(0o600)
+            with mock.patch.object(ownership, "OWNER_PATH", path), \
+                    mock.patch.object(ownership, "_MY_PID", os.getpid()):
+                holder = open(path, "a+")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+                releaser = threading.Timer(0.03, lambda: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
+                releaser.start()
+                try:
+                    self.assertTrue(ownership.is_owner())
+                finally:
+                    releaser.join()
+                    holder.close()
+                # A lock held past the bound still fails closed, promptly.
+                holder = open(path, "a+")
+                fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
+                try:
+                    started = real_time.monotonic()
+                    self.assertFalse(ownership.is_owner())
+                    self.assertLess(real_time.monotonic() - started, 1.0)
+                finally:
+                    holder.close()
