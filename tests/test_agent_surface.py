@@ -630,7 +630,7 @@ class OwnershipLockTests(unittest.TestCase):
                     mock.patch.object(ownership, "_MY_PID", os.getpid()):
                 holder = open(path, "a+")
                 fcntl.flock(holder.fileno(), fcntl.LOCK_EX)
-                releaser = threading.Timer(0.03, lambda: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
+                releaser = threading.Timer(0.01, lambda: fcntl.flock(holder.fileno(), fcntl.LOCK_UN))
                 releaser.start()
                 try:
                     self.assertTrue(ownership.is_owner())

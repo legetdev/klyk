@@ -100,7 +100,7 @@ def _open():
         return None
 
 
-_LOCK_WAIT_SECONDS = 0.25
+_LOCK_WAIT_SECONDS = 0.05
 
 
 def _lock(fh, mode: int, wait: float = _LOCK_WAIT_SECONDS) -> bool:
