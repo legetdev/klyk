@@ -37,6 +37,7 @@ NATIVE_CHECKS = frozenset({
     'stale window refused without closing app', 'close_app closed fixture',
     'second fixture started', 'close_app closed several fixtures', 'all declared tools exercised',
     'element click changed native counter', 'zoomed region returned', 'running apps listed',
+    'status reports no emergency stop',
 })
 DESKTOP_CHECKS = frozenset({
     'browser fixture loaded', 'one isolated browser window identified',

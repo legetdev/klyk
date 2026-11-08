@@ -45,8 +45,10 @@ from mcp import types
 from . import __version__
 from . import activity
 from . import connection_gate
+from . import controls as access_controls
 from . import elements as elements_mod
 from . import frames
+from . import presence
 from . import surface
 from . import ownership
 from . import reporter as reporter_mod
@@ -2606,9 +2608,9 @@ def _running_apps() -> list[dict]:
     return apps[:200]
 
 
-async def _click_numbered_element(session, number: int) -> list:
+async def _click_numbered_element(session, number: int, app: str) -> list:
     """Click an inspected element: its own accessibility action first, else its live center."""
-    target = await _element_target(session.app, number, require_hit=False)
+    target = await _element_target(app, number, require_hit=False)
     entry, state = target["entry"], target["state"]
     await _refresh_window(session, window_id=target["window_id"])
     clicked = {"element": number, "role": state["role"], "x": target["x"], "y": target["y"],
@@ -2628,8 +2630,8 @@ async def _click_numbered_element(session, number: int) -> list:
             return [types.TextContent(type="text", text=json.dumps({
                 "ok": True, "clicked": clicked, "via": "ax_action", "action": pressed.get("action"),
             }))]
-    target = await _element_target(session.app, number, require_hit=True)
-    response = await call_tool("click", {"app": session.app, "window_id": target["window_id"],
+    target = await _element_target(app, number, require_hit=True)
+    response = await call_tool("click", {"app": app, "window_id": target["window_id"],
                                          "x": target["x"], "y": target["y"]})
     outcome = json.loads(response[-1].text)
     outcome["clicked" if outcome.get("ok") else "matched_element"] = clicked
@@ -4131,6 +4133,24 @@ async def _execute_public_route(name: str, args: dict) -> list:
         return _respond({"ok": False, "error": str(error)})
 
 
+def _note_request(name, arguments) -> None:
+    """Keep the user's menu-bar controls present and show which app this environment works in."""
+    try:
+        access_controls.ensure_running()
+    except Exception:
+        pass
+
+
+def _note_activity(name, arguments) -> None:
+    """Record a permitted request for the controls' live status; display-only, never raises."""
+    try:
+        app = arguments.get("app") if isinstance(arguments, dict) else None
+        presence.record(connection_gate.policy.current_client(), app if isinstance(app, str) else None,
+                        name if isinstance(name, str) else None)
+    except Exception:
+        pass
+
+
 @_call_tool_handler
 async def call_tool(
     name: str, arguments: dict | None, *, request_id=None
@@ -4149,6 +4169,7 @@ async def call_tool(
                 _run_step_context.reset(step_token)
         return await _execute_tool(name, arguments)
     request = None
+    _note_request(name, arguments)
     try:
         with connection_gate.request() as request:
             if request_id is None:
@@ -4168,6 +4189,7 @@ async def call_tool(
                 try:
                     result = await _execute_public(name, arguments)
                     connection_gate.checkpoint()
+                    _note_activity(name, arguments)
                     return result
                 finally:
                     _call_context.reset(token)
@@ -6823,7 +6845,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
         elif name == "click_element":
             session, _ = await _get_session(args, name)
             if "element" in args:
-                return await _click_numbered_element(session, int(args["element"]))
+                return await _click_numbered_element(session, int(args["element"]), args["app"])
             query = _normalize_label(args["label"])
             index_explicit = "index" in args
             index = int(args.get("index", 0))
@@ -7258,6 +7280,10 @@ async def main():
 
 def _cleanup_input_on_exit() -> None:
     """Halt new input and release keys/buttons before restoring any borrowed clipboard."""
+    try:
+        presence.clear()  # Lock-free; safe from signal handlers and forced exits.
+    except Exception:
+        pass
     if computer is None:
         return
     try:
@@ -7382,7 +7408,9 @@ async def _ensure_native_runtime() -> None:
         connection_gate.checkpoint()
         if not _native_initialized:
             await asyncio.get_running_loop().run_in_executor(
-                None, lambda: _ui.dispatch_sync(_initialize_native_runtime, timeout=10.0),
+                # A heavily loaded Mac can take well over 10 s to load the native frameworks;
+                # a slower first call is better than a failed one.
+                None, lambda: _ui.dispatch_sync(_initialize_native_runtime, timeout=30.0),
             )
             connection_gate.checkpoint()
             try:
@@ -7396,7 +7424,7 @@ async def _ensure_native_runtime() -> None:
                 log.warning("SkyLight delivery self-test skipped (%s)", type(error).__name__)
             connection_gate.checkpoint()
             await asyncio.get_running_loop().run_in_executor(
-                None, lambda: _ui.dispatch_sync(_finish_native_initialization, timeout=2.0),
+                None, lambda: _ui.dispatch_sync(_finish_native_initialization, timeout=10.0),
             )
         connection_gate.checkpoint()
         computer._start_emergency_stop_tap()
@@ -7561,6 +7589,10 @@ def _main_entry() -> None:
     """
     if sys.platform == "darwin":
         _start_access_controls()
+        try:
+            presence.connected(connection_gate.policy.current_client())
+        except Exception:
+            pass  # Live status is display-only; it never gates the protocol.
         _run_on_macos()
     else:
         # Non-darwin builds are not officially supported (klyk is macOS

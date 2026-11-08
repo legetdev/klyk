@@ -363,3 +363,92 @@ class PublicRoutingTests(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class ElementActionTests(unittest.IsolatedAsyncioTestCase):
+    """Numbered elements act on the exact control and refuse rather than guess."""
+
+    def setUp(self):
+        self.s = load_server()
+        self.session = SimpleNamespace(app="Fixture", pid=123, window_id=7, width=400, height=300, win_x=100,
+                                       win_y=50, mode="autonomous", windowless=False, frames={}, elements=None,
+                                       escalation_log=[], screenshots_taken=0, ax_warmup_attempted=False,
+                                       ax_disabled_warned_on_inspect=False)
+        self.s.registry.get_by_app.return_value = self.session
+        self.s._get_session = AsyncMock(return_value=(self.session, False))
+        self.s._refresh_window = AsyncMock()
+        self.s.ownership.is_owner.return_value = True
+        self.s.computer._check_stop.return_value = None
+        native = self.s.computer
+        native.refs_equal = lambda a, b: a == b
+        native.ref_hash = lambda ref: ref
+        native.ax_ref_state.return_value = {"role": "AXButton", "label": "Save", "value": "draft",
+                                            "value_status": "ok", "x": 200.0, "y": 100.0,
+                                            "width": 80.0, "height": 20.0}
+        native.ax_ref_at_point.return_value = True
+        self.s.capture.get_window_by_id.return_value = {"pid": 123, "x": 100, "y": 50, "width": 400,
+                                                        "height": 300, "window_id": 7}
+        self.s._is_chromium_based = lambda session: False
+        self.s._element_table(self.session).adopt(123, 7, [{"role": "AXButton", "label": "Save", "_ref": 555}])
+
+    async def test_plain_click_uses_the_elements_own_action(self):
+        self.s.computer.ax_ref_perform.return_value = {"ok": True, "action": "AXPress", "status": "performed"}
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
+        self.assertEqual(result["via"], "ax_action")
+        self.assertEqual((result["clicked"]["x"], result["clicked"]["y"]), (140.0, 60.0))
+        self.assertEqual(self.s.computer.ax_ref_perform.call_args.args[0], 555)
+
+    async def test_unsupported_action_falls_back_to_its_live_center(self):
+        self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported"}
+        self.s.call_tool = AsyncMock(return_value=text({"ok": True, "via": "skylight+keyed"}))
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
+        self.assertEqual(result["via"], "element+skylight+keyed")
+        sent = self.s.call_tool.call_args.args[1]
+        self.assertEqual((sent["x"], sent["y"], sent["window_id"]), (140.0, 60.0, 7))
+
+    async def test_covered_or_vanished_elements_send_nothing(self):
+        self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported"}
+        self.s.computer.ax_ref_at_point.return_value = False
+        self.s.call_tool = AsyncMock()
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
+        self.assertFalse(result["ok"])
+        self.assertIn("covered or scrolled", result["error"])
+        self.s.call_tool.assert_not_awaited()
+        self.s.computer.ax_ref_state.return_value = None
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
+        self.assertIn("no longer exists", result["error"])
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 99}))
+        self.assertIn("never listed", result["error"])
+
+    async def test_offscreen_element_is_refused(self):
+        self.s.computer.ax_ref_state.return_value = {**self.s.computer.ax_ref_state.return_value, "x": 900.0}
+        self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported"}
+        result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
+        self.assertIn("outside its window", result["error"])
+
+    async def test_read_and_actions_use_the_reference(self):
+        result = payload(await self.s._execute_tool("read_element", {"app": "Fixture", "element": 1}))
+        self.assertEqual((result["value"], result["status"], result["element"]), ("draft", "ok", 1))
+        self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported",
+                                                       "available_actions": ["AXPress"]}
+        result = payload(await self.s._execute_tool("ax_action", {"app": "Fixture", "element": 1,
+                                                                   "action": "AXIncrement"}))
+        self.assertEqual(result["available_actions"], ["AXPress"])
+        self.assertEqual(result["action"], "AXIncrement")
+
+    async def test_inspect_numbers_shown_elements_and_releases_the_rest(self):
+        raw = [{"role": "AXButton", "label": f"B{i}", "x": 150 + i, "y": 60, "width": 10, "height": 10,
+                "_ref": 1000 + i} for i in range(60)]
+        self.s.computer.ax_snapshot.return_value = raw
+        self.s._take_screenshot = AsyncMock(return_value=("", 400, 300, None))
+        self.session.elements = None
+        result = payload(await self.s._execute_tool("inspect", {"app": "Fixture"}))
+        numbers = [element["element"] for element in result["ax_elements"]]
+        self.assertEqual(numbers, list(range(1, 51)))
+        self.assertEqual(list(result["ax_elements"][0])[0], "element")
+        dropped = self.s.computer.release_refs.call_args.args[0]
+        self.assertEqual(len(dropped), 10)
+        self.s.computer.ax_snapshot.return_value = [{"role": "AXButton", "label": "B0", "x": 150, "y": 60,
+                                                     "width": 10, "height": 10, "_ref": 1000}]
+        result = payload(await self.s._execute_tool("inspect", {"app": "Fixture"}))
+        self.assertEqual(result["ax_elements"][0]["element"], 1, "the same element keeps its number")

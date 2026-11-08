@@ -23,7 +23,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 from klyk import capture, computer
 from klyk.client import KlykClient
-from release_check import fingerprint
+from release_check import expected_tools, fingerprint
 from live_smoke import finalize_report, stop_fixture_process
 
 
@@ -131,7 +131,7 @@ def main():
             check('MCP startup preserved foreground', foreground_safe(client._proc.pid))
             tools = client.list_tools()
             report['schema_bytes'] = len(json.dumps(tools))
-            check('48 tools discovered over real MCP', len(tools) == 48)
+            check('all declared tools discovered over real MCP', {tool['name'] for tool in tools} == expected_tools())
 
             def call(name, **arguments):
                 """Call the shipped MCP entry point and enforce the background boundary."""
@@ -174,13 +174,13 @@ def main():
                 read, _ = call('read_element', x=field['x'], y=field['y'])
                 check(title + ' covered read targets selected window', read['value'] == text)
                 before = current()['clicks']
-                call('click_element', label=f'Increment {index}')
+                call('click', label=f'Increment {index}')
                 check(title + ' semantic action occurred exactly once', settled(lambda: current()['clicks'] == before + 1))
                 # Duplicate labels are intentional fixture ambiguity, not a failed acceptance call.
-                ambiguous = payload(client.call('click_element', {'app': 'KlykParityFixture', 'label': 'Duplicate'}))
+                ambiguous = payload(client.call('click', {'app': 'KlykParityFixture', 'label': 'Duplicate'}))
                 check(title + ' duplicate controls remain ambiguous', ambiguous.get('ambiguous') is True)
                 check(title + ' ambiguous action sent no input', current()['clicks'] == before + 1)
-                ax, _ = call('ax_snapshot')
+                ax, _ = call('inspect', detail='all')
                 check(title + ' expanded AX retains selection', ax['window_id'] == wid)
                 anchor = next(e for e in ax['elements'] if e.get('value') == f'Klyk visual anchor {index}')
                 rx, ry = max(0, anchor['x'] - anchor['width'] // 2 - 3), max(0, anchor['y'] - 30)

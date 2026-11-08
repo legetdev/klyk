@@ -36,13 +36,19 @@ Klyk closes that gap. It gives an AI agent the same input channel a human has �
 ## What it does
 
 ```
-> screenshot the app, then click "Sign in"
-[ inspect returns a fresh window screenshot plus a bounded AX element list ]
-[ click_element finds "Sign in" via accessibility, then on-device OCR if needed ]
-[ Klyk performs an AX action or sends input using the app and session delivery mode ]
+> look at Mail, then click "Reply"
+[ inspect returns a fresh window screenshot plus numbered controls: 12 AXButton "Reply" … ]
+[ click(element=12) presses that exact button through accessibility: no cursor movement ]
+[ inspect again to confirm the reply window opened ]
 ```
 
-Tools cover observation, interaction, evaluation, session management, and system operations. Label targeting uses AX → on-device OCR; separate template tools locate previously captured icons or graphics without text. Cross-app drag, right-click-then-select, and multilingual OCR are all first-class. Per-call latency + reasoning-gap metrics so the agent can self-pace. `inspect` combines a screenshot with best-effort AX targeting data in one round-trip; `screenshot` returns only the image.
+38 tools, one per intent: observe (`inspect`, `screenshot` with zoom, `read_text`, `read_element`, pixels and grids), act (`click`, `drag`, `fill_field`, `type_text`, `press_key`, `scroll`, menus, dialogs), wait, batch (`run`), and manage windows and sessions. Targets are given the same way everywhere:
+
+- **Element numbers** from `inspect` are the most reliable target. The same control keeps its number across observations, and Klyk acts on that exact control wherever it is now, or refuses if it is gone or covered.
+- **Visible text** (`click(label="Sign in")`) searches accessibility first, then on-device OCR, and refuses ambiguous matches.
+- **Coordinates** are pixels of the latest screenshot of that window. Klyk sizes every screenshot so current vision models see it unchanged (at most 1568 pixels on the long edge), and converts coordinates both ways. `screenshot(region=[x1, y1, x2, y2])` zooms in for small text.
+
+Arguments in the spellings computer-use models are trained on also work: `coordinate: [x, y]`, `ref_12`, `scroll_direction`, `ctrl+shift` modifier chords, uppercase key arrays like `["CMD", "S"]`, and xdotool key names like `Page_Down`. `run` accepts batches written as computer-use action lists. Set `KLYK_IMAGE_TIER=high` in the server's environment to send up to 2576-pixel screenshots to models that accept them.
 
 ## Install
 
@@ -175,15 +181,17 @@ echo '{"tool":"screen_info","args":{}}' | klyk-call --batch   # many calls, one 
 ## Quick example
 
 ```
-inspect(app="Google Chrome")
-# → returns the image plus a bounded AX element list
+inspect(app="Calculator")
+# → the window image plus numbered controls, e.g. 14: AXButton "7", 9: AXButton "Multiply", 20: AXButton "Equals"
 
-run(app="Google Chrome", actions=[
-    {"tool": "click", "x": 580, "y": 389},
-    {"tool": "fill_field", "x": 580, "y": 389, "text": "This video is incredible!"},
-    {"tool": "screenshot"}
+run(app="Calculator", actions=[
+    {"tool": "click", "element": 14},
+    {"tool": "click", "element": 9},
+    {"tool": "press_key", "key": "8"},
+    {"tool": "click", "element": 20},
+    {"tool": "inspect", "detail": "slim"}
 ])
-# → executes the full sequence at OS speed, returns one batched response
+# → runs the predictable steps in one call, stops at the first failure, ends with an observation
 
 verdict(app="Google Chrome", test_description="Entered the expected text in the comment field")
 # → returns final screenshot + logs + grading criteria for the agent to synthesize PASS/FAIL
@@ -204,7 +212,8 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 
 | Module | Purpose |
 |---|---|
-| `mcp_server.py` | MCP server, tool definitions, dispatch |
+| `mcp_server.py` | MCP server, public tools, routing onto handlers, dispatch |
+| `surface.py`, `frames.py`, `elements.py` | Familiar argument spellings, model-ready screenshot frames, numbered elements |
 | `session.py` | Per-app session registry, auto-launch, template cache |
 | `computer.py` | CoreGraphics input synthesis (click, drag, keyboard, scroll, AX) |
 | `capture.py`, `window_capture.py` | ScreenCaptureKit window screenshots, bounded capture-plan cache, scoped compatibility fallbacks |
