@@ -57,7 +57,7 @@ def load_server():
              '_POINT_TARGET', '_TARGET_HINTS', '_WINDOW_KEYS', '_PUBLIC_ROUTES',
              '_HINT_HISTORY_CAP', '_call_history', '_BATCHABLE_ACTIONS', '_OBSERVATION_TOOLS',
              '_POST_ACTION_SETTLE_MS',
-             '_OWNERSHIP_EXEMPT', '_chromium_based_cache', '_call_lock', '_call_context', '_run_step_context'}
+             '_OWNERSHIP_EXEMPT', '_chromium_based_cache', '_call_lock', '_call_context', '_run_step_context', '_deferred_frame'}
     nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):

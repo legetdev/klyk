@@ -1890,6 +1890,7 @@ _INTERNAL_TOOLS = [
                 **_APP_PARAM,
                 **_WINDOW_ID_PARAM,
                 "region": {"type": "array", "items": {"type": "number"}, "minItems": 4, "maxItems": 4},
+                "save_path": {"type": "string"},
             },
             "required": ["app", "region"],
         },
@@ -2198,7 +2199,8 @@ TOOLS = [
             "Hover: move the real cursor over an element or x,y without clicking, for tooltips "
             "and hover menus. This is always visible because hover is a cursor effect. "
             "dwell_seconds keeps it there before returning, so a following screenshot shows the "
-            "hover state. Clicking never needs this."
+            "hover state. Background mode refuses it with requires_foreground. Clicking never "
+            "needs this."
         ),
         inputSchema={
             "type": "object",
@@ -2388,7 +2390,8 @@ TOOLS = [
         description=(
             "Find a saved template in a fresh capture of the window. Returns {found, x, y, "
             "confidence} with the match center in screenshot pixels, ready for click. "
-            "search_region [x1,y1,x2,y2] limits the search when the image repeats."
+            "search_region [x1,y1,x2,y2] limits the search when the image repeats. Pass the "
+            "template_id (or include_b64 output) from get_template, not a crop of a screenshot."
         ),
         inputSchema=_schema_of("find_template"),
     ),
@@ -2494,8 +2497,9 @@ TOOLS = [
     types.Tool(
         name="close_app",
         description=(
-            "Quit apps Klyk is working with and end their sessions: app, or apps for several at "
-            "once. Results are per app; apps without a session report was_open=false."
+            "Quit apps Klyk is working with and end their sessions: app for one, or apps for "
+            "several at once (apps takes precedence when both are given; results are then per app, "
+            "and apps without a session report was_open=false)."
         ),
         inputSchema={
             "type": "object",
@@ -2578,6 +2582,20 @@ TOOLS = [
 # Helpers
 # ---------------------------------------------------------------------------
 
+def _convert_attached(session, tool: str, args: dict) -> None:
+    """Convert a first call's image coordinates now that the window size is known."""
+    if getattr(session, "windowless", False) is True:
+        return
+    try:
+        frame = frames.Frame.for_window(int(session.width), int(session.height))
+    except (TypeError, ValueError):
+        return
+    converted = frames.args_to_logical(tool, args, frame)
+    if converted is not args:
+        args.clear()
+        args.update(converted)
+
+
 def _running_apps() -> list[dict]:
     """Running regular apps with their on-screen window counts; metadata only."""
     from AppKit import NSWorkspace
@@ -2611,28 +2629,32 @@ def _running_apps() -> list[dict]:
 async def _click_numbered_element(session, number: int, app: str) -> list:
     """Click an inspected element: its own accessibility action first, else its live center."""
     target = await _element_target(app, number, require_hit=False)
-    entry, state = target["entry"], target["state"]
-    await _refresh_window(session, window_id=target["window_id"])
-    clicked = {"element": number, "role": state["role"], "x": target["x"], "y": target["y"],
-               "width": state["width"], "height": state["height"]}
-    if state["label"]:
-        clicked["label"] = state["label"]
-    # Chromium can acknowledge AXPress without firing the page action; use its click route.
-    if session.mode in ("background", "autonomous") and not _is_chromium_based(session):
-        pressed = await computer.run_input(
-            lambda: computer.ax_ref_perform(entry.ref, ("AXPress",), expected_pid=session.pid))
-        if pressed.get("status") == "gone":
-            return [types.TextContent(type="text", text=json.dumps({
-                "ok": False, "element": number,
-                "error": f"Element {number} ({target['described']}) no longer exists. Call inspect again.",
-            }))]
-        if pressed.get("ok"):
-            return [types.TextContent(type="text", text=json.dumps({
-                "ok": True, "clicked": clicked, "via": "ax_action", "action": pressed.get("action"),
-            }))]
-    target = await _element_target(app, number, require_hit=True)
-    response = await call_tool("click", {"app": app, "window_id": target["window_id"],
-                                         "x": target["x"], "y": target["y"]})
+    try:
+        state = target["state"]
+        await _refresh_window(session, window_id=target["window_id"])
+        clicked = {"element": number, "role": state["role"], "x": target["x"], "y": target["y"],
+                   "width": state["width"], "height": state["height"]}
+        if state["label"]:
+            clicked["label"] = state["label"]
+        # Chromium can acknowledge AXPress without firing the page action; use its click route.
+        if session.mode in ("background", "autonomous") and not _is_chromium_based(session):
+            ref = target["ref"]
+            pressed = await computer.run_input(
+                lambda: computer.ax_ref_perform(ref, ("AXPress",), expected_pid=session.pid))
+            if pressed.get("status") == "gone":
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "element": number,
+                    "error": f"Element {number} ({target['described']}) no longer exists. Call inspect again.",
+                }))]
+            if pressed.get("ok"):
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": True, "clicked": clicked, "via": "ax_action", "action": pressed.get("action"),
+                }))]
+    finally:
+        _release_target(target)
+    point = await _element_point(app, number)
+    response = await call_tool("click", {"app": app, "window_id": point["window_id"],
+                                         "x": point["x"], "y": point["y"]})
     outcome = json.loads(response[-1].text)
     outcome["clicked" if outcome.get("ok") else "matched_element"] = clicked
     if outcome.get("ok"):
@@ -2671,6 +2693,10 @@ async def _get_session(args: dict, tool_name: str | None = None):
         session, is_new = await get_or_create_session(args["app"], **options)
     if existing is None and ("window_id" in args or "window" in args):
         await _refresh_window(session, _resolve_window(args, args["app"]))
+    pending = _deferred_frame.get()
+    if pending is not None and pending[1] == id(args):
+        _deferred_frame.set(None)
+        _convert_attached(session, pending[0], args)
     if tool_name and tool_name in activity.ACTION_TOOLS:
         # Best-effort instrumentation; record_from_args swallows internally
         # but we guard once more so a bug in activity.py never breaks tool
@@ -3535,6 +3561,8 @@ _POST_ACTION_SETTLE_MS = 150
 _call_lock = asyncio.Lock()
 _call_context = ContextVar('klyk_nested_call', default=None)
 _run_step_context = ContextVar('klyk_run_step', default=False)
+# (tool, id(args)) of a public call whose coordinates convert once its session attaches.
+_deferred_frame = ContextVar('klyk_deferred_frame', default=None)
 
 
 def _detect_hint(name: str, args: dict) -> str | None:
@@ -3726,7 +3754,8 @@ def _element_table(session):
     """Return the session's element table, creating it on first use."""
     table = getattr(session, "elements", None)
     if table is None:
-        table = elements_mod.ElementTable(computer.release_ref, computer.refs_equal, computer.ref_hash)
+        table = elements_mod.ElementTable(computer.release_ref, computer.refs_equal, computer.ref_hash,
+                                          retain=computer.retain_ref)
         session.elements = table
     return table
 
@@ -3734,6 +3763,9 @@ def _element_table(session):
 def _adopt_elements(session, kept: list[dict], dropped: list[dict]) -> list[dict]:
     """Number the elements shown to the agent and release the references it never sees."""
     computer.release_refs(dropped)
+    if getattr(session, "windowless", False) is True:
+        computer.release_refs(kept)  # No window to verify against; these stay unnumbered.
+        return kept
     try:
         _element_table(session).adopt(session.pid, getattr(session, "window_id", None), kept)
     except Exception as error:
@@ -3812,52 +3844,106 @@ def _frame_response(tool: str, response: list, frame, args: dict) -> list:
 async def _framed(tool: str, args: dict, *, logical: bool = False) -> list:
     """Run one handler, converting window coordinates in and out of image pixels."""
     window_tool = tool in frames.WINDOW_TOOLS and not (tool == "screenshot" and args.get("display") is not None)
+    deferred = None
     if window_tool and not logical:
-        args = frames.args_to_logical(tool, args, await _frame_for(args.get("app"), args))
-    response = await _execute_tool(tool, args)
+        frame = await _frame_for(args.get("app"), args)
+        if frame is None and frames.has_inputs(tool, args):
+            # No session yet (first call of a fresh server): convert as soon as the
+            # handler attaches the window, before it reads any coordinate.
+            args = dict(args)
+            deferred = _deferred_frame.set((tool, id(args)))
+        else:
+            args = frames.args_to_logical(tool, args, frame)
+    try:
+        response = await _execute_tool(tool, args)
+    finally:
+        if deferred is not None:
+            _deferred_frame.reset(deferred)
     if not window_tool:
         return response
     return _frame_response(tool, response, await _frame_for(args.get("app"), args, record=True), args)
 
 
 async def _element_target(app: str, number: int, *, require_hit: bool = True) -> dict:
-    """Resolve an element number to its live reference and current logical center.
+    """Resolve an element number to a retained reference and its current logical center.
 
-    Refuses, without input, when the element is unknown, gone, outside its
-    window, or (require_hit) no longer the control at its own center point.
+    The returned "ref" is owned by the caller and must be released with
+    computer.release_ref (see _release_target). Refuses, without input, when the
+    element is unknown, gone, outside its window, or (require_hit) no longer the
+    control at its own center point.
     """
     session = registry.get_by_app(app)
     if session is None:
         raise RuntimeError(f"Element {number}: Klyk has no session for {app}. Call inspect first.")
     table = _element_table(session)
-    entry = table.get(number)
-    if entry is None:
+    acquired = table.acquire(number)
+    if acquired is None:
         raise RuntimeError(elements_mod.missing_message(number, app, table.latest_number()))
-    await _ensure_native_runtime()
-    connection_gate.checkpoint()
-    loop = asyncio.get_event_loop()
-    state = await loop.run_in_executor(None, lambda: computer.ax_ref_state(entry.ref, session.pid))
-    described = f"{entry.role or 'element'} '{entry.label}'" if entry.label else (entry.role or "element")
-    if state is None:
-        raise RuntimeError(f"Element {number} ({described}) no longer exists. Call inspect again.")
-    window_id = entry.window_id or session.window_id
-    win = await loop.run_in_executor(None, lambda: capture.get_window_by_id(int(window_id)))
-    if not win or win.get("pid") != session.pid:
-        raise RuntimeError(f"Element {number}'s window is no longer on screen. Call inspect again.")
-    center_x = state["x"] + state["width"] / 2
-    center_y = state["y"] + state["height"] / 2
-    x, y = center_x - win["x"], center_y - win["y"]
-    if not (0 <= x < win["width"] and 0 <= y < win["height"]):
-        raise RuntimeError(f"Element {number} ({described}) is outside its window's visible area. "
-                           "Scroll it into view, then inspect again.")
-    if require_hit:
-        hit = await loop.run_in_executor(
-            None, lambda: computer.ax_ref_at_point(entry.ref, center_x, center_y, session.pid))
-        if not hit:
-            raise RuntimeError(f"Element {number} ({described}) is covered or scrolled out of view at its "
-                               "center; nothing was sent. Scroll it into view or inspect again.")
-    return {"entry": entry, "state": state, "window_id": int(window_id), "x": x, "y": y,
+    entry, ref = acquired
+    try:
+        await _ensure_native_runtime()
+        connection_gate.checkpoint()
+        loop = asyncio.get_event_loop()
+        state = await loop.run_in_executor(None, lambda: computer.ax_ref_state(ref, session.pid))
+        described = f"{entry.role or 'element'} '{entry.label}'" if entry.label else (entry.role or "element")
+        if state is None:
+            raise RuntimeError(f"Element {number} ({described}) no longer exists. Call inspect again.")
+        window_id = entry.window_id or session.window_id
+        win = await loop.run_in_executor(None, lambda: capture.get_window_by_id(int(window_id)))
+        if not win or win.get("pid") != session.pid:
+            raise RuntimeError(f"Element {number}'s window is no longer on screen. Call inspect again.")
+        center_x = state["x"] + state["width"] / 2
+        center_y = state["y"] + state["height"] / 2
+        x, y = center_x - win["x"], center_y - win["y"]
+        if not (0 <= x < win["width"] and 0 <= y < win["height"]):
+            raise RuntimeError(f"Element {number} ({described}) is outside its window's visible area. "
+                               "Scroll it into view, then inspect again.")
+        if require_hit:
+            hit = await loop.run_in_executor(
+                None, lambda: computer.ax_ref_at_point(ref, center_x, center_y, session.pid))
+            if not hit:
+                raise RuntimeError(f"Element {number} ({described}) is covered or scrolled out of view at its "
+                                   "center; nothing was sent. Scroll it into view or inspect again.")
+    except BaseException:
+        computer.release_ref(ref)
+        raise
+    return {"entry": entry, "ref": ref, "state": state, "window_id": int(window_id), "x": x, "y": y,
             "element": number, "described": described}
+
+
+async def _retained_walk(walk) -> list[dict]:
+    """Run an accessibility walk that retains references, releasing them if nobody receives them.
+
+    Cancelling the awaiting request cannot stop the worker thread; its references
+    are then released when the walk finishes instead of leaking.
+    """
+    future = asyncio.get_event_loop().run_in_executor(None, walk)
+
+    def release(done) -> None:
+        if not done.cancelled() and done.exception() is None:
+            computer.release_refs(done.result())
+
+    try:
+        return await asyncio.shield(future)
+    except BaseException:
+        if future.done():
+            release(future)
+        else:
+            future.add_done_callback(release)
+        raise
+
+
+def _release_target(target: dict | None) -> None:
+    """Release the reference _element_target retained for its caller."""
+    if target and target.get("ref"):
+        computer.release_ref(target.pop("ref"))
+
+
+async def _element_point(app: str, number: int) -> dict:
+    """An element's live, hit-checked center for coordinate tools; holds no reference."""
+    target = await _element_target(app, number)
+    _release_target(target)
+    return target
 
 
 def _annotate(response: list, **fields) -> list:
@@ -3897,7 +3983,7 @@ async def _route_screenshot(args: dict) -> list:
             return _respond({"ok": False, "error": "Use region with an app window, not with display."})
         if not args.get("app"):
             return _respond({"ok": False, "error": "Zooming needs app (and optionally window)."})
-        return await _framed("zoom", _pick(args, "app", "region", *_WINDOW_KEYS))
+        return await _framed("zoom", _pick(args, "app", "region", "save_path", *_WINDOW_KEYS))
     return await _framed("screenshot", args)
 
 
@@ -3919,10 +4005,9 @@ async def _route_click(args: dict) -> list:
                 "number (or x and y) for right, double, triple or modified clicks.")})
         return await _framed("click_element", {**_pick(args, "app", "label", "index", "verify", *_WINDOW_KEYS)})
     if "element" in args and count == 1 and button == "left" and not modifiers:
-        return await _framed("click_element", {**_pick(args, "app", "element", "verify", *_WINDOW_KEYS)},
-                             logical=True)
+        return await _framed("click_element", _pick(args, "app", "element", "verify"), logical=True)
     if "element" in args:
-        target = await _element_target(args["app"], args["element"])
+        target = await _element_point(args["app"], args["element"])
         internal = {**shared, "window_id": target["window_id"], "x": target["x"], "y": target["y"]}
         logical = True
     else:
@@ -3950,8 +4035,8 @@ async def _route_drag(args: dict) -> list:
             args, "source_label", "target_label", "target_app", "source_index", "target_index", *_WINDOW_KEYS)})
     if "x1" in args:
         return await _framed("drag", {**shared, **_pick(args, "x1", "y1", "x2", "y2", *_WINDOW_KEYS)})
-    source = await _element_target(args["app"], args["source_element"])
-    target = await _element_target(args["app"], args["target_element"])
+    source = await _element_point(args["app"], args["source_element"])
+    target = await _element_point(args["app"], args["target_element"])
     if source["window_id"] != target["window_id"]:
         return _respond({"ok": False, "error": (
             "source_element and target_element are in different windows. Use source_label and "
@@ -3971,7 +4056,7 @@ def _point_route(tool: str, keys: tuple[str, ...]):
             return _respond({"ok": False, "error": _TARGET_HINTS.get(tool, f"{tool} needs element or x and y.")})
         if "element" not in args:
             return await _framed(tool, _pick(args, "app", "x", "y", *keys, *_WINDOW_KEYS))
-        target = await _element_target(args["app"], args["element"])
+        target = await _element_point(args["app"], args["element"])
         response = await _framed(tool, {**_pick(args, "app", *keys), "window_id": target["window_id"],
                                         "x": target["x"], "y": target["y"]}, logical=True)
         return _annotate(response, element=args["element"])
@@ -3985,7 +4070,7 @@ def _element_route(tool: str, keys: tuple[str, ...]):
         if ("element" in args) == has_point or (has_point and not {"x", "y"} <= set(args)):
             return _respond({"ok": False, "error": _TARGET_HINTS[tool]})
         if "element" in args:
-            return await _framed(tool, _pick(args, "app", "element", *keys, *_WINDOW_KEYS), logical=True)
+            return await _framed(tool, _pick(args, "app", "element", *keys), logical=True)
         return await _framed(tool, _pick(args, "app", "x", "y", *keys, *_WINDOW_KEYS))
     return route
 
@@ -4330,10 +4415,9 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 # to the agent (50 in full mode, 15 in slim), so walking
                 # many more is wasted IPC on pathologically heavy trees.
                 # Retained references let the shown elements keep stable numbers.
-                return await asyncio.get_event_loop().run_in_executor(
-                    None, lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
-                                                      window_id=session.window_id, retain=True),
-                )
+                return await _retained_walk(
+                    lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
+                                                 window_id=session.window_id, retain=True))
 
             ax_task = (
                 asyncio.create_task(_walk_ax_top())
@@ -4346,10 +4430,10 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     img_b64, w, h, focus_status = await screenshot_task
                 except BaseException:
                     if ax_task is not None:
-                        ax_task.cancel()
+                        ax_task.cancel()  # An unfinished walk releases its references when it ends.
                         outcome = await asyncio.gather(ax_task, return_exceptions=True)
                         if outcome and isinstance(outcome[0], list):
-                            computer.release_refs(outcome[0])
+                            computer.release_refs(outcome[0])  # It had already finished.
                     raise
                 session.screenshots_taken += 1
                 if output_size is not None:
@@ -4404,10 +4488,9 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     # walk's emptiness.
                     if not raw and not getattr(session, 'ax_warmup_attempted', False):
                         await asyncio.sleep(0.25)
-                        raw = await asyncio.get_event_loop().run_in_executor(
-                            None, lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
-                                                              window_id=session.window_id, retain=True),
-                        )
+                        raw = await _retained_walk(
+                            lambda: computer.ax_snapshot(session.pid, max_results=raw_walk_cap,
+                                                         window_id=session.window_id, retain=True))
                     session.ax_warmup_attempted = True
                     elements = _filter_for_browser(raw, session.app)
                     wx, wy = session.win_x, session.win_y
@@ -4710,8 +4793,12 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             if "element" in args:
                 target = await _element_target(args["app"], int(args["element"]), require_hit=False)
                 action_name = str(args["action"])
-                result = await computer.run_input(lambda: computer.ax_ref_perform(
-                    target["entry"].ref, (action_name,), expected_pid=session.pid))
+                ref = target["ref"]
+                try:
+                    result = await computer.run_input(lambda: computer.ax_ref_perform(
+                        ref, (action_name,), expected_pid=session.pid))
+                finally:
+                    _release_target(target)
                 if result.get("status") == "gone":
                     return [types.TextContent(type="text", text=json.dumps({
                         "ok": False, "element": int(args["element"]),
@@ -5475,6 +5562,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             session, _ = await _get_session(args, name)
             if "element" in args:
                 target = await _element_target(args["app"], int(args["element"]), require_hit=False)
+                _release_target(target)
                 state = target["state"]
                 value = state["value"]
                 truncated = isinstance(value, str) and len(value) > 12000
@@ -6584,16 +6672,28 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             image, zoom_width, zoom_height, magnification = await asyncio.get_event_loop().run_in_executor(
                 None, lambda: capture.zoom_window(int(session.window_id), int(session.width),
                                                   int(session.height), region, frames.budget()))
-            return [
-                types.ImageContent(type="image", data=image, mimeType="image/png"),
-                types.TextContent(type="text", text=json.dumps({
-                    "ok": True,
-                    "region": [int(round(v)) for v in region],
-                    "zoom": round(magnification * frame.width / frame.image_width, 2),
-                    "image_width": zoom_width, "image_height": zoom_height,
-                    "note": "Zoomed view only; keep using full-screenshot coordinates for actions.",
-                })),
-            ]
+            meta = {
+                "ok": True,
+                "region": [int(round(v)) for v in region],
+                "zoom": round(magnification * frame.width / frame.image_width, 2),
+                "image_width": zoom_width, "image_height": zoom_height,
+                "note": "Zoomed view only; keep using full-screenshot coordinates for actions.",
+            }
+            include_image = True
+            if args.get("save_path"):
+                resolved = os.path.abspath(os.path.expanduser(args["save_path"]))
+                try:
+                    with open_private(resolved, "wb") as handle:
+                        handle.write(base64.b64decode(image))
+                    meta["saved_path"] = resolved
+                    include_image = False
+                except Exception as error:
+                    log.warning("zoom save failed (%s)", type(error).__name__)
+                    meta["save_error"] = f"{error}"
+            payload = [types.TextContent(type="text", text=json.dumps(meta))]
+            if include_image:
+                payload.insert(0, types.ImageContent(type="image", data=image, mimeType="image/png"))
+            return payload
 
         # --- get_escalation_log ---
         elif name == "get_escalation_log":
@@ -6691,10 +6791,9 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             session, _ = await _get_session(args, name)
             if not getattr(session, "windowless", False):
                 await _refresh_window(session, window_id=_resolve_window(args, args["app"]))
-            raw = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_snapshot(session.pid, max_results=201,
-                                                  window_id=session.window_id or None, retain=True)
-            )
+            raw = await _retained_walk(
+                lambda: computer.ax_snapshot(session.pid, max_results=201,
+                                             window_id=session.window_id or None, retain=True))
             elements = _filter_for_browser(raw, session.app)
             # Convert from screen-space to window-relative so coords match screenshot pixels
             wx, wy = session.win_x, session.win_y

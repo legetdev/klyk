@@ -123,15 +123,27 @@ _LIST_INPUTS = {"get_pixels": (("points", ("x", "y")), ("regions", ("x", "y", "w
 
 # Tools whose coordinates are window-relative; everything else is screen space or none.
 WINDOW_TOOLS = frozenset({
-    *INPUTS, *_BOX_INPUTS, *_LIST_INPUTS, "inspect", "ax_snapshot", "wait_for", "click_element",
-    "drag_to_element", "find_template", "wait_for_visual",
+    *INPUTS, *_BOX_INPUTS, *_LIST_INPUTS, "inspect", "screenshot", "ax_snapshot", "wait_for",
+    "click_element", "drag_to_element", "find_template", "wait_for_visual",
 })
+# Result keys a tool reports in screen points rather than window pixels.
+_SCREEN_RESULT_KEYS = {"drag_to_element": frozenset({"source", "target", "matches", "source_matches",
+                                                     "target_matches", "candidates"})}
 _INTEGER_INPUTS = frozenset({("get_template", "x1"), ("get_template", "y1"), ("get_template", "x2"),
                              ("get_template", "y2")})
 
 
 def _number(value) -> bool:
     return isinstance(value, (int, float)) and not isinstance(value, bool)
+
+
+def has_inputs(tool: str, args: dict) -> bool:
+    """True when the call carries window coordinates that a frame would convert."""
+    if any(key in args for key, _ in INPUTS.get(tool, ())):
+        return True
+    if _BOX_INPUTS.get(tool) in args:
+        return True
+    return any(key in args for key, _ in _LIST_INPUTS.get(tool, ()))
 
 
 def args_to_logical(tool: str, args: dict, frame: Frame | None) -> dict:
@@ -186,6 +198,8 @@ def result_to_image(tool: str, payload, frame: Frame | None):
     if frame is None or frame.identity or tool not in WINDOW_TOOLS:
         return payload
 
+    skip = _SKIP_KEYS | _SCREEN_RESULT_KEYS.get(tool, frozenset())
+
     def walk(value):
         if isinstance(value, list):
             return [walk(item) for item in value]
@@ -193,7 +207,7 @@ def result_to_image(tool: str, payload, frame: Frame | None):
             return value
         out = {}
         for key, item in value.items():
-            if key in _SKIP_KEYS:
+            if key in skip:
                 out[key] = item
             elif key in _X_KEYS and _number(item):
                 out[key] = frame.to_image(item, "x")

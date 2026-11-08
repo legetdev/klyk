@@ -1401,6 +1401,7 @@ def ax_snapshot(
     deadline_ts = (
         time.monotonic() + deadline_seconds if deadline_seconds > 0 else 0.0
     )
+    results: list[dict] = []
     try:
         app_ptr = _appserv.AXUIElementCreateApplication(pid)
         if not app_ptr:
@@ -1411,7 +1412,6 @@ def ax_snapshot(
             )
         except Exception:
             pass
-        results: list[dict] = []
         seen: set[tuple] = set()
         # One extra IPC to fetch the app's currently-focused UI element so
         # _ax_collect can mark it as `focused: True`. AX returns a stable
@@ -1506,6 +1506,11 @@ def release_refs(entries: list[dict]) -> None:
                 pass
 
 
+def retain_ref(ref: int) -> int:
+    """Take an additional reference the caller must release with release_ref."""
+    return int(_cf.CFRetain(ctypes.c_void_p(ref)))
+
+
 def release_ref(ref: int) -> None:
     """Release one retained accessibility reference."""
     if ref:
@@ -1530,7 +1535,18 @@ def ax_ref_state(ref: int, expected_pid: int | None = None) -> dict | None:
     """
     if not ref or not _ax_matches_pid(ref, expected_pid):
         return None
-    raw = _ax_read_multi(ref, (b"AXRole", b"AXTitle", b"AXDescription", b"AXValue", b"AXPosition", b"AXSize"))
+    try:
+        # A hung app must not stall the agent; 0 restores the system default afterwards.
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(ref), 1.0)
+    except Exception:
+        pass
+    try:
+        raw = _ax_read_multi(ref, (b"AXRole", b"AXTitle", b"AXDescription", b"AXValue", b"AXPosition", b"AXSize"))
+    finally:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(ref), 0.0)
+        except Exception:
+            pass
     if raw is None:
         return None
     try:

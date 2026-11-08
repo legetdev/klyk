@@ -379,6 +379,55 @@ class PublicRoutingTests(unittest.IsolatedAsyncioTestCase):
         await self.call("wait_for", {"app": "Fixture", "text": "x"})
         self.assertEqual([name for name, _ in self.calls], ["click_element", "wait_for"])
 
+    async def test_first_call_of_a_fresh_server_converts_once_the_window_is_known(self):
+        """No session yet: coordinates convert as the handler attaches the window, never unconverted."""
+        async def execute(name, args):
+            await self.s._get_session(args, name)
+            self.calls.append((name, dict(args)))
+            return text({"ok": True})
+        self.s._execute_tool = execute
+        self.s.registry.get_by_app.return_value = None
+        self.s.get_or_create_session = AsyncMock(return_value=(self.session, True))
+        await self.call("click", {"app": "Fixture", "x": self.frame.image_width / 2,
+                                  "y": self.frame.image_height / 2})
+        name, args = self.calls[0]
+        self.assertAlmostEqual(args["x"], 960, delta=1)
+        self.assertAlmostEqual(args["y"], 540, delta=1)
+        self.assertIsNone(self.s._deferred_frame.get())
+
+    async def test_plain_screenshots_report_their_image_size(self):
+        async def execute(name, args):
+            return text({"width": 1920, "height": 1080, "window_id": 7})
+        self.s._execute_tool = execute
+        result = await self.call("screenshot", {"app": "Fixture"})
+        self.assertEqual((result["width"], result["height"]), (self.frame.image_width, self.frame.image_height))
+        self.assertEqual(result["scaled_from"], [1920, 1080])
+        self.assertIn(7, self.session.frames)
+
+    async def test_drag_label_evidence_stays_in_screen_points(self):
+        async def execute(name, args):
+            return text({"ok": True, "source": {"x": 1500, "y": 900}, "target": {"x": 1700, "y": 950}})
+        self.s._execute_tool = execute
+        result = await self.call("drag", {"app": "Fixture", "source_label": "A", "target_label": "B"})
+        self.assertEqual(result["source"], {"x": 1500, "y": 900})
+
+    async def test_element_routes_ignore_window_arguments(self):
+        self.s._element_target = AsyncMock(return_value={"x": 10.0, "y": 10.0, "window_id": 9, "ref": None})
+        await self.call("click", {"app": "Fixture", "element": 3, "window_id": 7})
+        await self.call("read_element", {"app": "Fixture", "element": 3, "window": "B"})
+        self.assertEqual(self.calls[0], ("click_element", {"app": "Fixture", "element": 3}))
+        self.assertEqual(self.calls[1], ("read_element", {"app": "Fixture", "element": 3}))
+
+    def test_windowless_sessions_are_not_numbered(self):
+        released = []
+        self.s.computer.release_refs = lambda entries: released.extend(entries)
+        windowless = SimpleNamespace(pid=5, window_id=0, windowless=True, elements=None)
+        kept = [{"role": "AXDockItem", "_ref": 1}]
+        result = self.s._adopt_elements(windowless, kept, [])
+        self.assertNotIn("element", result[0])
+        self.assertIsNone(windowless.elements)
+        self.assertEqual(len(released), 1)
+
     async def test_validation_errors_are_short(self):
         result = await self.call("scroll", {"app": "Fixture", "direction": "sideways"})
         self.assertFalse(result["ok"])
@@ -408,6 +457,9 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
         native = self.s.computer
         native.refs_equal = lambda a, b: a == b
         native.ref_hash = lambda ref: ref
+        self.retained = []
+        native.retain_ref = lambda ref: self.retained.append(ref) or ref
+        native.release_ref = MagicMock()
         native.ax_ref_state.return_value = {"role": "AXButton", "label": "Save", "value": "draft",
                                             "value_status": "ok", "x": 200.0, "y": 100.0,
                                             "width": 80.0, "height": 20.0}
@@ -417,12 +469,18 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
         self.s._is_chromium_based = lambda session: False
         self.s._element_table(self.session).adopt(123, 7, [{"role": "AXButton", "label": "Save", "_ref": 555}])
 
+    def assertBalanced(self):
+        """Every reference retained for a call is released by the end of it."""
+        released = [call.args[0] for call in self.s.computer.release_ref.call_args_list]
+        self.assertEqual(sorted(released), sorted(self.retained))
+
     async def test_plain_click_uses_the_elements_own_action(self):
         self.s.computer.ax_ref_perform.return_value = {"ok": True, "action": "AXPress", "status": "performed"}
         result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 1}))
         self.assertEqual(result["via"], "ax_action")
         self.assertEqual((result["clicked"]["x"], result["clicked"]["y"]), (140.0, 60.0))
         self.assertEqual(self.s.computer.ax_ref_perform.call_args.args[0], 555)
+        self.assertBalanced()
 
     async def test_unsupported_action_falls_back_to_its_live_center(self):
         self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported"}
@@ -431,6 +489,7 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(result["via"], "element+skylight+keyed")
         sent = self.s.call_tool.call_args.args[1]
         self.assertEqual((sent["x"], sent["y"], sent["window_id"]), (140.0, 60.0, 7))
+        self.assertBalanced()
 
     async def test_covered_or_vanished_elements_send_nothing(self):
         self.s.computer.ax_ref_perform.return_value = {"ok": False, "status": "unsupported"}
@@ -445,6 +504,7 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("no longer exists", result["error"])
         result = payload(await self.s._execute_tool("click_element", {"app": "Fixture", "element": 99}))
         self.assertIn("never listed", result["error"])
+        self.assertBalanced()
 
     async def test_offscreen_element_is_refused(self):
         self.s.computer.ax_ref_state.return_value = {**self.s.computer.ax_ref_state.return_value, "x": 900.0}
@@ -461,6 +521,7 @@ class ElementActionTests(unittest.IsolatedAsyncioTestCase):
                                                                    "action": "AXIncrement"}))
         self.assertEqual(result["available_actions"], ["AXPress"])
         self.assertEqual(result["action"], "AXIncrement")
+        self.assertBalanced()
 
     async def test_inspect_numbers_shown_elements_and_releases_the_rest(self):
         raw = [{"role": "AXButton", "label": f"B{i}", "x": 150 + i, "y": 60, "width": 10, "height": 10,

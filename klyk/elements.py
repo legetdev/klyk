@@ -37,8 +37,9 @@ class Entry:
 class ElementTable:
     """Bounded mapping from element numbers to owned accessibility references."""
 
-    def __init__(self, release, equal, hash_value, capacity: int = CAPACITY):
+    def __init__(self, release, equal, hash_value, capacity: int = CAPACITY, retain=None):
         self._release = release
+        self._retain = retain
         self._equal = equal
         self._hash = hash_value
         self._capacity = capacity
@@ -115,6 +116,20 @@ class ElementTable:
         """Return the tracked element, or None when it was never seen or was evicted."""
         with self._lock:
             return self._entries.get(number)
+
+    def acquire(self, number: int) -> tuple[Entry, int] | None:
+        """Return a copy of the entry and a newly retained reference the caller must release.
+
+        Eviction or session close can release the table's own reference at any time,
+        so work that outlives the table lock holds its own retain.
+        """
+        with self._lock:
+            entry = self._entries.get(number)
+            if entry is None or self._retain is None:
+                return None
+            ref = self._retain(entry.ref)
+            return Entry(entry.number, ref, entry.pid, entry.window_id, entry.role, entry.label,
+                         entry.observed), ref
 
     def latest_number(self) -> int:
         """Highest number issued so far (0 when none)."""
