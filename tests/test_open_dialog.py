@@ -92,10 +92,21 @@ class OpenDialogTests(unittest.IsolatedAsyncioTestCase):
     async def test_missing_open_button_sends_no_shortcut_or_path(self):
         """An unrelated single sheet is not proof of an Open/Choose panel."""
         self.server.computer.ax_snapshot.return_value = [{"role": "AXSheet"}]
+        self.server.computer.ax_press_panel_button.return_value = None
         result = await self.open()
         self.assertFalse(result["ok"])
         self.server.computer.press_key.assert_not_awaited()
         self.server.computer.ax_navigate_open_panel.assert_not_called()
+        self.server.computer.ax_press_panel_button.assert_called_once_with(42, ("Open", "Choose"), press=False)
+
+    async def test_button_beyond_the_bounded_overview_is_confirmed_without_pressing(self):
+        """A large file panel can hide its buttons from the overview; the targeted search finds them."""
+        self.server.computer.ax_snapshot.return_value = [{"role": "AXSheet"}]
+        result = await self.open()
+        self.assertTrue(result["ok"], result)
+        calls = self.server.computer.ax_press_panel_button.call_args_list
+        self.assertEqual(calls[0].kwargs, {"press": False})
+        self.assertNotIn("press", calls[-1].kwargs)
 
     async def test_unready_chooser_retries_only_until_deadline_before_open(self):
         """A no-write observation may retry; its sleep never exceeds remaining readiness time."""
