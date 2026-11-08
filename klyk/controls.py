@@ -2,7 +2,12 @@
 
 The controls use only native AppKit and private settings. They never capture the
 screen, inspect other apps, request Accessibility, or start a computer-use session.
+Live status comes from the servers' own presence files (see presence.py).
 The existing activity indicator remains independent from this user control.
+
+MCP servers call ``ensure_running()`` on each tool request: at most one cheap lease
+check per 10 s per process, and a quiet background start only when no controller holds
+the lease, so a quit or crashed controller comes back without ever opening the panel.
 """
 
 from __future__ import annotations
@@ -15,9 +20,10 @@ import select
 import subprocess
 import sys
 import threading
+import time
 from pathlib import Path
 
-from . import clients, connection_policy as policy, jsonc
+from . import __version__, clients, connection_policy as policy, jsonc, presence
 from .private_files import open_private, private_directory
 
 log = logging.getLogger("klyk.controls")
@@ -26,6 +32,18 @@ _LABELS = {"codex": "Codex", "claude": "Claude Code", "opencode": "OpenCode",
            "other": "Other connections"}
 _PRIORITY = ("codex", "claude", "opencode")
 _native_types = None
+_ALL = "*"  # Busy marker while every environment is being switched Off.
+_OCCLUSION_VISIBLE = 1 << 1  # NSWindowOcclusionStateVisible, without importing AppKit.
+_SYMBOLS = {"off": ("cursorarrow.slash", "Klyk controls, all access off"),
+            "on": ("cursorarrow.click.2", "Klyk controls, access on"),
+            "busy": ("cursorarrow.motionlines", "Klyk controls, working")}
+_FOOTER = "Changes apply immediately, without restarting the AI app."
+_PRESENCE_INTERVAL = 1.0
+_ENSURE_INTERVAL = 10.0
+_ensure_lock = threading.Lock()
+_ensure_checked: float | None = None
+_ensure_thread: threading.Thread | None = None
+_images: dict = {}
 
 
 def configured_environments() -> tuple[str, ...]:
@@ -33,6 +51,9 @@ def configured_environments() -> tuple[str, ...]:
     present = set(_PRIORITY)
     present.update(key for key, row in policy.snapshot()["clients"].items()
                    if row["enabled"] and key in clients.CLIENTS)
+    # A client that is connected right now is shown even without a saved entry.
+    present.update(key for key, row in presence.summary().items()
+                   if row["connected"] and key in clients.CLIENTS)
     for key, client in clients.CLIENTS.items():
         if key in _PRIORITY:
             continue
@@ -50,6 +71,80 @@ def configured_environments() -> tuple[str, ...]:
 def label(key: str) -> str:
     """Use concise familiar client names without introducing provider branding."""
     return _LABELS.get(key, clients.CLIENTS[key].label if key in clients.CLIENTS else "Unknown connection")
+
+
+def status_text(allowed: bool, live: dict | None, saving: bool = False) -> str:
+    """Describe one environment's saved switch and live connection in a few plain words."""
+    live = live or {}
+    if saving:
+        return "Saving…"
+    if not allowed:
+        return "Off · connected" if live.get("connected") else "Off"
+    if live.get("active"):
+        return f"On · working in {live['app']}" if live.get("app") else "On · working"
+    return "On · connected" if live.get("connected") else "On · not connected"
+
+
+def menu_summary(state: dict, live: dict) -> tuple[str, str]:
+    """Pick the menu-bar symbol and tooltip: all off, some on, or someone working right now."""
+    allowed = [key for key, row in state["clients"].items() if row["enabled"]]
+    if not allowed:
+        return "off", "Klyk — all access off"
+    working = [key for key in allowed if live.get(key, {}).get("active")]
+    if working:
+        phrases = [label(key) + (f" working in {live[key]['app']}" if live[key].get("app") else " working")
+                   for key in working]
+        text = ", ".join(phrases[:2]) + (f" and {len(phrases) - 2} more" if len(phrases) > 2 else "")
+        return "busy", "Klyk — " + text
+    noun = "environment" if len(allowed) == 1 else "environments"
+    return "on", f"Klyk — {len(allowed)} {noun} allowed"
+
+
+def _symbol(kind: str):
+    """Load one template SF Symbol once; None when this macOS lacks it."""
+    if kind not in _images:
+        from AppKit import NSImage
+        name, description = _SYMBOLS[kind]
+        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_(name, description)
+        if image is not None:
+            image.setTemplate_(True)
+        _images[kind] = image
+    return _images[kind]
+
+
+def ensure_running() -> bool:
+    """Bring back a quit or crashed controller from a server's tool request; never raises.
+
+    Costs one lease check per 10 s per process. When no controller holds the lease it
+    starts one in the background with the panel closed, so the request never waits.
+    Returns True only when this call scheduled a start.
+    """
+    global _ensure_checked, _ensure_thread
+    try:
+        now = time.monotonic()
+        with _ensure_lock:
+            if _ensure_checked is not None and now - _ensure_checked < _ENSURE_INTERVAL:
+                return False
+            _ensure_checked = now
+            if sys.platform != "darwin" or (_ensure_thread is not None and _ensure_thread.is_alive()):
+                return False
+        if running():
+            return False
+
+        def start() -> None:
+            """Start quietly; a failure is retried on a later request."""
+            try:
+                start_background(show=False)
+            except Exception as error:
+                log.warning("Klyk controls could not restart (%s)", type(error).__name__)
+
+        thread = threading.Thread(target=start, name="klyk-controls-ensure", daemon=True)
+        with _ensure_lock:
+            _ensure_thread = thread
+        thread.start()
+        return True
+    except Exception:
+        return False
 
 
 def _lock_path() -> Path:
@@ -195,6 +290,10 @@ def _types():
             """Save a switch asynchronously and confirm its actual persisted state."""
             self.controller.change(self.controller.keys[sender.tag()], sender.state() == 1)
 
+        def turnAllOff_(self, sender):
+            """Switch every environment Off in one save."""
+            self.controller.turn_all_off()
+
         def quitControls_(self, sender):
             """Quit the interface without changing any saved access preference."""
             from .ui_thread import ui
@@ -232,13 +331,18 @@ class Controls:
         self._popover = None
         self._footer = None
         self._quit = None
+        self._all_off = None
         self._timer = None
         self._outside = None
         self._anchor = None
+        self._icon = None
+        self._live: dict = {}
+        self._live_at: float | None = None
 
     def build(self) -> None:
         """Create a quiet system-styled popover, closed until the user asks for it."""
-        from AppKit import NSImage, NSStatusBar, NSVariableStatusItemLength, NSPopover, NSPopoverBehaviorTransient
+        from AppKit import (NSPopover, NSPopoverBehaviorTransient, NSSquareStatusItemLength, NSStatusBar,
+                            NSVariableStatusItemLength)
         from Foundation import NSTimer, NSRunLoop
         Actions, _ = _types()
         self._delegate = Actions.alloc().init()
@@ -248,16 +352,12 @@ class Controls:
         self._popover.setAnimates_(False)
         self._popover.setDelegate_(self._delegate)
         self._build_content()
-        self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(NSVariableStatusItemLength)
+        # A fixed square keeps neighbouring menu-bar items still while the symbol changes.
+        length = NSSquareStatusItemLength if _symbol("on") is not None else NSVariableStatusItemLength
+        self._item = NSStatusBar.systemStatusBar().statusItemWithLength_(length)
         # Python apps share one preferences domain; a private name keeps another item's hidden state away.
         self._item.setAutosaveName_("klyk.controls")
         button = self._item.button()
-        image = NSImage.imageWithSystemSymbolName_accessibilityDescription_("cursorarrow.click.2", "Klyk controls")
-        if image is not None:
-            image.setTemplate_(True)
-            button.setImage_(image)
-        else:
-            button.setTitle_("Klyk")
         button.setToolTip_("Klyk — computer access")
         button.setTarget_(self._delegate)
         button.setAction_("showControls:")
@@ -268,13 +368,14 @@ class Controls:
 
     def _build_content(self) -> None:
         """Create one switch row per current environment inside the existing popover."""
-        from AppKit import NSFont, NSColor, NSView, NSViewController, NSTextField, NSScrollView, NSSwitch, NSButton
+        from AppKit import (NSButton, NSColor, NSControlSizeSmall, NSFont, NSLineBreakByTruncatingTail,
+                            NSScrollView, NSSwitch, NSTextField, NSView, NSViewController)
         from Foundation import NSMakeRect
         _, Document = _types()
         self.rows = {}
         width, row_height = 320, 56
         body_height = min(448, len(self.keys) * row_height)
-        height = body_height + 130
+        height = body_height + 120
         content = NSView.alloc().initWithFrame_(NSMakeRect(0, 0, width, height))
 
         def text(value, frame, size=13, secondary=False):
@@ -286,50 +387,67 @@ class Controls:
             content.addSubview_(field)
             return field
 
-        title = text("Klyk", (20, height - 36, 280, 24), 18)
+        title = text("Klyk", (20, height - 36, 180, 24), 18)
         title.setFont_(NSFont.boldSystemFontOfSize_(18))
-        text("Computer access", (20, height - 59, 280, 20), 12, True)
-        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 60, width, body_height))
+        title.setToolTip_("Klyk " + __version__)
+        text("Computer access", (20, height - 59, 180, 20), 12, True)
+        self._all_off = NSButton.buttonWithTitle_target_action_("Turn All Off", self._delegate, "turnAllOff:")
+        self._all_off.setControlSize_(NSControlSizeSmall)
+        self._all_off.setFont_(NSFont.systemFontOfSize_(NSFont.smallSystemFontSize()))
+        self._all_off.sizeToFit()
+        size = self._all_off.frame().size
+        visible = self._all_off.alignmentRectForFrame_(self._all_off.frame())
+        # Align the visible bezel with the switches' right edge and the header text's centre.
+        self._all_off.setFrame_(NSMakeRect(width - 22 - visible.origin.x - visible.size.width,
+                                           height - 34 - visible.origin.y - visible.size.height / 2,
+                                           size.width, size.height))
+        self._all_off.setAccessibilityLabel_("Turn off computer access for every environment")
+        self._all_off.setToolTip_("Blocks Klyk for every AI app at once. Turn each back on when you need it.")
+        content.addSubview_(self._all_off)
+        scroll = NSScrollView.alloc().initWithFrame_(NSMakeRect(0, 50, width, body_height))
         scroll.setDrawsBackground_(False)
         scroll.setHasVerticalScroller_(len(self.keys) * row_height > body_height)
         document = Document.alloc().initWithFrame_(NSMakeRect(0, 0, width, len(self.keys) * row_height))
-        previous = None
+        previous = self._all_off
         for index, key in enumerate(self.keys):
             row = NSView.alloc().initWithFrame_(NSMakeRect(16, index * row_height, width - 32, row_height))
             name = NSTextField.labelWithString_(label(key))
             name.setFont_(NSFont.systemFontOfSize_(13))
             name.setFrame_(NSMakeRect(4, 29, 210, 18))
+            name.setLineBreakMode_(NSLineBreakByTruncatingTail)
             row.addSubview_(name)
             status = NSTextField.labelWithString_("Off")
             status.setFont_(NSFont.systemFontOfSize_(11))
             status.setTextColor_(NSColor.secondaryLabelColor())
             status.setFrame_(NSMakeRect(4, 10, 210, 17))
+            status.setLineBreakMode_(NSLineBreakByTruncatingTail)  # Long app names end in an ellipsis.
             row.addSubview_(status)
-            switch = NSSwitch.alloc().initWithFrame_(NSMakeRect(width - 102, 8, 62, 40))
+            switch = NSSwitch.alloc().initWithFrame_(NSMakeRect(width - 88, 8, 62, 40))
             switch.setTag_(index)
             switch.setTarget_(self._delegate)
             switch.setAction_("toggleConnection:")
             switch.setAccessibilityLabel_(label(key) + " computer access")
             switch.setAccessibilityIdentifier_("klyk-access-" + key)
             switch.setToolTip_("Off blocks Klyk's screen reads and actions for " + label(key) + ".")
-            if previous is not None:
-                previous.setNextKeyView_(switch)
+            previous.setNextKeyView_(switch)
             previous = switch
             row.addSubview_(switch)
             document.addSubview_(row)
             self.rows[key] = switch, status
         scroll.setDocumentView_(document)
         content.addSubview_(scroll)
-        self._footer = NSTextField.wrappingLabelWithString_("On allows screen reads and actions.")
+        self._footer = NSTextField.wrappingLabelWithString_(_FOOTER)
         self._footer.setFont_(NSFont.systemFontOfSize_(10))
         self._footer.setTextColor_(NSColor.secondaryLabelColor())
-        self._footer.setFrame_(NSMakeRect(20, 10, 220, 42))
+        self._footer.setFrame_(NSMakeRect(20, 6, 220, 36))
         content.addSubview_(self._footer)
         self._quit = NSButton.buttonWithTitle_target_action_("Quit", self._delegate, "quitControls:")
         self._quit.setBordered_(False)
-        self._quit.setFrame_(NSMakeRect(246, 15, 58, 40))
+        self._quit.setFrame_(NSMakeRect(width - 64, 9, 58, 40))
         self._quit.setAccessibilityLabel_("Quit Klyk controls")
-        self._quit.setToolTip_("Closes the controls; saved access stays in effect.")
+        self._quit.setToolTip_("Closes these controls. Saved access stays in effect, and the controls "
+                               "reopen automatically when an AI app next uses Klyk.")
+        previous.setNextKeyView_(self._quit)
         content.addSubview_(self._quit)
         view_controller = NSViewController.alloc().init()
         view_controller.setView_(content)
@@ -348,6 +466,7 @@ class Controls:
             # A client installed since startup gets its switch without restarting the controls.
             self.keys = current
             self._build_content()
+        self._live_at = None  # Read who is connected now rather than up to a second ago.
         self.refresh()
         anchor = self._item.button() if self.in_menu_bar() else self._screen_anchor()
         self._popover.showRelativeToRect_ofView_preferredEdge_(anchor.bounds(), anchor, NSMinYEdge)
@@ -355,10 +474,9 @@ class Controls:
 
     def in_menu_bar(self) -> bool:
         """Report whether the icon can really be seen, since macOS can hide it without saying so."""
-        from AppKit import NSWindowOcclusionStateVisible
         window = self._item.button().window()
         return bool(window is not None and window.isVisible() and window.screen() is not None
-                    and window.occlusionState() & NSWindowOcclusionStateVisible)
+                    and window.occlusionState() & _OCCLUSION_VISIBLE)
 
     def open_when_placed(self, ready_fd: int | None) -> None:
         """Open once macOS has placed the icon, or below the menu bar when it never appears."""
@@ -440,27 +558,60 @@ class Controls:
             self.busy.discard(key)
             self.error = error
         state = policy.snapshot()
+        now = time.monotonic()
+        if self._live_at is None or now - self._live_at >= _PRESENCE_INTERVAL:
+            self._live = presence.summary()
+            self._live_at = now
         error = self.error or state.get("error", "")
-        marker = (state, error, frozenset(self.busy))
+        live = tuple((key, row["connected"], row["active"], row["app"]) for key, row in self._live.items())
+        marker = (state, error, frozenset(self.busy), live)
         if marker == self._last_state:
             return
         self._last_state = marker
+        clearing = _ALL in self.busy
         for key, (switch, status) in self.rows.items():
             allowed = state["clients"][key]["enabled"]
             switch.setState_(1 if allowed else 0)
-            switch.setEnabled_(not state.get("error") and key not in self.busy)
-            status.setStringValue_("Saving…" if key in self.busy else ("On" if allowed else "Off"))
+            switch.setEnabled_(not state.get("error") and key not in self.busy and not clearing)
+            status.setStringValue_(status_text(allowed, self._live.get(key),
+                                               key in self.busy or (clearing and allowed)))
+        any_on = any(row["enabled"] for row in state["clients"].values())
+        self._all_off.setEnabled_(any_on and not self.busy and not state.get("error"))
         self._quit.setEnabled_(not self.busy)
-        self._footer.setStringValue_(error or "On allows screen reads and actions.")
-        count = sum(row["enabled"] for row in state["clients"].values())
-        noun = "environment" if count == 1 else "environments"
-        self._item.button().setToolTip_("Klyk — all access off" if count == 0 else f"Klyk — {count} {noun} allowed")
+        self._footer.setStringValue_(error or _FOOTER)
+        icon, tooltip = menu_summary(state, self._live)
+        self._show_icon(icon)
+        self._item.button().setToolTip_(tooltip)
+
+    def _show_icon(self, kind: str) -> None:
+        """Swap the template symbol only when the state changes, with a text fallback."""
+        if kind == self._icon:
+            return
+        self._icon = kind
+        button = self._item.button()
+        image = _symbol(kind) or _symbol("on")
+        if image is not None:
+            button.setImage_(image)
+        else:
+            button.setTitle_("Klyk")  # Older macOS without these symbols still shows the item.
 
     def change(self, key: str, value: bool) -> None:
         """Persist user intent off the main thread, keeping switches responsive on I/O errors."""
-        from .ui_thread import ui
-        if key in self.busy:
+        if key in self.busy or _ALL in self.busy:
+            self._last_state = None
+            self.refresh()  # Snap a refused switch back to its saved position.
             return
+        self._save(key, lambda: policy.set_enabled(key, value), "Could not save. Try the switch again.")
+
+    def turn_all_off(self) -> None:
+        """Switch every environment Off in one atomic save, including ones not listed here."""
+        if self.busy:
+            return  # A pending single switch finishes first, so it cannot land after this.
+        self._save(_ALL, policy.disable_all, "Could not turn access off. Try again.")
+
+    def _save(self, key: str, write, failure: str) -> None:
+        """Run one settings write on a worker and report its confirmed result to the UI."""
+        from .ui_thread import ui
         self.busy.add(key)
         self.error = ""
         self.refresh()
@@ -469,9 +620,9 @@ class Controls:
             """Keep failures plain and restore the actual state after an atomic write."""
             error = ""
             try:
-                policy.set_enabled(key, value)
+                write()
             except (OSError, ValueError, RuntimeError):
-                error = "Could not save. Try the switch again."
+                error = failure
 
             self._completed.put((key, error))
             # The periodic refresh also drains completions if the UI queue is full.

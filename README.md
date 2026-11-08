@@ -47,11 +47,11 @@ Tools cover observation, interaction, evaluation, session management, and system
 ## Install
 
 ```bash
-pipx install klyk        # isolated install — recommended
+uv tool install klyk     # fastest isolated install — recommended
 klyk install
 ```
 
-> **Use `pipx` (or `uv tool install klyk`), not bare `pip`.** Klyk accepts NumPy `>=1.24`; installing it into your global Python can still clash with other packages pinned to different versions. `pipx`/`uv` give klyk its own environment while still putting `klyk` and `klyk-call` on your PATH — same commands, zero blast radius. Plain `pip install klyk` works if you want it in the current environment and accept that risk.
+> **Use `uv tool install klyk` (or `pipx install klyk`), not bare `pip`.** Klyk accepts NumPy `>=1.24`; installing it into your global Python can still clash with other packages pinned to different versions. `uv` and `pipx` give klyk its own environment while still putting `klyk` and `klyk-call` on your PATH — same commands, zero blast radius. `uv` resolves and installs in seconds; `pipx` works the same way if you already use it. Plain `pip install klyk` works if you want it in the current environment and accept that risk.
 
 `klyk install` is a turnkey first-run flow:
 
@@ -66,9 +66,11 @@ Restart Claude Code (or whichever MCP client you use), then turn its switch **On
 
 ### Turn computer access on or off
 
-Click the Klyk switch icon in the menu bar. Codex, Claude Code and OpenCode each have their own switch; other configured or saved-enabled clients also appear at startup. **Off** blocks all Klyk tools for that environment, including screenshots, accessibility reads, clipboard operations and input. **On** permits normal use with the existing permissions, ownership checks and emergency stop. Connected clients stay connected, so switching does not require a restart.
+Click the Klyk pointer icon in the menu bar. Codex, Claude Code and OpenCode each have their own switch; other configured, saved-enabled or currently connected clients also appear. **Off** blocks all Klyk tools for that environment, including screenshots, accessibility reads, clipboard operations and input. **On** permits normal use with the existing permissions, ownership checks and emergency stop. Changes apply immediately: connected clients stay connected, so switching never requires restarting the AI app. **Turn All Off** switches every environment Off in one step, including environments the panel does not list.
 
-The settings are saved locally and shared by current Klyk installations under the same user account. New MCP connections start the controls in the background, including after a Mac restart. Run `klyk controls` to open the panel at any time: it works whether the controls are stopped, frozen or running with a missing icon, and it restores the icon. Otherwise the panel stays closed until you click its icon; it never reads the screen or starts computer use itself. Quitting the controls leaves the saved access preferences in effect.
+Each row shows what that environment is doing right now: **Off**, **On · not connected**, **On · connected**, or **On · working in Safari** while it has acted in the last few seconds. An Off environment that is still connected shows **Off · connected**, so you can see who is trying to use Klyk. The menu-bar icon tells you the same at a glance: a crossed-out pointer when all access is Off, a clicking pointer when at least one environment is On, and a moving pointer while one is working. Its tooltip names who is working in which app. This live status comes from a tiny owner-only file that each running Klyk server keeps in `~/.klyk/presence/`. It holds only the environment, the version and the last app and tool name, never screen content, and is removed when the server exits.
+
+The settings are saved locally and shared by current Klyk installations under the same user account. New MCP connections start the controls in the background, including after a Mac restart, and a server that is in use quietly restarts them within about ten seconds if they were quit or stopped. Run `klyk controls` to open the panel at any time: it works whether the controls are stopped, frozen or running with a missing icon, and it restores the icon. Otherwise the panel stays closed until you click its icon; it never reads the screen or starts computer use itself. Quitting the controls leaves the saved access preferences in effect.
 
 Revocation cancels pending requests and rejects queued work and late replies. An operation already submitted to macOS may finish, and held keys/buttons or a temporarily borrowed clipboard are released/restored. Off cannot retract data already delivered to a client. Older Klyk versions do not enforce these switches and must be upgraded and restarted once.
 
@@ -82,7 +84,7 @@ Generated client entries carry a `KLYK_CLIENT` environment tag. Untagged support
 klyk update
 ```
 
-It detects **how** klyk was installed (pipx, `uv tool`, or plain pip), runs the matching upgrade, and then **restarts the running klyk server automatically** — every connected client that shares that installation loads the new version on its next tool call. Clients using pinned, bundled, or separate klyk installations need their own update.
+It detects **how** klyk was installed (`uv tool`, pipx, or plain pip), runs the matching upgrade, and then **restarts the running klyk servers automatically** — every connected client that shares that installation loads the new version on its next tool call. If the menu-bar controls are running, they restart on the new version too, with the panel closed and every saved switch unchanged. Clients using pinned, bundled, or separate klyk installations need their own update.
 
 **Existing setups:** After upgrading, run `klyk doctor --fix` as a new command from the same installation, then restart your AI clients when ready. This repairs generated launch settings to `-P -m klyk.mcp_server`, clears inherited `PYTHONPATH`, and adds the per-client `KLYK_CLIENT` tag. An updater started on an old version does not apply this repair automatically. Explicit custom `PYTHONPATH` remains a trusted override; customized TOML commands or arguments are preserved and require manual editing. Start `klyk controls` and explicitly enable the environments you want to use.
 
@@ -95,6 +97,15 @@ You never have to wonder whether you're behind, either:
 Behind these sits a single once-a-day HTTPS check of klyk's own PyPI metadata, cached in `~/.klyk/update_check.json` and fully offline-safe. The check sends no screen data or captured content, but the normal network request exposes metadata such as your IP address to PyPI and the network path. Set `KLYK_UPDATE_CHECK=0` to disable it entirely.
 
 **One driver at a time.** Any number of MCP clients can have klyk configured and connected simultaneously (Claude Code *and* OpenCode *and* Cursor…) — each spawns its own klyk process, and none is ever refused. But only **one** session holds the control token and actually drives the Mac at a time, so two agents can never interleave clicks and keystrokes into the same app. A new session takes control automatically when the previous driver is gone; taking over from a *live* driver is an explicit `take_control` call. Exactly one menu-bar eye is visible: the active driver's.
+
+### Uninstall
+
+```bash
+klyk uninstall           # every client entry, running servers, the controls and ~/.klyk
+uv tool uninstall klyk   # or: pipx uninstall klyk
+```
+
+`klyk uninstall <client>` removes only that client's entry. A full uninstall first stops this installation's running Klyk servers and the menu-bar controls, so nothing recreates the removed files. If a client configuration or a running server cannot be handled safely, it reports exactly what to fix and removes no state.
 
 ### Use with other MCP clients
 
@@ -202,7 +213,7 @@ Every tool is designed against the same set of failure modes — ambiguity, acci
 | `matcher.py` | Pure-NumPy template matching (FFT + integral-image NCC) with template cache support |
 | `grader.py`, `reporter.py` | Verdict + UI grading helpers |
 | `clients.py`, `jsonc.py` | Multi-client setup plus atomic, comment-preserving OpenCode configuration |
-| `controls.py`, `connection_policy.py`, `connection_gate.py` | Native menu-bar access switches, private saved settings and live request revocation |
+| `controls.py`, `connection_policy.py`, `connection_gate.py`, `presence.py` | Native menu-bar access switches with live status, private saved settings and live request revocation |
 | `updates.py` | Update awareness (daily cached PyPI check) + `klyk update` plumbing |
 | `keycodes.py`, `logs.py` | Low-level support |
 
