@@ -172,6 +172,7 @@ class ServerTests(unittest.IsolatedAsyncioTestCase):
 
     def test_all_tool_schemas_are_valid(self):
         """The complete specialist surface retains distinct names and valid schemas."""
-        self.assertEqual(len(self.s.TOOLS),48)
-        self.assertEqual(len(self.s._TOOL_SCHEMAS),48)
-        for validator in self.s._TOOL_VALIDATORS.values(): validator.check_schema(validator.schema)
+        self.assertEqual(len(self.s.TOOLS),38)
+        self.assertEqual(len(self.s._TOOL_SCHEMAS),51)
+        for validator in (*self.s._TOOL_VALIDATORS.values(), *self.s._PUBLIC_VALIDATORS.values()):
+            validator.check_schema(validator.schema)

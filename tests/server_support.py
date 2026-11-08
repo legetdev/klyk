@@ -23,6 +23,7 @@ from unittest.mock import AsyncMock, MagicMock
 import jsonschema
 from mcp import types
 from klyk.private_files import open_private
+from klyk import elements as elements_mod, frames, surface
 from test_input_cleanup import enabled_gate
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -52,9 +53,11 @@ def load_server():
     module.CHROMIUM_BROWSERS = set()
     names = {'_HYPHEN_VARIANTS', '_SERVER_INSTRUCTIONS', '_APP_PARAM', '_APP_LAUNCH_PARAMS', '_CONFIRM_DESTRUCTIVE',
              '_WINDOW_ID_PARAM', '_VERIFY_PARAM', 'TOOLS', '_last_response_time', '_call_depth',
+             '_INTERNAL_TOOLS', '_INTERNAL_BY_NAME', '_ELEMENT_PARAM', '_POINT_PARAMS', '_MODIFIERS_PARAM',
+             '_POINT_TARGET', '_TARGET_HINTS', '_WINDOW_KEYS', '_PUBLIC_ROUTES',
              '_HINT_HISTORY_CAP', '_call_history', '_BATCHABLE_ACTIONS', '_OBSERVATION_TOOLS',
              '_POST_ACTION_SETTLE_MS',
-             '_OWNERSHIP_EXEMPT', '_chromium_based_cache', '_call_lock', '_call_context'}
+             '_OWNERSHIP_EXEMPT', '_chromium_based_cache', '_call_lock', '_call_context', '_run_step_context'}
     nodes = [ast.ImportFrom(module='__future__', names=[ast.alias(name='annotations')], level=0)]
     for node in tree.body:
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -66,8 +69,10 @@ def load_server():
                 nodes.append(node)
     compiled = ast.fix_missing_locations(ast.Module(body=nodes, type_ignores=[]))
     exec(compile(compiled, str(ROOT / 'klyk/mcp_server.py'), 'exec'), module.__dict__)
-    module._TOOL_SCHEMAS = {t.name: module._tool_input_schema(t) for t in module.TOOLS}
+    module._TOOL_SCHEMAS = {t.name: module._tool_input_schema(t) for t in module._INTERNAL_TOOLS}
     module._TOOL_VALIDATORS = {n: jsonschema.validators.validator_for(s)(s) for n,s in module._TOOL_SCHEMAS.items()}
+    module._PUBLIC_SCHEMAS = {t.name: module._tool_input_schema(t) for t in module.TOOLS}
+    module._PUBLIC_VALIDATORS = {n: jsonschema.validators.validator_for(s)(s) for n,s in module._PUBLIC_SCHEMAS.items()}
     module._refresh_menubar = MagicMock()
     # Legacy dispatcher suites already provide native adapters; do not initialize the desktop.
     module._ensure_native_runtime = AsyncMock(return_value=None)

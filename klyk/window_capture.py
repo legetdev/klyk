@@ -70,8 +70,11 @@ def _complete(start, deadline):
     return value
 
 
-def take(window_id, width, height):
-    """Return fresh PNG pixels at logical window dimensions; never widen capture scope."""
+def take(window_id, width, height, crop=None):
+    """Return fresh PNG pixels of one window rendered at width x height; never widen capture scope.
+
+    crop=(x, y, w, h) in those rendered pixels returns only that part, for zooming.
+    """
     from .image_bounds import png_dimensions, validate_image_dimensions
 
     if (isinstance(window_id, bool) or not isinstance(window_id, int)
@@ -121,6 +124,16 @@ def take(window_id, width, height):
             actual = (int(Quartz.CGImageGetWidth(image)), int(Quartz.CGImageGetHeight(image)))
             if actual != key[1:]:
                 raise RuntimeError('Window screenshot dimensions changed during capture; observe again.')
+            if crop is not None:
+                cx, cy, cw, ch = (int(v) for v in crop)
+                if cw <= 0 or ch <= 0 or cx < 0 or cy < 0 or cx + cw > actual[0] or cy + ch > actual[1]:
+                    raise ValueError('The zoom region lies outside the captured window.')
+                image = Quartz.CGImageCreateWithImageInRect(image, Quartz.CGRectMake(cx, cy, cw, ch))
+                if image is None:
+                    raise RuntimeError('The zoom region could not be cropped.')
+                actual = (int(Quartz.CGImageGetWidth(image)), int(Quartz.CGImageGetHeight(image)))
+                if actual != (cw, ch):
+                    raise RuntimeError('The zoom crop changed size; observe again.')
             data = NSMutableData.data()
             destination = Quartz.CGImageDestinationCreateWithData(data, 'public.png', 1, None)
             if destination is None:

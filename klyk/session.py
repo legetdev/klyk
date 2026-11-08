@@ -75,6 +75,10 @@ class Session:
     _log_reader: StderrReader | None = field(default=None, repr=False)
     # A native log stream stopped by revocation restarts only for a permitted request.
     _log_stream_suspended: bool = field(default=False, repr=False)
+    # Numbered accessibility elements shown to the agent (bounded; see klyk.elements)
+    # and the last screenshot frame returned per window (at most 16 entries).
+    elements: object = field(default=None, repr=False)
+    frames: dict = field(default_factory=dict, repr=False)
 
 
 class SessionRegistry:
@@ -522,9 +526,15 @@ def _close_session(session: Session) -> None:
         except Exception:
             pass
         session._log_reader = None
-    # Free in-session caches.
+    # Free in-session caches and the retained accessibility references.
     try:
         session.template_cache.clear()
+    except Exception:
+        pass
+    try:
+        if session.elements is not None:
+            session.elements.clear()
+        session.frames.clear()
     except Exception:
         pass
     # Terminate the app itself (with escalation in terminate_pid).

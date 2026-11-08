@@ -65,7 +65,7 @@ class ObservationContractTests(unittest.IsolatedAsyncioTestCase):
         """Both structural reads and semantic lookup stay on the selected window."""
         await self.server.call_tool("ax_snapshot", {"app": "Fixture", "window_id": 77})
         self.server.computer.ax_snapshot.assert_called_once_with(
-            123, max_results=201, window_id=77
+            123, max_results=201, window_id=77, retain=True
         )
 
         self.server.computer.ax_snapshot.reset_mock()
