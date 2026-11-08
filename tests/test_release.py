@@ -77,7 +77,7 @@ class ReleaseNameTests(unittest.TestCase):
     def test_full_evidence_requires_actual_declared_tool_coverage(self):
         """Empty, partial, duplicated, or invented tool lists must not pass by agreeing with calls."""
         first, second, desktop = self._native('1.30.0'), self._native('2.2.0'), self._desktop()
-        self.assertEqual(len(first['tools']), 48)
+        self.assertEqual(len(first['tools']), len(expected_tools()))
         for changes in ({'tools': [], 'calls': []},
                         {'tools': ['inspect'], 'calls': [{'tool': 'inspect'}]},
                         {'tools': ['invented'], 'calls': [{'tool': 'invented'}]},

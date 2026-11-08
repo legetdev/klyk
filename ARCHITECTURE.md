@@ -27,7 +27,10 @@ Tools attach to a running app without activating it. Creating a session for a st
 
 ```text
 klyk/                   # Runtime package
-├── mcp_server.py        # Tool contracts, validation, dispatch, and handlers
+├── mcp_server.py        # Public tools, routing onto handlers, validation, dispatch
+├── surface.py           # Familiar argument spellings and run-step dialects (pure)
+├── frames.py            # Model-ready screenshot frames and coordinate conversion (pure)
+├── elements.py          # Bounded table of numbered accessibility elements (pure)
 ├── client.py            # klyk-call shell client and capture cache
 ├── session.py           # App sessions, window labels, and template cache
 ├── computer.py          # CoreGraphics input and Accessibility operations
@@ -44,6 +47,7 @@ klyk/                   # Runtime package
 ├── ui_thread.py         # Main-thread AppKit dispatch
 ├── cli.py               # Install, uninstall, doctor, update, and restart
 ├── doctor.py            # Health and permission diagnostics
+├── settings_names.py    # System Settings pane names for the running macOS
 ├── clients.py           # Supported-client registry and config editing
 ├── controls.py          # Native per-environment switches, independent of MCP
 ├── connection_policy.py # Private saved switches and generations
@@ -68,6 +72,18 @@ AGENTS.md               # Contributor orientation
 SECURITY.md             # Trust model and vulnerability reporting
 LICENSE                 # MIT
 ```
+
+---
+
+## Agent surface
+
+Agents see one public tool per intent (`TOOLS` in `mcp_server.py`); targeting is a parameter, not a separate tool. `click` takes an element number, visible text or coordinates and covers double and triple clicks through `click_count`; `drag` takes an element pair, a text pair or coordinates; `wait` takes seconds, accessible text or a template; `inspect` with `detail='all'` is the expanded accessibility list; `screenshot` with `region` zooms; `status` reports the emergency stop, control owner, sessions and escalations; `list_apps` lists running apps. Each public call is normalized, validated against its public schema and routed onto one existing handler (`_INTERNAL_TOOLS`), which keeps its own schema and safety gates. Handler-to-handler calls inside the server bypass the public layer. Earlier handler names stay callable through `klyk-call` and `run` for existing scripts, but agents are not shown them.
+
+`surface.py` maps unambiguous spellings that computer-use models are trained on onto the canonical arguments before validation: `coordinate` pairs, `start_coordinate`, `element_index`/`ref_N`, `scroll_direction`/`scroll_amount` and pixel deltas, modifier chords in `text` or `keys`, `duration`. `run` also accepts steps written as `{type: ...}` action objects or as `left_click`/`key`/`zoom`-style step names. Canonical arguments always win; nothing is guessed, and unsupported steps (separate mouse down/up, cursor position) fail with a plain reason. `keycodes.py` accepts macOS, xdotool and uppercase key names (`super`, `Page_Down`, `KP_Enter`, `ENTER`).
+
+**Screenshot frames.** Vision models resize oversized images and answer in the resized frame. `frames.py` sizes every agent-facing window image to fit the strictest current model tier (at most 1568 pixels on the long edge and 1568 28-pixel tiles; `KLYK_IMAGE_TIER=high` raises this to 2576 / 4784), and the public layer converts every window-relative coordinate between those image pixels and logical window points: inputs before a handler runs, results after. Windows that already fit are unchanged. The window image is captured directly at the frame size. The frame used for inputs is the one last returned to the agent for that window (at most 16 per session), so coordinates read from an image map back exactly. Display screenshots stay in screen coordinates. `screenshot(region=...)` captures the window magnified (up to 4× logical) through ScreenCaptureKit and crops it; action coordinates stay in the full frame.
+
+**Element numbers.** `inspect` walks the accessibility tree with retained references and hands the elements it shows to the session's `ElementTable`: the same native element (CoreFoundation equality) keeps its number across observations, numbers never repeat, and at most 400 references are kept, least recently observed released first. Elements walked but not shown are released immediately; closing a session releases all. Acting on an element reads its live frame. A plain left click performs the element's own accessibility press when it has one, outside Chromium; otherwise, and for every coordinate-based tool, input goes to the element's current center only after the app's own hit test at that point resolves to the element, a descendant or its immediate container. Unknown, evicted, vanished, covered and out-of-window elements are refused without input, with a message naming the next step.
 
 ---
 
@@ -321,7 +337,7 @@ deliberately doesn't, on cost/benefit grounds. Recorded so the decisions aren't 
 
 **Tools considered and skipped.**
 - *`wait_for_idle`* — high lazy-fallback risk (agents reach for it instead of finding the right readiness signal); no documented failure motivated it.
-- *`middle_click`, `cursor_position`, `zoom`* — niche, or already approximated by existing primitives (modifier+click, `move_cursor`, `read_grid` / `get_pixels`).
+- *`middle_click`, `cursor_position`* — niche, or already approximated by existing primitives (modifier+click, `move_cursor`). Zoom was later built into `screenshot(region=...)` once screenshots became model-sized frames, which made a full-resolution detail view necessary for small text.
 
 **Anthropic Computer-Use patterns deliberately NOT adopted** — they contradict klyk's "uniform reach, invisible-first" premise.
 - *Tier-based app restrictions* (browsers read-only, IDEs click-only) — contradicts "if a human can do it on a Mac, klyk can."

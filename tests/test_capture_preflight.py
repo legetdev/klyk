@@ -4,6 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import MagicMock
 
+from klyk import settings_names
 from test_input_cleanup import load_functions
 
 
@@ -19,7 +20,7 @@ class CapturePreflightTests(unittest.TestCase):
                 tempfile = MagicMock()
                 cg = SimpleNamespace() if allowed is None else SimpleNamespace(
                     CGPreflightScreenCaptureAccess=preflight)
-                namespace = {'_cg': cg, 'ctypes': ctypes,
+                namespace = {'_cg': cg, 'ctypes': ctypes, '_panes': settings_names,
                              'subprocess': subprocess, 'tempfile': tempfile}
                 load_functions('capture.py', {'check_screen_recording'}, namespace)
                 if allowed:

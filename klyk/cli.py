@@ -49,6 +49,7 @@ import sys
 import time
 from pathlib import Path
 
+from . import settings_names
 from . import clients
 
 # Deep links to the exact System Settings panes for the two permissions
@@ -508,11 +509,11 @@ def _install(rest: list[str]) -> None:
         check_screen_recording_permission,
     )
     ax_ok = _verify_permission(
-        "Accessibility", check_accessibility_permission, _PRIVACY_AX, wait,
+        settings_names.accessibility_pane(), check_accessibility_permission, _PRIVACY_AX, wait,
     )
     print()
     sr_ok = _verify_permission(
-        "Screen Recording", check_screen_recording_permission, _PRIVACY_SCREEN, wait,
+        settings_names.screen_recording_pane(), check_screen_recording_permission, _PRIVACY_SCREEN, wait,
     )
     print()
 
@@ -598,7 +599,8 @@ def _verify_opencode_connection() -> bool:
         print("  ✓ OpenCode started klyk and reports it connected")
         return True
     print("  ✗ OpenCode could not start klyk (`opencode mcp list` is not connected).")
-    print("    Grant Accessibility and Screen Recording to the app that launches OpenCode")
+    print(f"    Grant {settings_names.accessibility_pane()} and {settings_names.screen_recording_pane()}"
+          " (Privacy & Security) to the app that launches OpenCode")
     print("    (Terminal, Ghostty, iTerm, or OpenCode Desktop). If it is already enabled,")
     print("    add the OpenCode executable too:")
     print(f"      {executable}")

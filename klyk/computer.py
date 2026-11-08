@@ -13,6 +13,7 @@ import subprocess
 import threading
 import time
 
+from . import settings_names as _panes
 from .keycodes import parse_key_combo, char_to_keycode, MODIFIER_FLAGS
 from . import connection_gate as _connection_gate
 
@@ -80,6 +81,8 @@ _cf.CFRelease.restype = None
 _cf.CFRelease.argtypes = [ctypes.c_void_p]
 _cf.CFRetain.restype = ctypes.c_void_p
 _cf.CFRetain.argtypes = [ctypes.c_void_p]
+_cf.CFHash.restype = ctypes.c_ulong
+_cf.CFHash.argtypes = [ctypes.c_void_p]
 _cf.CFStringCreateWithCString.restype = ctypes.c_void_p
 _cf.CFStringCreateWithCString.argtypes = [ctypes.c_void_p, ctypes.c_char_p, ctypes.c_uint32]
 _cf.CFStringCreateWithBytes.restype = ctypes.c_void_p
@@ -332,8 +335,8 @@ def _check_stop() -> None:
             return
     raise EmergencyStop(
         "Emergency stop is ACTIVE — all Klyk input is blocked. It can be cleared "
-        "ONLY by the user pressing Cmd+Shift+Escape again; the resume tool cannot "
-        "clear it. Tell the user to press the chord to resume."
+        "ONLY by the user pressing Cmd+Shift+Escape again; no Klyk tool can clear "
+        "it. Tell the user to press the chord to resume."
     )
 
 
@@ -704,7 +707,7 @@ def check_accessibility() -> None:
         raise RuntimeError(
             "klyk needs Accessibility permission to read the AX tree and post "
             "keyboard events. Grant it:\n"
-            "  System Settings → Privacy & Security → Accessibility\n"
+            "  System Settings → Privacy & Security → " + _panes.accessibility_pane() + "\n"
             "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
             "Then `klyk doctor` to verify, and restart your MCP client."
         )
@@ -1253,9 +1256,12 @@ def _ax_collect(
     deadline_ts: float = 0.0,
     max_results: int = 0,
     focused_ref: int = 0,
+    retain: bool = False,
 ) -> None:
     """
     Walk `elem` recursively, collecting interactive/labeled descendants.
+    With retain=True each collected entry carries a retained `_ref`; the caller
+    owns it and must hand it to an element table or release_refs().
     Single IPC per element via _ax_read_multi (plus a second for pos/size
     on elements that qualify). A per-node child cap skips huge homogeneous
     collections (Finder Desktop icons, list views); a deadline_ts of >0
@@ -1316,6 +1322,8 @@ def _ax_collect(
                                 ctypes.c_void_p(elem), ctypes.c_void_p(focused_ref)
                             ):
                                 entry["focused"] = True
+                            if retain:
+                                entry["_ref"] = _cf.CFRetain(ctypes.c_void_p(elem))
                             results.append(entry)
                     finally:
                         for p in ps_raw:
@@ -1337,7 +1345,7 @@ def _ax_collect(
                         _ax_collect(
                             child, results, depth + 1, max_depth,
                             max_children_per_node, deadline_ts, max_results,
-                            focused_ref,
+                            focused_ref, retain,
                         )
         finally:
             for p in raw:
@@ -1367,9 +1375,11 @@ def ax_snapshot(
     deadline_seconds: float = 0.9,
     max_results: int = 0,
     window_id: int | None = None,
+    retain: bool = False,
 ) -> list[dict]:
     """
     Return labeled/interactive elements from the selected window, or all app windows if omitted.
+    retain=True adds an owned `_ref` to each returned entry (see release_refs).
     Each element: {role, label?, value?, x, y, width, height} in screen
     coords. Single-IPC-per-element via batched attribute reads.
 
@@ -1391,6 +1401,7 @@ def ax_snapshot(
     deadline_ts = (
         time.monotonic() + deadline_seconds if deadline_seconds > 0 else 0.0
     )
+    results: list[dict] = []
     try:
         app_ptr = _appserv.AXUIElementCreateApplication(pid)
         if not app_ptr:
@@ -1401,7 +1412,6 @@ def ax_snapshot(
             )
         except Exception:
             pass
-        results: list[dict] = []
         seen: set[tuple] = set()
         # One extra IPC to fetch the app's currently-focused UI element so
         # _ax_collect can mark it as `focused: True`. AX returns a stable
@@ -1416,7 +1426,7 @@ def ax_snapshot(
                     return []
                 try:
                     _ax_collect(root, results, 0, max_depth, max_children_per_node,
-                                deadline_ts, max_results, focused_ref)
+                                deadline_ts, max_results, focused_ref, retain)
                     return results
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(root))
@@ -1437,7 +1447,7 @@ def ax_snapshot(
                             _ax_collect(
                                 win, results, 0, max_depth,
                                 max_children_per_node, deadline_ts, max_results,
-                                focused_ref,
+                                focused_ref, retain,
                             )
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(wins_ptr))
@@ -1462,7 +1472,7 @@ def ax_snapshot(
                                 _ax_collect(
                                     child, results, 0, max_depth,
                                     max_children_per_node, deadline_ts, max_results,
-                                    focused_ref,
+                                    focused_ref, retain,
                                 )
                     finally:
                         _cf.CFRelease(ctypes.c_void_p(children_ptr))
@@ -1477,9 +1487,180 @@ def ax_snapshot(
             if key not in seen:
                 seen.add(key)
                 unique.append(e)
+            else:
+                release_refs([e])
         return unique
     except Exception:
+        release_refs(results)
         return []
+
+
+def release_refs(entries: list[dict]) -> None:
+    """Release every retained `_ref` still attached to walk entries."""
+    for entry in entries or ():
+        ref = entry.pop("_ref", None) if isinstance(entry, dict) else None
+        if ref:
+            try:
+                _cf.CFRelease(ctypes.c_void_p(ref))
+            except Exception:
+                pass
+
+
+def retain_ref(ref: int) -> int:
+    """Take an additional reference the caller must release with release_ref."""
+    return int(_cf.CFRetain(ctypes.c_void_p(ref)))
+
+
+def release_ref(ref: int) -> None:
+    """Release one retained accessibility reference."""
+    if ref:
+        _cf.CFRelease(ctypes.c_void_p(ref))
+
+
+def refs_equal(left: int, right: int) -> bool:
+    """True when two references name the same accessibility element."""
+    return bool(_cf.CFEqual(ctypes.c_void_p(left), ctypes.c_void_p(right)))
+
+
+def ref_hash(ref: int) -> int:
+    """CoreFoundation hash consistent with refs_equal."""
+    return int(_cf.CFHash(ctypes.c_void_p(ref)))
+
+
+def ax_ref_state(ref: int, expected_pid: int | None = None) -> dict | None:
+    """Read a tracked element's current role, label, value and screen frame.
+
+    Returns None when the element no longer exists, belongs to another process,
+    or has no on-screen frame. Never retains or releases `ref`.
+    """
+    if not ref or not _ax_matches_pid(ref, expected_pid):
+        return None
+    try:
+        # A hung app must not stall the agent; 0 restores the system default afterwards.
+        _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(ref), 1.0)
+    except Exception:
+        pass
+    try:
+        raw = _ax_read_multi(ref, (b"AXRole", b"AXTitle", b"AXDescription", b"AXValue", b"AXPosition", b"AXSize"))
+    finally:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(ref), 0.0)
+        except Exception:
+            pass
+    if raw is None:
+        return None
+    try:
+        role = _cftype_to_str(raw[0]) if raw[0] else ""
+        if not role:
+            return None
+        frame = _decode_pos_size(raw[4], raw[5])
+        if frame is None:
+            return None
+        try:
+            label = (_cftype_to_str(raw[1]) if raw[1] else "") or (_cftype_to_str(raw[2]) if raw[2] else "")
+        except ValueError:
+            label = ""
+        try:
+            value = _cftype_to_str(raw[3]) if raw[3] else None
+            value_status = "ok" if raw[3] else "no_value"
+        except ValueError:
+            value, value_status = None, "unreadable_value"
+        x, y, w, h = frame
+        return {"role": role, "label": label, "value": value, "value_status": value_status,
+                "x": x, "y": y, "width": w, "height": h}
+    finally:
+        for pointer in raw:
+            if pointer:
+                _cf.CFRelease(ctypes.c_void_p(pointer))
+
+
+def ax_ref_at_point(ref: int, x: float, y: float, expected_pid: int) -> bool:
+    """True when the app's own hit test at screen (x, y) is the element, inside it, or its direct container.
+
+    Guards coordinate input aimed at a numbered element: a popup, an overlapping
+    control or a scrolled-away element make the hit test name something else.
+    """
+    app = _appserv.AXUIElementCreateApplication(int(expected_pid))
+    if not app:
+        return False
+    hit = ctypes.c_void_p(0)
+    try:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        err = _appserv.AXUIElementCopyElementAtPosition(ctypes.c_void_p(app), float(x), float(y), ctypes.byref(hit))
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(app))
+    if err != 0 or not hit.value:
+        return False
+    owned: list[int] = []
+    try:
+        if refs_equal(int(hit.value), ref):
+            return True
+        current = int(hit.value)
+        for _ in range(8):  # The hit is a descendant of the element (e.g. text inside a row).
+            parent = _ax_read_attr_ptr(current, b"AXParent")
+            if not parent:
+                break
+            owned.append(parent)
+            if refs_equal(parent, ref):
+                return True
+            current = parent
+        current = ref
+        for _ in range(2):  # The hit test returned the element's immediate container.
+            parent = _ax_read_attr_ptr(current, b"AXParent")
+            if not parent:
+                break
+            owned.append(parent)
+            if refs_equal(parent, int(hit.value)):
+                return True
+            current = parent
+        return False
+    finally:
+        for pointer in owned:
+            _cf.CFRelease(ctypes.c_void_p(pointer))
+        _cf.CFRelease(hit)
+
+
+def ax_ref_actions(ref: int) -> list[str]:
+    """Accessibility action names the tracked element currently supports."""
+    names_ref = ctypes.c_void_p(0)
+    _appserv.AXUIElementCopyActionNames(ctypes.c_void_p(ref), ctypes.byref(names_ref))
+    names: list[str] = []
+    if names_ref.value:
+        try:
+            for index in range(int(_cf.CFArrayGetCount(names_ref))):
+                pointer = _cf.CFArrayGetValueAtIndex(names_ref, index)
+                if pointer:
+                    name = _cftype_to_str(pointer)
+                    if name:
+                        names.append(name)
+        finally:
+            _cf.CFRelease(names_ref)
+    return names
+
+
+def ax_ref_perform(ref: int, actions: tuple[str, ...], expected_pid: int | None = None) -> dict:
+    """Perform the first supported action of `actions` on the tracked element itself.
+
+    Returns {ok, action, role, available_actions, status}. status is "performed",
+    "unsupported" (nothing sent) or "gone" (element no longer exists; nothing sent).
+    A failed native perform raises: its effect is unknown and must be observed.
+    """
+    _check_stop()
+    if not _ax_matches_pid(ref, expected_pid):
+        return {"ok": False, "action": None, "status": "gone"}
+    role = _ax_str_attr(ref, b"AXRole")
+    if not role:
+        return {"ok": False, "action": None, "status": "gone"}
+    available = ax_ref_actions(ref)
+    for action in actions:
+        if action in available:
+            if _ax_perform_action(ref, action.encode("utf-8")):
+                return {"ok": True, "action": action, "role": role, "status": "performed"}
+            raise RuntimeError("The accessibility action failed; its effect is unknown. Observe before retrying.")
+    return {"ok": False, "action": None, "role": role, "available_actions": available, "status": "unsupported"}
 
 
 _AX_MENU_ITEM_ROLES = {"AXMenuItem"}
@@ -3722,6 +3903,53 @@ def _flush_clipboard_restore(*, revoked_only: bool = False) -> None:
 atexit.register(_flush_clipboard_restore)
 
 
+_PASTE_CONFIRM_SECONDS = 0.85  # Extra hold after the first 150 ms, at most.
+
+
+def _focused_value_has(pid: int, probe: str) -> bool:
+    """True when the app's focused element already shows probe; False when unknown."""
+    app_ptr = _appserv.AXUIElementCreateApplication(int(pid))
+    if not app_ptr:
+        return False
+    try:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app_ptr), _AX_MESSAGING_TIMEOUT_SECONDS)
+        except Exception:
+            pass
+        focused = _ax_read_attr_ptr(app_ptr, b"AXFocusedUIElement")
+        if not focused:
+            return False
+        try:
+            value = _ax_str_attr(focused, b"AXValue")
+        except ValueError:
+            return False
+        finally:
+            _cf.CFRelease(ctypes.c_void_p(focused))
+        return probe in value.replace("\r\n", "\n").replace("\r", "\n")
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(app_ptr))
+
+
+async def _await_paste_landed(pid: int | None, text: str) -> None:
+    """Keep the borrowed clipboard until the target shows the pasted text, bounded.
+
+    Returns as soon as the focused field contains the text's first line; unreadable
+    targets (secure fields, canvases) wait the full bound. Never sends input.
+    """
+    probe = next((line.strip() for line in text.splitlines() if line.strip()), "")[:80]
+    if not pid or not probe:
+        return
+    deadline = time.monotonic() + _PASTE_CONFIRM_SECONDS
+    loop = asyncio.get_running_loop()
+    while time.monotonic() < deadline:
+        try:
+            if await loop.run_in_executor(None, lambda: _focused_value_has(pid, probe)):
+                return
+        except Exception:
+            pass  # Unknown is treated as not yet visible; the bound still applies.
+        await asyncio.sleep(0.05)
+
+
 async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
     """Paste while preserving every clipboard type, including on failure or cancellation."""
     from AppKit import NSPasteboard
@@ -3755,6 +3983,9 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
             # Finish restoration before the next tool can intentionally replace
             # the clipboard. This also bounds cleanup after cancelled pastes.
             await asyncio.sleep(0.15)
+            # A busy app can read the clipboard after 150 ms; restoring first would
+            # paste the user's own clipboard. Hold it until the text shows up.
+            await _await_paste_landed(expected_frontmost_pid or pid, text)
         finally:
             # A real copy made by the user during the paste takes precedence.
             with _connection_gate.cleanup():

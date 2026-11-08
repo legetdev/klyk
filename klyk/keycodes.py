@@ -32,8 +32,10 @@ logger = logging.getLogger("klyk.keycodes")
 # CGEventFlags bitmasks
 MODIFIER_FLAGS: dict[str, int] = {
     "cmd": 0x100000, "command": 0x100000,
+    # Other harnesses name the Command key super/meta/win (xdotool, web, OpenAI).
+    "super": 0x100000, "meta": 0x100000, "win": 0x100000,
     "shift": 0x020000,
-    "option": 0x080000, "alt": 0x080000,
+    "option": 0x080000, "alt": 0x080000, "opt": 0x080000,
     "ctrl": 0x040000, "control": 0x040000,
 }
 
@@ -58,7 +60,39 @@ NAMED_KEYS: dict[str, int] = {
     # Arrow-key aliases for the web KeyboardEvent.key names many models reach for
     # (ArrowLeft, ArrowUp, ...). Same keycodes — pure synonyms, no ambiguity.
     "arrowleft": 123, "arrowright": 124, "arrowdown": 125, "arrowup": 126,
+    # xdotool / OpenAI spellings (matched after lowercasing and removing underscores).
+    "uparrow": 126, "downarrow": 125, "leftarrow": 123, "rightarrow": 124,
+    "pgup": 116, "pgdn": 121, "spacebar": 49, "bksp": 51,
+    "kpenter": 76, "kpdecimal": 65, "kpmultiply": 67, "kpadd": 69, "kpdivide": 75,
+    "kpsubtract": 78, "kpequal": 81, "kp0": 82, "kp1": 83, "kp2": 84, "kp3": 85, "kp4": 86,
+    "kp5": 87, "kp6": 88, "kp7": 89, "kp8": 91, "kp9": 92,
 }
+
+# xdotool keysym names for printable characters, resolved through the active layout.
+KEY_CHAR_NAMES: dict[str, str] = {
+    "minus": "-", "equal": "=", "plus": "+", "comma": ",", "period": ".", "slash": "/",
+    "backslash": "\\", "semicolon": ";", "apostrophe": "'", "quote": "'", "quotedbl": '"',
+    "bracketleft": "[", "bracketright": "]", "braceleft": "{", "braceright": "}",
+    "grave": "`", "backtick": "`", "asciitilde": "~", "exclam": "!", "at": "@",
+    "numbersign": "#", "dollar": "$", "percent": "%", "asciicircum": "^", "ampersand": "&",
+    "asterisk": "*", "parenleft": "(", "parenright": ")", "underscore": "_", "colon": ":",
+    "less": "<", "greater": ">", "question": "?", "bar": "|",
+}
+
+
+def _key_name(part: str) -> str:
+    """Normalize a multi-character key name: case, underscores and left/right modifier suffixes."""
+    if len(part) <= 1:
+        return part
+    low = part.strip().lower().replace("_", "").replace(" ", "")
+    if low in MODIFIER_FLAGS or low in NAMED_KEYS:
+        return low
+    if low in KEY_CHAR_NAMES:
+        return KEY_CHAR_NAMES[low]
+    for suffix in ("left", "right", "l", "r"):
+        if low.endswith(suffix) and low[: -len(suffix)] in MODIFIER_FLAGS:
+            return low[: -len(suffix)]
+    return low
 
 
 # ---------------------------------------------------------------------------
@@ -403,12 +437,17 @@ def parse_key_combo(key_string: str) -> tuple[int, int]:
             raise ValueError(f"Unknown key {key_string!r}")
         return kc, mods
 
-    # Whole-string named key (Return, F5, PageUp, ...).
-    low_whole = key_string.lower()
+    # Whole-string named key (Return, F5, PageUp, Page_Down, KP_Enter, minus, ...).
+    low_whole = _key_name(key_string)
     if low_whole in NAMED_KEYS:
         return NAMED_KEYS[low_whole], 0
     if low_whole in MODIFIER_FLAGS:
         raise ValueError(f"{key_string!r} is a modifier, not a key")
+    if len(low_whole) == 1 and len(key_string) > 1:
+        kc, mods = char_to_keycode(low_whole)
+        if kc is None:
+            raise ValueError(f"Unknown key {key_string!r}")
+        return kc, mods
 
     # Combo path. 'Cmd++' (Cmd plus '+') splits to ['Cmd', '', ''] — collapse
     # the empty pair into a literal '+'.
@@ -430,7 +469,10 @@ def parse_key_combo(key_string: str) -> tuple[int, int]:
     flags = 0
     keycode: int | None = None
     for part in normalized:
-        low = part.lower()
+        named = _key_name(part)
+        if len(part) > 1 and len(named) == 1:
+            part = named  # A keysym name such as 'minus' stands for its character.
+        low = named.lower() if len(part) > 1 else part.lower()
         if low in MODIFIER_FLAGS:
             flags |= MODIFIER_FLAGS[low]
             continue

@@ -15,7 +15,7 @@ PRIVATE_DIRECTORIES = {'.verification', '__pycache__', '.claude', '.codex', '.gi
 
 # These are independently observed outcomes from the native suite, not just tool names.
 NATIVE_CHECKS = frozenset({
-    'fixture started', '48 tools discovered', 'all 48 real SDK schemas validate', 'app-only focus rejected',
+    'fixture started', 'all declared tools discovered', 'all real SDK schemas validate', 'app-only focus rejected',
     'semantic click changed native counter', 'duplicate AX labels click nothing',
     'explicit duplicate index clicks once', 'click delivered native input', 'double_click delivered native input',
     'triple_click delivered native input', 'long_press delivered native input',
@@ -35,7 +35,9 @@ NATIVE_CHECKS = frozenset({
     'non-owner input blocked', 'dead owner recovered',
     'closed-window animation finished', 'selected window closed and sibling survived',
     'stale window refused without closing app', 'close_app closed fixture',
-    'second fixture started', 'close_apps closed fixture', 'all 48 tools exercised',
+    'second fixture started', 'close_app closed several fixtures', 'all declared tools exercised',
+    'element click changed native counter', 'zoomed region returned', 'running apps listed',
+    'status reports no emergency stop',
 })
 DESKTOP_CHECKS = frozenset({
     'browser fixture loaded', 'one isolated browser window identified',

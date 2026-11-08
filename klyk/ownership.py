@@ -31,6 +31,7 @@ call take_control. No investigation, ever.
 from __future__ import annotations
 
 import fcntl
+import time
 import os
 import contextvars
 import asyncio
@@ -99,13 +100,27 @@ def _open():
         return None
 
 
-def _lock(fh, mode: int) -> bool:
-    """Fail promptly when another process holds the token instead of wedging startup."""
-    try:
-        fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
-        return True
-    except OSError:
-        return False
+_LOCK_WAIT_SECONDS = 0.05
+
+
+def _lock(fh, mode: int, wait: float = _LOCK_WAIT_SECONDS) -> bool:
+    """Take the lock within a short bound instead of wedging startup.
+
+    Readers (this server's own status watcher, doctor, other servers) hold the
+    owner lock for microseconds; failing on the first contended attempt made a
+    valid driver's request look like "another session owns control".
+    """
+    deadline = time.monotonic() + wait
+    while True:
+        try:
+            fcntl.flock(fh.fileno(), mode | fcntl.LOCK_NB)
+            return True
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(0.002)
+        except OSError:
+            return False
 
 
 @contextmanager

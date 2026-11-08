@@ -37,6 +37,7 @@ import tempfile
 from dataclasses import dataclass, asdict
 from pathlib import Path
 
+from . import settings_names as _panes
 from .private_files import open_private, private_directory
 
 
@@ -303,8 +304,8 @@ def check_accessibility_permission() -> CheckResult:
     return CheckResult(
         "Accessibility permission", "fail", "NOT granted",
         "Without Accessibility, klyk can't read the AX tree (no "
-        "inspect/click_element targeting) or post keyboard events. Grant it:\n"
-        "  1. System Settings → Privacy & Security → Accessibility\n"
+        "inspect and element targeting) or post keyboard events. Grant it:\n"
+        "  1. System Settings → Privacy & Security → " + _panes.accessibility_pane() + "\n"
         "  2. Click + and add the terminal app you launch your MCP client from "
         "(Ghostty, Terminal, iTerm2, or the MCP client itself if it embeds Python).\n"
         "  3. Toggle it ON.\n"
@@ -325,7 +326,7 @@ def check_screen_recording_permission() -> CheckResult:
             raise RuntimeError(
                 "klyk needs Screen Recording permission to capture window contents "
                 "(used by screenshot / inspect / read_grid). Grant it:\n"
-                "  System Settings → Privacy & Security → Screen Recording\n"
+                "  System Settings → Privacy & Security → " + _panes.screen_recording_pane() + "\n"
                 "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
                 "Then run `klyk doctor` and restart the affected client process."
             )

@@ -13,6 +13,7 @@ import subprocess
 import tempfile
 import time
 
+from . import settings_names as _panes
 from . import connection_gate as _connection_gate
 
 from .image_bounds import (
@@ -1226,14 +1227,23 @@ def take_screenshot(
     win_x: int | None = None,
     win_y: int | None = None,
     settle_ms: int = 50,
+    output_size: tuple[int, int] | None = None,
 ) -> tuple[str, int, int]:
     """
-    Capture a window and return (base64_png, logical_width, logical_height).
+    Capture a window and return (base64_png, width, height).
 
     A supplied window ID always captures that window alone, even when covered.
-    Retina output is normalized to the caller's logical coordinates. Region or
-    display capture is available only when no window ID was supplied.
+    Retina output is normalized to the caller's logical coordinates, or to
+    output_size (the agent-facing frame) when given. Region or display capture
+    is available only when no window ID was supplied.
     """
+    if output_size is not None:
+        if logical_width is None or logical_height is None:
+            raise ValueError("A scaled window capture requires the window's logical size.")
+        out_w, out_h = (int(v) for v in output_size)
+        _validate_image_dimensions(out_w, out_h)
+        if (out_w, out_h) != (logical_width, logical_height):
+            return _take_scaled(window_id, logical_width, logical_height, win_x, win_y, settle_ms, out_w, out_h)
     if window_id is not None and (
         isinstance(window_id, bool) or not isinstance(window_id, int) or not 1 <= window_id <= 0xffffffff
     ):
@@ -1328,6 +1338,63 @@ def take_screenshot(
                 pass
 
 
+def _take_scaled(window_id, logical_width, logical_height, win_x, win_y, settle_ms, out_w, out_h):
+    """Capture one window directly at the agent frame size, never widening scope."""
+    if not window_id:
+        raise ValueError("A scaled capture requires a window ID.")
+    _connection_gate.checkpoint()
+    if settle_ms > 0:
+        time.sleep(settle_ms / 1000)
+    _connection_gate.checkpoint()
+    if _HAS_IMAGEIO:
+        try:
+            from . import window_capture
+            return window_capture.take(window_id, out_w, out_h)
+        except Exception:
+            pass  # Older macOS keeps the CoreGraphics window-only route.
+        raw = _capture_window_image(int(window_id), int(win_x or 0), int(win_y or 0),
+                                    int(logical_width), int(logical_height))
+        if not raw:
+            raise RuntimeError("Window screenshot unavailable; check Screen Recording permission.")
+        try:
+            resized = _resize_cgimage(raw, out_w, out_h)
+            try:
+                if (not resized or _cg.CGImageGetWidth(ctypes.c_void_p(resized)) != out_w
+                        or _cg.CGImageGetHeight(ctypes.c_void_p(resized)) != out_h):
+                    raise RuntimeError("Window screenshot could not be scaled to the agent frame.")
+                png_bytes = _cgimage_to_png_bytes(resized)
+            finally:
+                if resized and resized != raw:
+                    _cf.CFRelease(ctypes.c_void_p(resized))
+        finally:
+            _cf.CFRelease(ctypes.c_void_p(raw))
+        return base64.b64encode(png_bytes).decode("utf-8"), out_w, out_h
+    raise RuntimeError("Scaled window capture needs ImageIO; update macOS or reinstall Klyk's dependencies.")
+
+
+def zoom_window(window_id: int, logical_width: int, logical_height: int,
+                region: tuple[int, int, int, int], budget: tuple[int, int]) -> tuple[str, int, int, float]:
+    """Capture one window region magnified for reading small details.
+
+    region is (x1, y1, x2, y2) in logical window points. Returns (base64_png,
+    width, height, magnification) where magnification is image pixels per
+    logical point, at most 4, chosen so the image fits budget.
+    """
+    from . import frames as _frames
+    _validate_image_dimensions(logical_width, logical_height)
+    magnification, full, crop = _frames.zoom_plan(logical_width, logical_height, region, budget)
+    if not _HAS_IMAGEIO:
+        raise RuntimeError("Zoom needs ImageIO and ScreenCaptureKit (macOS 14 or later).")
+    from . import window_capture
+    try:
+        encoded, width, height = window_capture.take(int(window_id), full[0], full[1], crop=crop)
+    except ValueError:
+        raise
+    except Exception as error:
+        raise RuntimeError(f"Zoom needs ScreenCaptureKit window capture (macOS 14 or later): {error}") from None
+    return encoded, width, height, round(magnification, 3)
+
+
 def _parse_sips_dimensions(sips_output: str) -> tuple[int, int]:
     """Read actual image dimensions; never invent coordinates after probe failure."""
     pw = ph = 0
@@ -1354,7 +1421,7 @@ def check_screen_recording() -> None:
         raise RuntimeError(
             "klyk needs Screen Recording permission to capture window contents "
             "(used by screenshot / inspect / read_grid). Grant it:\n"
-            "  System Settings → Privacy & Security → Screen Recording\n"
+            "  System Settings → Privacy & Security → " + _panes.screen_recording_pane() + "\n"
             "  Add your terminal app (Ghostty, Terminal, iTerm2, etc.), toggle ON.\n"
             "Then run `klyk doctor` and restart the affected client process."
         )

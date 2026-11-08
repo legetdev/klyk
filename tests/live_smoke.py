@@ -467,11 +467,11 @@ def main():
             check('compact primary native bounds preserve controls',compact_layout_matches(json.loads(state.read_text())))
         with KlykClient(timeout=30) as client:
             tools=client.list_tools(); report['schema_bytes']=len(json.dumps(tools)); report['tools']=[t['name'] for t in tools]
-            check('48 tools discovered',len(report['tools'])==len(set(report['tools']))==48 and set(report['tools'])==expected_tools())
+            check('all declared tools discovered',len(report['tools'])==len(set(report['tools']))==len(expected_tools()) and set(report['tools'])==expected_tools())
             for tool in tools:
                 schema=tool['inputSchema']
                 jsonschema.validators.validator_for(schema).check_schema(schema)
-            check('all 48 real SDK schemas validate',True)
+            check('all real SDK schemas validate',True)
             call(client,'take_control')
             call(client,'screen_info')
             # MCP can reject invalid input before dispatch with a plain-text error.
@@ -486,7 +486,9 @@ def main():
             else:
                 target=windows['windows'][0]
             observation=call(client,'inspect',detail='full',**({'window_id':target['window_id']} if compact else {}))
-            call(client,'ax_snapshot')
+            call(client,'inspect',detail='all')
+            running=call(client,'list_apps')
+            check('running apps listed',any(app.get('bundle_id')=='org.klyk.regression.fixture' and app.get('klyk_session') for app in running.get('apps',[])))
             accurate_text=call(client,'read_text',level='accurate',window_id=target['window_id'])
             # Resolve all control coordinates from this live observation.
             elements=observation['ax_elements']
@@ -511,17 +513,21 @@ def main():
             report['accurate_ocr_expectation']={'window_id':target['window_id'],'field_index':field_index,
                                                'text':expected_accurate_text,'matched':accurate_fixture_text(accurate_text,expected_accurate_text)}
             before=current()['clicks']
-            call(client,'click_element',label=label,verify=True)
+            call(client,'click',label=label,verify=True)
             check('semantic click changed native counter',current()['clicks']==before+1)
             before=current()['clicks']
-            ambiguous=call(client,'click_element',label='Duplicate')
+            ambiguous=call(client,'click',label='Duplicate')
             check('duplicate AX labels click nothing',ambiguous.get('ambiguous') and current()['clicks']==before)
-            call(client,'click_element',label='Duplicate',index=1)
+            call(client,'click',label='Duplicate',index=1)
             check('explicit duplicate index clicks once',current()['clicks']==before+1)
-            for tool in ('click','double_click','triple_click','long_press'):
+            for tool,public,extra in (('click','click',{}),('double_click','click',{'click_count':2}),
+                                      ('triple_click','click',{'click_count':3}),('long_press','long_press',{'duration':.1})):
                 before=current()['clicks']
-                call(client,tool,**button,**({'duration':.1} if tool=='long_press' else {}))
+                call(client,public,**button,**extra)
                 check(tool+' delivered native input',current()['clicks']>before)
+            before=current()['clicks']
+            call(client,'click',element=element(label)['element'])
+            check('element click changed native counter',current()['clicks']==before+1)
             before=current()['clicks']
             call(client,'ax_action',**button,action='AXPress')
             check('AX action delivered',current()['clicks']==before+1)
@@ -550,19 +556,21 @@ def main():
             finally:
                 computer._restore_pasteboard(clipboard)
             call(client,'read_element',**field)
-            call(client,'wait_for',text=label,timeout=1)
+            call(client,'wait',text=label,timeout=1)
             call(client,'wait',seconds=.01)
-            call(client,'get_pixel',**button)
+            call(client,'get_pixels',**button)
             call(client,'get_pixels',points=[button])
             grid=call(client,'read_grid',rows=1,cols=1,x=button['x'],y=button['y'],cell_width=10,cell_height=10)
             check('grid observation returned',not grid.get('error'))
             template=call(client,'get_template',x1=int(button['x']-25),y1=int(button['y']-10),x2=int(button['x']+25),y2=int(button['y']+10))
             match=call(client,'find_template',template_id=template['template_id'])
             check('template matches current native control',match.get('found'))
-            visible=call(client,'wait_for_visual',template_id=template['template_id'],timeout=1)
+            visible=call(client,'wait',template_id=template['template_id'],timeout=1)
             check('visual readiness found',visible.get('found') is True and accurate_fixture_text(accurate_text,expected_accurate_text))
             screenshot=call(client,'screenshot',save_path=str(work/'fixture.png'))
             check('screenshot saved',Path(screenshot['saved_path']).is_file())
+            zoomed=call(client,'screenshot',region=[button['x']-40,button['y']-15,button['x']+40,button['y']+15])
+            check('zoomed region returned',zoomed.get('ok') is True and report['calls'][-1]['images']==1 and zoomed.get('image_width',0)>=80)
             call(client,'move_cursor',**button,dwell_seconds=.1)
             call(client,'select_option',**point('Choice'),option='Second')
             slim=call(client,'inspect',detail='slim')
@@ -578,7 +586,7 @@ def main():
             call(client,'drag',x1=slider['x'],y1=slider['y'],x2=slider['x']+80,y2=slider['y'])
             check('native slider drag changed state',current()['selections']>before)
             call(client,'set_mode',mode='humanoid')
-            drop=call(client,'drag_to_element',source_label='Drag sample',target_label='Drop target')
+            drop=call(client,'drag',source_label='Drag sample',target_label='Drop target')
             check('semantic drag delivered payload',drop.get('ok') and 'Klyk drag payload' in current()['drops'])
             call(client,'set_mode',mode='autonomous')
             before=current()['scroll'][field_index]
@@ -595,12 +603,12 @@ def main():
             saved=work/'saved-fixture.txt'
             if saved.exists(): saved.unlink()
             call(client,'click_menu',path=['File','Save Test File'])
-            call(client,'wait_for',text='Save As:',timeout=3)
+            call(client,'wait',text='Save As:',timeout=3)
             call(client,'handle_system_dialog',action='save')
             check('native save produced expected file',(work/'saved-fixture.txt').read_text()=='Klyk fixture saved')
             check('native Save sheet closed and Open menu ready',file_menu_ready('Open Test File','after_save'))
             call(client,'click_menu',path=['File','Open Test File'])
-            call(client,'wait_for',text='Open',timeout=3)
+            call(client,'wait',text='Open',timeout=3)
             opened=call(client,'handle_system_dialog',action='open',path=str(saved))
             opened_verified=opened.get('ok') and settled(lambda:current()['opened']=='Klyk fixture saved')
             if not opened_verified:
@@ -611,7 +619,7 @@ def main():
             missing=call(client,'handle_system_dialog',action='save')
             check('missing save panel sends no input',not missing.get('ok') and fixture_input_unchanged(missing_before,current()))
             call(client,'click_menu',path=['File','Save Test File'])
-            call(client,'wait_for',text='Save As:',timeout=3)
+            call(client,'wait',text='Save As:',timeout=3)
             call(client,'handle_system_dialog',action='cancel')
             check('native cancelled sheet closed and File menu ready',file_menu_ready('Save Test File','after_cancel'))
             # Global media input is exercised as a reversible mute toggle.
@@ -624,11 +632,13 @@ def main():
             finally:
                 subprocess.run(['osascript','-e','set volume output muted '+mute_before],check=True)
             before=current()['clicks']
-            stopped=call(client,'run',actions=[{'tool':'click','x':99999,'y':99999},{'tool':'click_element','label':label}])
+            stopped=call(client,'run',actions=[{'tool':'click','x':99999,'y':99999},{'tool':'click','label':label}])
             check('failed batch stops dependent input',not stopped['ok'] and stopped['skipped_steps']==1 and current()['clicks']==before)
             call(client,'set_mode',mode='background')
             call(client,'set_mode',mode='autonomous')
-            call(client,'get_logs');call(client,'get_escalation_log');call(client,'list_sessions');call(client,'resume')
+            call(client,'get_logs')
+            klyk_status=call(client,'status')
+            check('status reports no emergency stop',klyk_status.get('emergency_stop')=='inactive' and klyk_status.get('escalations',{}).get('app')=='Klyk Fixture')
             verdict=call(client,'verdict',test_description='Fixture actions independently verified')
             check('verdict discloses unverified evidence','UNVERIFIED' in verdict.get('instruction',''))
             if compact:
@@ -673,7 +683,7 @@ def main():
                      width=cover_window['width'],height=cover_window['height'])
                 call(client,'focus_window',window_id=target['window_id'])
                 source_before=current();receiver_before=json.loads(receiver_state.read_text())
-                covered=call(client,'drag_to_element',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
+                covered=call(client,'drag',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
                 check('covered cross-app drag refuses without native input',covered.get('ok') is False
                       and 'Drag destination' in covered.get('error','')
                       and fixture_input_unchanged(source_before,current())
@@ -683,7 +693,7 @@ def main():
                 report['fixture_layout']['primary_after_covered_drag']=current()['windows']
                 check('compact source windows restored after covered drag',
                       compact_layout_matches(current(),source_on_right=True))
-            dropped=call(client,'drag_to_element',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
+            dropped=call(client,'drag',source_label='Drag sample',target_label='Drop target',target_app='Klyk Receiver')
             check('cross-app drop independently received',dropped.get('ok') and settled(lambda:'Klyk drag payload' in json.loads(receiver_state.read_text())['drops']))
             # A second real MCP connection can take control; blocked clients must
             # not deliver input, and a dead owner must not wedge the next action.
@@ -710,10 +720,10 @@ def main():
             fixture=subprocess.Popen([str(binary)],env=fixture_environment(state),stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             check('second fixture started',settled(lambda: current()['pid']==fixture.pid))
             call(client,'list_windows',bundle_id='org.klyk.regression.fixture',app_path=str(bundle))
-            call(client,'close_apps',apps=['Klyk Fixture'])
+            call(client,'close_app',apps=['Klyk Fixture'])
             fixture.wait(timeout=5)
-            check('close_apps closed fixture',fixture.poll() is not None)
-            check('all 48 tools exercised',set(report['tools'])=={c['tool'] for c in report['calls']})
+            check('close_app closed several fixtures',fixture.poll() is not None)
+            check('all declared tools exercised',set(report['tools'])=={c['tool'] for c in report['calls']})
             report['completed']=True
     except BaseException as exc:
         report['error']=f'{type(exc).__name__}: {exc}'

@@ -18,6 +18,7 @@ import unittest
 from unittest.mock import MagicMock, patch
 
 from test_input_cleanup import enabled_gate, load_functions
+from klyk import settings_names
 from klyk.image_bounds import png_dimensions, validate_image_dimensions
 
 
@@ -131,6 +132,7 @@ class CapturePreflightTests(unittest.TestCase):
         namespace = {
             "_cg": cg,
             "ctypes": ctypes,
+            "_panes": settings_names,
             "subprocess": subprocess_mock,
             "tempfile": tempfile_mock,
         }
