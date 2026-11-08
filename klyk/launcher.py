@@ -328,6 +328,39 @@ def _process_argv(pid: int) -> list[str] | None:
     return arguments
 
 
+def _process_venv_launcher(pid: int) -> str | None:
+    """Return only the __PYVENV_LAUNCHER__ path a framework Python was started with.
+
+    python.org framework builds re-execute a virtual environment's interpreter
+    as Python.app, so argv[0] no longer names the environment; the launcher keeps
+    that path in this one variable. No other environment value is returned.
+    """
+    libc = ctypes.CDLL(None, use_errno=True)
+    libc.sysctl.restype = ctypes.c_int
+    libc.sysctl.argtypes = [ctypes.POINTER(ctypes.c_int), ctypes.c_uint, ctypes.c_void_p,
+                           ctypes.POINTER(ctypes.c_size_t), ctypes.c_void_p, ctypes.c_size_t]
+    mib = (ctypes.c_int * 3)(1, 49, pid)  # CTL_KERN, KERN_PROCARGS2, pid.
+    length = ctypes.c_size_t()
+    if libc.sysctl(mib, 3, None, ctypes.byref(length), None, 0) != 0 or not 5 <= length.value <= 1024 * 1024:
+        return None
+    data = ctypes.create_string_buffer(length.value)
+    if libc.sysctl(mib, 3, data, ctypes.byref(length), None, 0) != 0:
+        return None
+    return _venv_launcher_from(data.raw[:length.value])
+
+
+def _venv_launcher_from(raw: bytes) -> str | None:
+    """Find the launcher entry among the strings that follow argv in a KERN_PROCARGS2 block."""
+    prefix = b"__PYVENV_LAUNCHER__="
+    values = [part[len(prefix):] for part in raw[4:].split(b"\0") if part.startswith(prefix)]
+    if len(values) != 1 or not values[0]:
+        return None
+    try:
+        return values[0].decode("utf-8", "strict")
+    except UnicodeError:
+        return None
+
+
 def process_identity(pid: int, *, include_command: bool = False) -> dict | None:
     """Read a process start token without activating apps; optional command data stays internal."""
     if sys.platform != "darwin" or not isinstance(pid, int) or pid <= 1:
@@ -353,6 +386,9 @@ def process_identity(pid: int, *, include_command: bool = False) -> dict | None:
                 return None
             identity["executable"] = path.value.decode("utf-8", "strict")
             identity["argv"] = arguments
+            launcher = _process_venv_launcher(pid)
+            if launcher is not None:
+                identity["venv_launcher"] = launcher
             # The command must belong to the same process observed before the read.
             current = process_identity(pid)
             if current != {key: identity[key] for key in ("pid", "uid", "started")}:

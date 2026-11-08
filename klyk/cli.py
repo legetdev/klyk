@@ -282,7 +282,11 @@ def _installation_process(pid: int):
     argv = identity.get("argv")
     if not isinstance(argv, list) or not argv or not all(isinstance(arg, str) for arg in argv):
         return None
-    if os.path.abspath(argv[0]) != os.path.abspath(sys.executable):
+    mine = os.path.abspath(sys.executable)
+    launcher = identity.get("venv_launcher")
+    # Framework Python re-executes a venv interpreter as Python.app; its launcher
+    # variable still names the environment the client started.
+    if os.path.abspath(argv[0]) != mine and not (isinstance(launcher, str) and os.path.abspath(launcher) == mine):
         return None
     if argv[1:] not in (["-m", "klyk.mcp_server"], ["-P", "-m", "klyk.mcp_server"]):
         return None

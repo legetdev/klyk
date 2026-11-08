@@ -100,6 +100,34 @@ class SetupSecurityTests(unittest.TestCase):
                 self.assertEqual(cli._installation_process(123), identity if accepted else None)
                 fake.process_identity.assert_called_once_with(123, include_command=True)
 
+    def test_framework_python_servers_are_recognized_by_their_venv_launcher(self):
+        """python.org Python re-executes a venv interpreter as Python.app; the launcher still names it."""
+        app = "/Library/Frameworks/Python.framework/Versions/3.12/Resources/Python.app/Contents/MacOS/Python"
+        for launcher, accepted in ((sys.executable, True), (str(Path(sys.executable).with_name("other-python")), False),
+                                   (None, False)):
+            identity = self._identity(123, [app, "-P", "-m", "klyk.mcp_server"], None)
+            if launcher is not None:
+                identity["venv_launcher"] = launcher
+            fake = types.ModuleType("klyk.launcher")
+            fake.process_identity = mock.Mock(return_value=identity)
+            with self.subTest(launcher=launcher), mock.patch.dict(sys.modules, {"klyk.launcher": fake}):
+                self.assertEqual(cli._installation_process(123), identity if accepted else None)
+        identity = self._identity(123, [app, "-c", "klyk.mcp_server"], None)
+        identity["venv_launcher"] = sys.executable
+        fake = types.ModuleType("klyk.launcher")
+        fake.process_identity = mock.Mock(return_value=identity)
+        with mock.patch.dict(sys.modules, {"klyk.launcher": fake}):
+            self.assertIsNone(cli._installation_process(123), "the module command is still required")
+
+    def test_venv_launcher_is_the_only_environment_value_read(self):
+        """Only __PYVENV_LAUNCHER__ is extracted, and an ambiguous block yields nothing."""
+        from klyk import launcher
+        block = (b"\x03\x00\x00\x00/usr/bin/python\0\0python\0-m\0klyk.mcp_server\0"
+                 b"SECRET=hidden\0__PYVENV_LAUNCHER__=/Users/a/.klyk/venv/bin/python\0HOME=/Users/a\0")
+        self.assertEqual(launcher._venv_launcher_from(block), "/Users/a/.klyk/venv/bin/python")
+        self.assertIsNone(launcher._venv_launcher_from(block + b"__PYVENV_LAUNCHER__=/other\0"))
+        self.assertIsNone(launcher._venv_launcher_from(b"\x01\x00\x00\x00/usr/bin/python\0python\0HOME=/x\0"))
+
     def test_restart_rejects_invalid_and_reused_owner_without_signalling(self):
         """A stale owner file can never target a reused PID or a special process group."""
         fake = types.ModuleType("klyk.launcher")
