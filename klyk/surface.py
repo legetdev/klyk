@@ -108,6 +108,7 @@ def normalize(tool: str, arguments: dict | None) -> dict:
     args = dict(arguments or {})
     for alias in ("element_index", "ref", "element_id"):
         _move(args, alias, "element")
+    _move(args, "confirm_destructive", "allow_outside_window")  # Earlier name of the same switch.
     if "element" in args and not isinstance(args["element"], bool):
         try:
             args["element"] = parse_element(args["element"])
