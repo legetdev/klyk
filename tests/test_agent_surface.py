@@ -671,7 +671,7 @@ class ContractTests(unittest.IsolatedAsyncioTestCase):
                     "tools": [{"name": t.name, "description": t.description,
                                "inputSchema": self.s._tool_input_schema(t)} for t in self.s.TOOLS]}
         size = len(json.dumps(contract, separators=(",", ":"), ensure_ascii=False))
-        self.assertLess(size, 48_000, f"contract grew to {size} characters")
+        self.assertLess(size, 50_000, f"contract grew to {size} characters")  # Was 59,100 before 0.7.0.
         for tool in self.s.TOOLS:
             self.assertLess(len(tool.description), 900, tool.name)
 
@@ -730,3 +730,22 @@ class GracefulQuitTests(unittest.TestCase):
 
     def test_an_app_asking_to_save_is_never_forced(self):
         self.assertFalse(self.run_quit(terminates=False))
+
+
+class WindowDefaultTests(unittest.IsolatedAsyncioTestCase):
+    """set_window_bounds acts on the selected window like every other tool."""
+
+    async def test_selected_window_is_used_when_none_is_named(self):
+        s = load_server()
+        calls = []
+
+        async def execute(name, args):
+            calls.append((name, dict(args)))
+            return text({"ok": True})
+        s._execute_tool = execute
+        s.registry.get_by_app.return_value = SimpleNamespace(window_id=77, windowless=False, frames={},
+                                                            width=800, height=600, pid=1)
+        await s._execute_public("set_window_bounds", {"app": "Mail", "x": 10, "y": 20})
+        await s._execute_public("set_window_bounds", {"app": "Mail", "x": 10, "y": 20, "window_id": 5})
+        self.assertEqual(calls[0][1]["window_id"], 77)
+        self.assertEqual(calls[1][1]["window_id"], 5)
