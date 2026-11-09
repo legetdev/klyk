@@ -141,10 +141,24 @@ class LifecycleTests(unittest.IsolatedAsyncioTestCase):
         identity = {"pid": 731, "uid": 501, "started": (1, 0)}
         existing = session_module.Session("fixture", "Fixture App", "native", 731, 42, 800, 600, 1.0,
                                           process_identity=identity)
-        launcher_fake = SimpleNamespace(terminate_pid=MagicMock(return_value=True), pid_alive=MagicMock(return_value=True))
+        launcher_fake = SimpleNamespace(quit_app=MagicMock(return_value=True), terminate_pid=MagicMock(),
+                                        pid_alive=MagicMock(return_value=True))
         with patch.dict(sys.modules, {"klyk.launcher": launcher_fake}), patch.object(klyk, "launcher", launcher_fake):
             session_module._close_session(existing)
-        launcher_fake.terminate_pid.assert_called_once_with(731, expected_identity=identity)
+        launcher_fake.quit_app.assert_called_once_with(731, expected_identity=identity)
+        launcher_fake.terminate_pid.assert_not_called()
+
+    def test_close_never_forces_an_app_that_is_asking_to_save(self):
+        """An app that stays open after a normal quit request is reported, never killed."""
+        identity = {"pid": 731, "uid": 501, "started": (1, 0)}
+        existing = session_module.Session("fixture", "Mail", "native", 731, 42, 800, 600, 1.0,
+                                          process_identity=identity)
+        launcher_fake = SimpleNamespace(quit_app=MagicMock(return_value=False), terminate_pid=MagicMock(),
+                                        pid_alive=MagicMock(return_value=True))
+        with patch.dict(sys.modules, {"klyk.launcher": launcher_fake}), patch.object(klyk, "launcher", launcher_fake):
+            with self.assertRaisesRegex(RuntimeError, "nothing was forced"):
+                session_module._close_session(existing)
+        launcher_fake.terminate_pid.assert_not_called()
 
     async def test_passive_cold_attach_refuses_launch_before_effects(self):
         """Background/non-owner observations cannot cold-launch an absent native app."""

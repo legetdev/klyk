@@ -194,10 +194,12 @@ def launch_native_app(
 
     if check_stop is not None:
         check_stop()
+    # -g opens the app behind the user's current window: starting an app for an
+    # agent never takes the user's focus; actions activate it only when they must.
     if bundle_id:
-        subprocess.Popen(["/usr/bin/open", "-b", bundle_id])
+        subprocess.Popen(["/usr/bin/open", "-g", "-b", bundle_id])
     elif app_name:
-        cmd = ["/usr/bin/open", "-a", app_name]
+        cmd = ["/usr/bin/open", "-g", "-a", app_name]
         if app_name in CHROMIUM_BROWSERS and not was_already_running:
             cmd += ["--args", "--force-renderer-accessibility"]
         subprocess.Popen(cmd)
@@ -412,6 +414,29 @@ def _process_status(pid: int, expected_identity: dict) -> str:
     if all(current.get(key) == expected_identity.get(key) for key in ("pid", "uid", "started")):
         return "same"
     return "gone"
+
+
+def quit_app(pid: int, *, expected_identity: dict, timeout: float = 5.0) -> bool:
+    """Ask an app to quit the way Cmd+Q does, so it can save or ask; never force it.
+
+    Returns True once the original process is gone. False means it is still
+    running, usually because it is asking the user to save or confirm.
+    """
+    status = _process_status(pid, expected_identity)
+    if status != "same":
+        return status == "gone"
+    _check_request_access()
+    from AppKit import NSRunningApplication
+    app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(pid))
+    if app is None:
+        return not pid_alive(pid)
+    app.terminate()
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        if _process_status(pid, expected_identity) == "gone":
+            return True
+        time.sleep(0.1)
+    return _process_status(pid, expected_identity) == "gone"
 
 
 def terminate_pid(pid: int, term_timeout: float = 3.0, *, expected_identity: dict | None = None) -> bool:

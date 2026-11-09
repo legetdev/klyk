@@ -542,8 +542,10 @@ def _close_session(session: Session) -> None:
         if not app_terminated and launcher.pid_alive(session.pid):
             raise RuntimeError("The app was left running because its original process could not be safely verified or closed.")
     elif session.process_identity is not None:
-        if not launcher.terminate_pid(session.pid, expected_identity=session.process_identity):
-            raise RuntimeError("The app could not be safely closed; its process identity or termination could not be verified.")
+        # The user may have unsaved work in an app Klyk attached to: quit like Cmd+Q, never force.
+        if not launcher.quit_app(session.pid, expected_identity=session.process_identity):
+            raise RuntimeError("The app is still open. It was asked to quit like Cmd+Q and may be waiting "
+                               "for someone to save or confirm; nothing was forced. Inspect it or ask the user.")
     elif launcher.pid_alive(session.pid):
         raise RuntimeError("The app was left running because this session has no verified process identity.")
 

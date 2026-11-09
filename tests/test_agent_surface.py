@@ -646,3 +646,106 @@ class OwnershipLockTests(unittest.TestCase):
                     self.assertLess(real_time.monotonic() - started, 1.0)
                 finally:
                     holder.close()
+
+
+class ContractTests(unittest.IsolatedAsyncioTestCase):
+    """The agent-facing contract stays complete, consistent and lean."""
+
+    def setUp(self):
+        self.s = load_server()
+        self.calls = []
+
+        async def execute(name, args):
+            self.calls.append((name, dict(args)))
+            if name == "ax_snapshot":
+                return text({"elements": [{"element": 1, "role": "AXCell", "label": "F23", "value": "42"},
+                                          {"element": 2, "role": "AXButton", "label": "Send"}],
+                             "returned": 2})
+            return text({"ok": True})
+        self.s._execute_tool = execute
+        self.s.registry.get_by_app.return_value = None
+
+    def test_contract_size_budget(self):
+        """Instructions plus every tool definition stay within a token budget agents pay each session."""
+        contract = {"instructions": self.s._SERVER_INSTRUCTIONS,
+                    "tools": [{"name": t.name, "description": t.description,
+                               "inputSchema": self.s._tool_input_schema(t)} for t in self.s.TOOLS]}
+        size = len(json.dumps(contract, separators=(",", ":"), ensure_ascii=False))
+        self.assertLess(size, 50_000, f"contract grew to {size} characters")  # Was 59,100 before 0.7.0.
+        for tool in self.s.TOOLS:
+            self.assertLess(len(tool.description), 900, tool.name)
+
+    def test_contract_uses_one_coordinate_vocabulary(self):
+        text_blob = json.dumps([[t.description, self.s._tool_input_schema(t)] for t in self.s.TOOLS])
+        for word in ("window-relative", "Window-local", "logical", "Youty", "confirm_destructive", "SkyLight"):
+            self.assertNotIn(word, text_blob)
+        self.assertIn("element", self.s._SERVER_INSTRUCTIONS)
+        self.assertIn("requires_foreground", self.s._SERVER_INSTRUCTIONS)
+        self.assertIn("access_off", self.s._SERVER_INSTRUCTIONS)
+
+    async def test_inspect_query_filters_the_expanded_list(self):
+        result = payload(await self.s._execute_public("inspect", {"app": "Numbers", "query": "f23"}))
+        self.assertEqual(self.calls[0][0], "ax_snapshot")
+        self.assertNotIn("query", self.calls[0][1])
+        self.assertEqual([e["element"] for e in result["elements"]], [1])
+        self.assertEqual(result["returned"], 1)
+        empty = payload(await self.s._execute_public("inspect", {"app": "Numbers", "query": "nothing here"}))
+        self.assertEqual(empty["elements"], [])
+        self.assertIn("hint", empty)
+
+    async def test_outside_window_switch_and_its_earlier_name(self):
+        await self.s._execute_public("click", {"app": "A", "x": 1, "y": 2, "allow_outside_window": True})
+        await self.s._execute_public("click", {"app": "A", "x": 1, "y": 2, "confirm_destructive": True})
+        for name, args in self.calls:
+            self.assertEqual(name, "click")
+            self.assertIs(args["confirm_destructive"], True)
+            self.assertNotIn("allow_outside_window", args)
+
+    async def test_media_keys_are_a_closed_list(self):
+        result = payload(await self.s._execute_public("press_system_key", {"app": "A", "key": "launch_rockets"}))
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.calls, [])
+
+
+class GracefulQuitTests(unittest.TestCase):
+    """Quitting asks the app like Cmd+Q and reports an app that stays open."""
+
+    def run_quit(self, terminates):
+        from klyk import launcher
+        app = MagicMock()
+        appkit = SimpleNamespace(NSRunningApplication=SimpleNamespace(
+            runningApplicationWithProcessIdentifier_=lambda pid: app))
+        statuses = iter(["same"] + (["gone"] if terminates else ["same"] * 1000))
+        with mock.patch.dict("sys.modules", {"AppKit": appkit}), \
+                mock.patch.object(launcher, "_process_status", side_effect=lambda pid, identity: next(statuses)), \
+                mock.patch.object(launcher, "_check_request_access", lambda: None), \
+                mock.patch.object(launcher.os, "kill") as kill:
+            result = launcher.quit_app(731, expected_identity={"pid": 731}, timeout=0.3)
+        app.terminate.assert_called_once_with()
+        kill.assert_not_called()
+        return result
+
+    def test_quit_succeeds_when_the_app_exits(self):
+        self.assertTrue(self.run_quit(terminates=True))
+
+    def test_an_app_asking_to_save_is_never_forced(self):
+        self.assertFalse(self.run_quit(terminates=False))
+
+
+class WindowDefaultTests(unittest.IsolatedAsyncioTestCase):
+    """set_window_bounds acts on the selected window like every other tool."""
+
+    async def test_selected_window_is_used_when_none_is_named(self):
+        s = load_server()
+        calls = []
+
+        async def execute(name, args):
+            calls.append((name, dict(args)))
+            return text({"ok": True})
+        s._execute_tool = execute
+        s.registry.get_by_app.return_value = SimpleNamespace(window_id=77, windowless=False, frames={},
+                                                            width=800, height=600, pid=1)
+        await s._execute_public("set_window_bounds", {"app": "Mail", "x": 10, "y": 20})
+        await s._execute_public("set_window_bounds", {"app": "Mail", "x": 10, "y": 20, "window_id": 5})
+        self.assertEqual(calls[0][1]["window_id"], 77)
+        self.assertEqual(calls[1][1]["window_id"], 5)
