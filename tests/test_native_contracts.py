@@ -269,6 +269,54 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(summary["window_title"], "electron-fixture.txt")
         self.assertEqual(timeouts[-1], 0.05)
 
+    def _slow_root_walk_namespace(self):
+        """A browser that answers its window lookup after 0.95 s (within the patient bound), then walks quickly."""
+        clock = [100.0]
+
+        def slow_root(*args):
+            clock[0] += 0.95
+            return 500
+
+        def walk(element, results, *args):
+            deadline = next(a for a in args if isinstance(a, float) and a > 1.0)
+            if clock[0] <= deadline:
+                results.append({"role": "AXButton", "label": "Increment browser", "x": 1, "y": 2})
+
+        cf = MagicMock()
+        cf.CFArrayGetCount.return_value = 1
+        cf.CFArrayGetValueAtIndex.return_value = 600
+        api = MagicMock()
+        api.AXUIElementCreateApplication.return_value = 111
+        return {
+            "ctypes": ctypes,
+            "_appserv": api,
+            "_cf": cf,
+            "time": SimpleNamespace(monotonic=lambda: clock[0]),
+            "_AX_MESSAGING_TIMEOUT_SECONDS": 0.05,
+            "_AX_SNAPSHOT_CHILDREN_CAP": 20,
+            "_ax_exact_window": slow_root,
+            "_ax_read_root_attr": slow_root,
+            "_ax_read_attr_ptr": lambda element, attr: 0 if attr == b"AXFocusedUIElement" else 700,
+            "_ax_collect": walk,
+            "_ax_search_by_label": lambda element, query, results, depth, max_depth, per_node, max_results, deadline:
+                walk(element, results, deadline),
+            "release_refs": lambda entries: None,
+        }
+
+    def test_slow_window_lookup_leaves_the_walk_its_full_budget(self):
+        """A patient window lookup must not use up the walk's own time (empty inspect)."""
+        for name, call in (
+            ("ax_snapshot", lambda f: f(42, window_id=77)),
+            ("ax_snapshot", lambda f: f(42)),
+            ("ax_search_focused", lambda f: f(42, "Increment", window_id=77)),
+            ("ax_search_focused", lambda f: f(42, "Increment")),
+            ("ax_collect_focused", lambda f: f(42)),
+        ):
+            with self.subTest(name=name):
+                ns = self._slow_root_walk_namespace()
+                load_functions("computer.py", {name}, ns)
+                self.assertEqual([e["label"] for e in call(ns[name])], ["Increment browser"])
+
     def test_focused_window_requires_exact_identity_when_window_is_selected(self):
         """Equal geometry is insufficient when the requested AX window differs."""
         api = MagicMock()

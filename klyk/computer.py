@@ -1388,6 +1388,15 @@ def _ax_read_root_attr(app_ptr: int, attr: bytes) -> int:
             pass
 
 
+def _walk_deadline(seconds: float) -> float:
+    """Start a walk's wall-clock budget; call it once the walk's root is resolved.
+
+    A patient root lookup must not use up the time meant for the walk itself.
+    0 means no budget.
+    """
+    return time.monotonic() + seconds if seconds > 0 else 0.0
+
+
 # Default per-node child cap for the public ax_snapshot. Skips huge
 # homogeneous collections (Finder Desktop full of file icons, browser
 # list views with hundreds of rows). Agents who need full coverage can
@@ -1425,9 +1434,7 @@ def ax_snapshot(
     Pass `max_children_per_node=500, deadline_seconds=5.0, max_results=0`
     when the agent genuinely needs exhaustive inspection.
     """
-    deadline_ts = (
-        time.monotonic() + deadline_seconds if deadline_seconds > 0 else 0.0
-    )
+    deadline_ts = 0.0  # Started once the root window is resolved.
     results: list[dict] = []
     try:
         app_ptr = _appserv.AXUIElementCreateApplication(pid)
@@ -1451,6 +1458,7 @@ def ax_snapshot(
                 root = _ax_exact_window(pid, window_id)
                 if not root:
                     return []
+                deadline_ts = _walk_deadline(deadline_seconds)
                 try:
                     _ax_collect(root, results, 0, max_depth, max_children_per_node,
                                 deadline_ts, max_results, focused_ref, retain)
@@ -1458,6 +1466,7 @@ def ax_snapshot(
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(root))
             wins_ptr = _ax_read_root_attr(app_ptr, b"AXWindows")
+            deadline_ts = _walk_deadline(deadline_seconds)
             had_windows = False
             if wins_ptr:
                 try:
@@ -2718,7 +2727,6 @@ def ax_search_focused(
     q = (query or "").lower().strip()
     if not q:
         return []
-    deadline_ts = time.monotonic() + deadline_seconds
     try:
         app_ptr = _appserv.AXUIElementCreateApplication(pid)
         if not app_ptr:
@@ -2733,6 +2741,7 @@ def ax_search_focused(
         try:
             focused_ptr = (_ax_exact_window(pid, window_id) if window_id is not None
                            else _ax_read_root_attr(app_ptr, b"AXFocusedWindow"))
+            deadline_ts = time.monotonic() + deadline_seconds
             if focused_ptr:
                 try:
                     children_ptr = _ax_read_attr_ptr(focused_ptr, b"AXChildren")
@@ -2788,9 +2797,6 @@ def ax_collect_focused(
     every label/role in the focused window's reachable AX tree (e.g.
     debugging tools) while still respecting the 1 s tool budget.
     """
-    deadline_ts = (
-        time.monotonic() + deadline_seconds if deadline_seconds > 0 else 0.0
-    )
     try:
         app_ptr = _appserv.AXUIElementCreateApplication(pid)
         if not app_ptr:
@@ -2804,6 +2810,7 @@ def ax_collect_focused(
         results: list[dict] = []
         try:
             focused_ptr = _ax_read_root_attr(app_ptr, b"AXFocusedWindow")
+            deadline_ts = _walk_deadline(deadline_seconds)
             if focused_ptr:
                 try:
                     children_ptr = _ax_read_attr_ptr(focused_ptr, b"AXChildren")
