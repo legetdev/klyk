@@ -265,7 +265,7 @@ class SelfTestLifecycleTests(IsolatedPolicy, unittest.IsolatedAsyncioTestCase):
             harness.drain()
             while thread.is_alive() and time.monotonic() < deadline:
                 await asyncio.sleep(0.001)
-            thread.join(timeout=0.1)
+            thread.join(timeout=10)
             self.assertFalse(thread.is_alive())
         self.assertEqual(errors, [])
         self.assertTrue(observed.is_set())

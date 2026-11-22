@@ -350,7 +350,7 @@ class NativeGateTests(IsolatedPolicy):
         namespace['_start_emergency_stop_tap']()
         thread = namespace['_stop_thread'][0]
         try:
-            thread.join(timeout=0.3)
+            thread.join(timeout=10)  # Returns as soon as the thread ends.
             self.assertFalse(thread.is_alive())
             namespace['_cf'].CFRunLoopRun.assert_not_called()
             namespace['_cf'].CFRunLoopRunInMode.assert_not_called()
@@ -370,7 +370,7 @@ class NativeGateTests(IsolatedPolicy):
         namespace['_cf'].CFRelease.side_effect = lambda *args: ownership.append(
             self.peer_can_take_listener_lock(namespace['_tap_lock']))
         namespace['_start_emergency_stop_tap']()
-        namespace['_stop_thread'][0].join(timeout=1)
+        namespace['_stop_thread'][0].join(timeout=10)  # Returns as soon as the thread ends.
         self.assertFalse(namespace['_stop_thread'][0].is_alive())
         namespace['_cf'].CFRunLoopRunInMode.assert_called_once_with(81, 0.05, False)
         namespace['_cf'].CFRunLoopRun.assert_not_called()

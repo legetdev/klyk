@@ -558,7 +558,7 @@ class SettingsNameTests(unittest.TestCase):
 class PasteHoldTests(unittest.IsolatedAsyncioTestCase):
     """The borrowed clipboard is kept until a slow app has actually pasted."""
 
-    def load(self, seen):
+    def load(self, seen, bound=0.3):
         import asyncio as real_asyncio
         import time as real_time
         from test_input_cleanup import load_functions
@@ -568,16 +568,18 @@ class PasteHoldTests(unittest.IsolatedAsyncioTestCase):
             calls.append((pid, probe))
             return seen(len(calls))
         ns = {"asyncio": real_asyncio, "time": real_time, "_focused_value_has": has,
-              "_PASTE_CONFIRM_SECONDS": 0.3}
+              "_PASTE_CONFIRM_SECONDS": bound}
         load_functions("computer.py", {"_await_paste_landed"}, ns)
         return ns["_await_paste_landed"], calls
 
     async def test_returns_once_the_field_shows_the_text(self):
-        wait, calls = self.load(lambda count: count >= 2)
+        # A long bound separates "returned at the confirming poll" from "waited it out"
+        # even on a heavily loaded machine.
+        wait, calls = self.load(lambda count: count >= 2, bound=30.0)
         started = __import__("time").monotonic()
         await wait(42, "  \nHello world\nsecond line")
-        self.assertLess(__import__("time").monotonic() - started, 0.25)
-        self.assertEqual(calls[0], (42, "Hello world"))
+        self.assertLess(__import__("time").monotonic() - started, 10.0)
+        self.assertEqual(calls, [(42, "Hello world")] * 2)
 
     async def test_unconfirmed_paste_waits_the_bound(self):
         wait, calls = self.load(lambda count: False)

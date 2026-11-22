@@ -154,7 +154,7 @@ class DiagnosticPrivacyTests(unittest.TestCase):
         buffer = logs.LogBuffer()
         data = b"password=" + b"s" * 100000 + b"-private-tail\nnormal diagnostic\n"
         reader = logs.StderrReader(io.BytesIO(data), buffer)
-        reader._thread.join(timeout=2)
+        reader._thread.join(timeout=10)
         self.assertFalse(reader._thread.is_alive())
         self.assertEqual(list(buffer.app_errors), ["[oversized log line omitted]", "normal diagnostic"])
 

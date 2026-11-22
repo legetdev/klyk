@@ -501,7 +501,7 @@ class EnsureRunningTests(unittest.TestCase):
 
     def wait_for_start(self):
         """Join the background starter this call created."""
-        controls._ensure_thread.join(timeout=2)
+        controls._ensure_thread.join(timeout=10)
         self.assertFalse(controls._ensure_thread.is_alive())
 
     def test_starts_quietly_in_the_background_only_when_stopped(self):

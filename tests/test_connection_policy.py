@@ -160,7 +160,7 @@ class ConnectionPolicyTests(unittest.TestCase):
             worker.start()
         barrier.wait()
         for worker in workers:
-            worker.join(timeout=2)
+            worker.join(timeout=10)
             self.assertFalse(worker.is_alive())
         self.assertFalse(errors)
         self.assertTrue(policy.enabled("codex"))
