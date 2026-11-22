@@ -3661,11 +3661,40 @@ async def triple_click(x: int, y: int, modifiers: list[str] | None = None) -> No
 # Keyboard input
 # ---------------------------------------------------------------------------
 
+def _describe_app(name, bundle) -> str | None:
+    """A short printable 'Name (bundle.id)' for refusals, or None when nothing is known."""
+    def clean(text):
+        return "".join(ch for ch in str(text or "") if ch.isprintable()).strip()[:80]
+    name, bundle = clean(name), clean(bundle)
+    if name and bundle:
+        return f"{name} ({bundle})"
+    return name or bundle or None
+
+
+def _frontmost_app_label() -> str | None:
+    """Describe the app that is now in front; None when it cannot be read."""
+    try:
+        from . import capture
+        from AppKit import NSRunningApplication
+        front = capture.frontmost_pid()
+        if front is None:
+            return None
+        app = NSRunningApplication.runningApplicationWithProcessIdentifier_(int(front))
+        if app is None:
+            return None
+        return _describe_app(app.localizedName(), app.bundleIdentifier())
+    except Exception:
+        return None
+
+
 def _check_frontmost(expected_pid: int | None) -> None:
     """Refuse global typing after the foreground app changes or cannot be verified."""
     _check_stop()
     if expected_pid is not None and not is_frontmost_app(expected_pid):
-        raise RuntimeError("The foreground app changed; no further keys were sent. Inspect the dialog before continuing.")
+        front = _frontmost_app_label()
+        now = f" ({front} is now in front)" if front else ""
+        raise RuntimeError(f"The foreground app changed{now}; no further keys were sent. "
+                           "Inspect the dialog before continuing.")
 
 
 async def press_key(key_string: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:

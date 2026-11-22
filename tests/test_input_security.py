@@ -131,6 +131,26 @@ class StopAndReleaseTests(unittest.IsolatedAsyncioTestCase):
             await ns["type_text_char_by_char"]("ab", expected_frontmost_pid=123)
         self.assertEqual(events, [10, 11])
 
+    async def test_foreground_refusal_names_the_app_that_took_over(self):
+        """A prompt that steals focus is named so the agent knows what to inspect."""
+        ns, events = core_namespace()
+        ns["is_frontmost_app"] = lambda pid: False
+        ns["_frontmost_app_label"] = lambda: "Keychain Access (com.apple.keychainaccess)"
+        load_functions("computer.py", {"_check_frontmost"}, ns)
+        with self.assertRaisesRegex(RuntimeError, r"foreground app changed \(Keychain Access "
+                                    r"\(com\.apple\.keychainaccess\) is now in front\); no further keys"):
+            ns["_check_frontmost"](123)
+        self.assertEqual(events, [])
+
+    def test_frontmost_app_description_is_short_and_printable(self):
+        ns = {}
+        load_functions("computer.py", {"_describe_app"}, ns)
+        describe = ns["_describe_app"]
+        self.assertEqual(describe("Code", "com.microsoft.VSCode"), "Code (com.microsoft.VSCode)")
+        self.assertEqual(describe("Evil\nName\x1b[2J", None), "EvilName[2J")
+        self.assertEqual(len(describe("x" * 500, "")), 80)
+        self.assertIsNone(describe(None, " "))
+
     async def test_system_key_cancellation_always_sends_release(self):
         """Cancel after a fake media down; cleanup still posts the matching media up."""
         ns, events = core_namespace()
