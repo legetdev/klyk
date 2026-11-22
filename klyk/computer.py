@@ -1360,14 +1360,15 @@ def _ax_collect(
 # at the start of every snapshot — AX cascades this to the children
 # AXUIElementRefs used inside the same walk.
 _AX_MESSAGING_TIMEOUT_SECONDS = 0.05  # 50 ms
-# A window lookup is one answer every later step depends on. A browser busy
-# rendering (just activated, or on a loaded machine) often needs longer than the
-# walk cap to answer it, and a miss would fail the whole action.
+# A window lookup or the app's focused element is one answer every later step
+# depends on. A browser busy rendering (just activated, or on a loaded machine)
+# often needs longer than the walk cap to answer it, and a miss would fail the
+# whole action.
 _AX_PATIENT_TIMEOUT_SECONDS = 1.0
 
 
-def _ax_read_window_attr(app_ptr: int, attr: bytes) -> int:
-    """Read an app's window list or focused window, giving a busy app one patient retry.
+def _ax_read_root_attr(app_ptr: int, attr: bytes) -> int:
+    """Read an app's window list, focused window or focused element, giving a busy app one patient retry.
 
     The app element keeps the fast walk timeout afterwards. Returns an owned
     reference or 0, like _ax_read_attr_ptr.
@@ -1456,7 +1457,7 @@ def ax_snapshot(
                     return results
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(root))
-            wins_ptr = _ax_read_window_attr(app_ptr, b"AXWindows")
+            wins_ptr = _ax_read_root_attr(app_ptr, b"AXWindows")
             had_windows = False
             if wins_ptr:
                 try:
@@ -1994,7 +1995,7 @@ def _ax_open_path_context(pid: int, expected: tuple[int, int, int, int, int] | N
     fields = []
     try:
         _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app), _AX_MESSAGING_TIMEOUT_SECONDS)
-        field = _ax_read_attr_ptr(app, b"AXFocusedUIElement")
+        field = _ax_read_root_attr(app, b"AXFocusedUIElement")
         if not field:
             return None
         owned.append(field)
@@ -2731,7 +2732,7 @@ def ax_search_focused(
         results: list[dict] = []
         try:
             focused_ptr = (_ax_exact_window(pid, window_id) if window_id is not None
-                           else _ax_read_window_attr(app_ptr, b"AXFocusedWindow"))
+                           else _ax_read_root_attr(app_ptr, b"AXFocusedWindow"))
             if focused_ptr:
                 try:
                     children_ptr = _ax_read_attr_ptr(focused_ptr, b"AXChildren")
@@ -2802,7 +2803,7 @@ def ax_collect_focused(
             pass
         results: list[dict] = []
         try:
-            focused_ptr = _ax_read_window_attr(app_ptr, b"AXFocusedWindow")
+            focused_ptr = _ax_read_root_attr(app_ptr, b"AXFocusedWindow")
             if focused_ptr:
                 try:
                     children_ptr = _ax_read_attr_ptr(focused_ptr, b"AXChildren")
@@ -2863,7 +2864,7 @@ def ax_focused_summary(pid: int) -> dict:
                 )
             except Exception:
                 pass
-            focused_ptr = _ax_read_attr_ptr(app_ptr, b"AXFocusedUIElement")
+            focused_ptr = _ax_read_root_attr(app_ptr, b"AXFocusedUIElement")
             if focused_ptr:
                 try:
                     label = (
@@ -2881,7 +2882,7 @@ def ax_focused_summary(pid: int) -> dict:
                         }
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(focused_ptr))
-            win_ptr = _ax_read_window_attr(app_ptr, b"AXFocusedWindow")
+            win_ptr = _ax_read_root_attr(app_ptr, b"AXFocusedWindow")
             if win_ptr:
                 try:
                     title = _ax_str_attr(win_ptr, b"AXTitle")
@@ -3123,7 +3124,7 @@ def _ax_window_for_cg_id(pid: int, target_window_id: int, target_x: float, targe
         return 0
     try:
         _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app_ptr), _AX_MESSAGING_TIMEOUT_SECONDS)
-        wins_ptr = _ax_read_window_attr(app_ptr, b"AXWindows")
+        wins_ptr = _ax_read_root_attr(app_ptr, b"AXWindows")
         if not wins_ptr:
             return 0
         try:
