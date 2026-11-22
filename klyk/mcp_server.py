@@ -2162,7 +2162,8 @@ TOOLS = [
             "(default in Chromium and Electron apps; use it for games and editors that ignore paste). "
             "Paste, and keys in Chromium/Electron, need the app in front, which background mode "
             "refuses. With window or window_id it types into that window or fails before typing. "
-            "Check the field afterwards."
+            "Keys into a Chromium/Electron text field wait for each key to show and return confirmed; "
+            "otherwise, or when confirmed is false, check the field afterwards."
         ),
         inputSchema=_public_schema(
             "type_text", mode={"type": "string", "enum": ["paste", "keys"],
@@ -5330,9 +5331,13 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 chromium = _is_chromium_based(session)
                 frontmost_pid = session.pid if chromium or session.mode == "humanoid" else None
                 # Renderers apply keys asynchronously; pace each key to the field so none reorder or drop.
-                await computer.type_text_char_by_char(args["text"], session.pid,
-                                                     expected_frontmost_pid=frontmost_pid,
-                                                     confirm_pid=session.pid if chromium else None)
+                landed = await computer.type_text_char_by_char(args["text"], session.pid,
+                                                              expected_frontmost_pid=frontmost_pid,
+                                                              confirm_pid=session.pid if chromium else None)
+                if chromium:
+                    # Tell the agent whether every key was seen landing; if not, it must read the field.
+                    return [types.TextContent(type="text", text=json.dumps(
+                        {"ok": True, "mode": mode, "confirmed": bool(landed)}))]
             else:
                 await computer.type_text(args["text"], session.pid, expected_frontmost_pid=session.pid)
             return [types.TextContent(

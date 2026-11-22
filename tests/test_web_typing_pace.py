@@ -213,6 +213,17 @@ class WebTypingDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.server.computer.type_text_char_by_char.assert_awaited_once_with(
             "hi", 123, expected_frontmost_pid=123, confirm_pid=123)
 
+    async def test_unconfirmed_chromium_typing_is_reported(self):
+        """When pacing had to be given up, the agent is told to read the field back."""
+        self.server._is_chromium_based = lambda session: True
+        for landed in (True, False):
+            with self.subTest(landed=landed):
+                self.server.computer.type_text_char_by_char = AsyncMock(return_value=landed)
+                result = payload(await self.server.call_tool(
+                    "type_text", {"app": "Klyk Electron Fixture", "text": "hi", "mode": "keys"}))
+                result.pop("_meta", None)
+                self.assertEqual(result, {"ok": True, "mode": "keys", "confirmed": landed})
+
     async def test_native_keys_typing_stays_unpaced(self):
         self.server._is_chromium_based = lambda session: False
         result = payload(await self.server.call_tool(
@@ -220,6 +231,7 @@ class WebTypingDispatchTests(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(result["ok"])
         self.server.computer.type_text_char_by_char.assert_awaited_once_with(
             "hi", 123, expected_frontmost_pid=None, confirm_pid=None)
+        self.assertNotIn("confirmed", result)
 
 
 if __name__ == "__main__":

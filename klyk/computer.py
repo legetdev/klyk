@@ -4058,10 +4058,12 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
 # after each change (VS Code, many rich editors) reorder or lose characters
 # (observed: "Electron vfied 🧭eri" for "Electron verified 🧭"). Typing into
 # a readable field therefore waits until each character shows up before the
-# next one is sent, which also means typing returns only once the text landed.
+# next one is sent, and typing reports whether every character was seen landing.
 _FIELD_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"})
 _kAXValueCFRangeType = 4
-_TYPING_FIRST_CONFIRM_SECONDS = 0.4  # A field that never reflects typing stops being watched quickly.
+# A busy renderer can take half a second to show the first key; a field that never
+# reflects typing (a terminal's hidden input) costs this wait once per call.
+_TYPING_FIRST_CONFIRM_SECONDS = 1.0
 _TYPING_CONFIRM_SECONDS = 1.5  # Once it has shown one, a busy renderer gets this long per character.
 
 
