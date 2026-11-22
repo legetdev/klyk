@@ -58,7 +58,7 @@ class StopAndReleaseTests(unittest.IsolatedAsyncioTestCase):
     def test_repeated_chord_does_not_clear_and_disabled_tap_recovers(self):
         """Holding a chord ignores repeats; a disabled tap is enabled without resetting stop."""
         now = [1.0]
-        fields = {9: 53, 8: 0}
+        fields = {9: 53, 8: 0, 45: 1, 41: 0}  # A physical keyboard event.
         cg = MagicMock()
         cg.CGEventGetIntegerValueField.side_effect = lambda event, field: fields.get(field, 0)
         cg.CGEventGetFlags.return_value = 0x120000
@@ -66,7 +66,8 @@ class StopAndReleaseTests(unittest.IsolatedAsyncioTestCase):
               "_stop_tap": [81], "kCGEventKeyDown": 10, "kCGKeyboardEventKeycode": 9,
               "_EMERGENCY_STOP_KEYCODE": 53, "_EMERGENCY_STOP_FLAGS": 0x120000,
               "_stop_engaged": [False], "_last_chord_t": [0.0], "_CHORD_DEBOUNCE_S": .6,
-              "_stop_lock": threading.Lock(), "time": SimpleNamespace(monotonic=lambda: now[0]), "log": MagicMock()}
+              "_stop_lock": threading.Lock(), "time": SimpleNamespace(monotonic=lambda: now[0]), "log": MagicMock(),
+              "_kCGEventSourceUnixProcessID": 41, "_kCGEventSourceStateID": 45, "_kCGEventSourceStateHIDSystemState": 1}
         load_functions("computer.py", {"_make_stop_callback", "_toggle_stop_from_chord"}, ns)
         callback = ns["_make_stop_callback"]()
         callback(None, 10, 123, None)
@@ -81,6 +82,34 @@ class StopAndReleaseTests(unittest.IsolatedAsyncioTestCase):
         fields[8] = 0
         callback(None, 10, 123, None)
         self.assertFalse(ns["_stop_engaged"][0])
+
+    def test_software_chord_engages_but_never_clears_the_stop(self):
+        """Audit A-2: a synthetic Cmd+Shift+Escape (osascript, another tool) cannot resume input."""
+        now = [1.0]
+        fields = {9: 53, 8: 0, 45: 0, 41: 4242}  # Posted by process 4242, not the keyboard.
+        cg = MagicMock()
+        cg.CGEventGetIntegerValueField.side_effect = lambda event, field: fields.get(field, 0)
+        cg.CGEventGetFlags.return_value = 0x120000
+        ns = {"ctypes": ctypes, "_cg": cg, "_TAP_CB_TYPE": lambda callback: callback,
+              "_stop_tap": [81], "kCGEventKeyDown": 10, "kCGKeyboardEventKeycode": 9,
+              "_EMERGENCY_STOP_KEYCODE": 53, "_EMERGENCY_STOP_FLAGS": 0x120000,
+              "_stop_engaged": [False], "_last_chord_t": [0.0], "_CHORD_DEBOUNCE_S": .6,
+              "_stop_lock": threading.Lock(), "time": SimpleNamespace(monotonic=lambda: now[0]), "log": MagicMock(),
+              "_kCGEventSourceUnixProcessID": 41, "_kCGEventSourceStateID": 45, "_kCGEventSourceStateHIDSystemState": 1}
+        load_functions("computer.py", {"_make_stop_callback", "_toggle_stop_from_chord"}, ns)
+        callback = ns["_make_stop_callback"]()
+        callback(None, 10, 123, None)
+        self.assertTrue(ns["_stop_engaged"][0], "engaging from any source stays allowed")
+        for state, pid in ((0, 4242), (1, 4242), (0, 0)):
+            with self.subTest(state=state, pid=pid):
+                now[0] += 1.0
+                fields[45], fields[41] = state, pid
+                callback(None, 10, 123, None)
+                self.assertTrue(ns["_stop_engaged"][0])
+        now[0] += 1.0
+        fields[45], fields[41] = 1, 0
+        callback(None, 10, 123, None)
+        self.assertFalse(ns["_stop_engaged"][0], "the physical chord still clears it")
 
     async def test_double_and_triple_click_stop_before_next_pair(self):
         """A stop between click pairs releases the first button and prevents the next down."""
