@@ -4,7 +4,7 @@ from types import SimpleNamespace
 import unittest
 from unittest.mock import patch
 
-from live_smoke import fixture_file_menu_ready, wait_for_fixture_file_menu
+from live_smoke import fixture_file_menu_ready, wait_for_fixture_file_menu, wait_for_fixture_panel
 
 
 class FixtureMenuReadinessTests(unittest.TestCase):
@@ -98,3 +98,43 @@ class FixtureMenuReadinessTests(unittest.TestCase):
             evidence=wait_for_fixture_file_menu(delayed_state,123,'Open Test File')
         self.assertFalse(evidence['ready']);self.assertEqual(evidence['observations'],0)
         probe.assert_not_called()
+
+
+class FixturePanelReadinessTests(unittest.TestCase):
+    """Wait for the real panel button, never for a word the window already shows."""
+
+    def _state(self, sheet):
+        return {'pid':123,'active':True,'windows':[
+            {'id':1,'title':'Klyk Fixture A','visible':True,'attached_sheet':sheet},
+            {'id':2,'title':'Klyk Fixture B','visible':True,'attached_sheet':False}]}
+
+    def test_window_without_sheet_is_not_ready_and_is_not_probed(self):
+        """Before the sheet attaches, the window's own "Open" text must not count as the panel."""
+        probes=[]
+        evidence=wait_for_fixture_panel(lambda:self._state(False),lambda *a,**k:probes.append(a) or 'Open',
+                                        123,'Open',timeout=.2)
+        self.assertFalse(evidence['ready'])
+        self.assertEqual(probes,[])
+        self.assertGreater(evidence['observations'],1)
+
+    def test_waits_for_sheet_and_exact_button_then_stops_probing(self):
+        """A sheet that is still building its controls becomes ready once Open exists."""
+        states=iter([self._state(False),self._state(True),self._state(True),self._state(True)])
+        answers=iter([None,'Open'])
+        calls=[]
+        def button(pid,titles,press=True):
+            calls.append((pid,titles,press))
+            return next(answers)
+        evidence=wait_for_fixture_panel(lambda:next(states),button,123,'Open',timeout=2)
+        self.assertTrue(evidence['ready'])
+        self.assertEqual(calls,[(123,('Open',),False),(123,('Open',),False)])
+        self.assertEqual(evidence['observations'],3)
+
+    def test_unowned_or_ambiguous_sheets_are_not_ready(self):
+        """Another process or two attached sheets cannot qualify."""
+        other=self._state(True);other['pid']=124
+        both=self._state(True);both['windows'][1]['attached_sheet']=True
+        for state in (other,both,None,{'pid':123}):
+            with self.subTest(state=state):
+                evidence=wait_for_fixture_panel(lambda:state,lambda *a,**k:'Open',123,'Open',timeout=.1)
+                self.assertFalse(evidence['ready'])
