@@ -591,6 +591,8 @@ def main():
             check('template matches current native control',match.get('found'))
             visible=call(client,'wait',template_id=template['template_id'],timeout=1)
             check('visual readiness found',visible.get('found') is True and accurate_fixture_text(accurate_text,expected_accurate_text))
+            # Klyk never overwrites an existing file, so a rerun starts from a fresh name.
+            (work/'fixture.png').unlink(missing_ok=True)
             screenshot=call(client,'screenshot',save_path=str(work/'fixture.png'))
             check('screenshot saved',Path(screenshot['saved_path']).is_file())
             zoomed=call(client,'screenshot',region=[button['x']-40,button['y']-15,button['x']+40,button['y']+15])
