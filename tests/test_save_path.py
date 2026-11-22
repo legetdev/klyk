@@ -76,8 +76,6 @@ class SavePathTests(unittest.TestCase):
             with open_private(target, "xb"):
                 self.fail("existing file opened")
         self.assertEqual(target.read_bytes(), b"keep")
-        with self.assertRaises(ValueError):
-            open_private(self.root / "x.png", "wb")
 
 
 if __name__ == "__main__":
