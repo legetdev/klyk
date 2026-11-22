@@ -130,6 +130,30 @@ def wait_for_fixture_file_menu(read_state, pid, command):
     return evidence
 
 
+def wait_for_fixture_panel(read_state, panel_button, pid, button, timeout=3):
+    """Passively wait until the fixture reports one attached sheet and that sheet's exact button exists.
+
+    The fixture window already shows the same word (its "Open Test File" item), so
+    matching text alone is no evidence that the panel is up. Sends no input.
+    """
+    started=time.monotonic();deadline=started+timeout
+    evidence={'ready':False,'observations':0,'button':button,'budget_seconds':timeout,
+              'sheet':False,'found':None,'fixture_state':None,'elapsed_ms':0}
+    while True:
+        state=read_state()
+        windows=state.get('windows') if isinstance(state,dict) else None
+        sheet=(isinstance(windows,list) and state.get('pid')==pid
+               and sum(isinstance(window,dict) and window.get('attached_sheet') is True for window in windows)==1)
+        found=panel_button(pid,(button,),press=False) if sheet else None
+        ready=sheet and isinstance(found,str) and found.lower()==button.lower()
+        evidence.update(ready=ready,observations=evidence['observations']+1,sheet=sheet,found=found,fixture_state=state)
+        if ready or time.monotonic()>=deadline:
+            break
+        time.sleep(min(.05,max(0,deadline-time.monotonic())))
+    evidence['elapsed_ms']=round((time.monotonic()-started)*1000)
+    return evidence
+
+
 def accurate_fixture_text(result, expected):
     """A positive accurate OCR call must independently recognize the selected fixture's real text."""
     if not isinstance(result,dict) or not isinstance(expected,str) or not expected:
@@ -608,7 +632,9 @@ def main():
             check('native save produced expected file',(work/'saved-fixture.txt').read_text()=='Klyk fixture saved')
             check('native Save sheet closed and Open menu ready',file_menu_ready('Open Test File','after_save'))
             call(client,'click_menu',path=['File','Open Test File'])
-            call(client,'wait',text='Open',timeout=3)
+            open_panel=wait_for_fixture_panel(current,computer.ax_press_panel_button,fixture.pid,'Open')
+            report.setdefault('file_panel_readiness',{})['open_panel']=open_panel
+            check('native Open panel ready',open_panel['ready'])
             opened=call(client,'handle_system_dialog',action='open',path=str(saved))
             opened_verified=opened.get('ok') and settled(lambda:current()['opened']=='Klyk fixture saved')
             if not opened_verified:
