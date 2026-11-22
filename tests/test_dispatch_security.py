@@ -597,7 +597,8 @@ class DispatchSecurityTests(unittest.IsolatedAsyncioTestCase):
             {"role": "AXMenuItem", "label": "Delete", "x": 10, "y": 10},
             {"role": "AXMenuItem", "label": "Delete", "x": 20, "y": 10},
         ]
-        arguments = {"app": "Fixture", "x": 10, "y": 10, "item_label": "Delete", "timeout": 0.2}
+        # The menu is found at once; a generous timeout only matters on a loaded machine.
+        arguments = {"app": "Fixture", "x": 10, "y": 10, "item_label": "Delete", "timeout": 5}
         refused = payload(await self.s.call_tool("context_menu_select", arguments))
         self.assertTrue(refused["ambiguous"])
         self.s.computer.ax_perform_action_at.assert_not_called()

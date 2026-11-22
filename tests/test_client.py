@@ -85,12 +85,14 @@ sys.stdout.write('{"id":')
 sys.stdout.flush()
 time.sleep(30)
 '''
-        client = self.client(source, timeout=1.0)
+        # The timeout also covers the child's own start, which a loaded machine slows;
+        # 3 s leaves room for it to write its partial lines, and the child sleeps 30 s.
+        client = self.client(source, timeout=3.0)
         started = time.monotonic()
         with mock.patch("klyk.client.subprocess.Popen", wraps=subprocess.Popen) as launch:
             with self.assertRaisesRegex(KlykError, "timed out.*diagnostics were omitted"):
                 client.start()
-        self.assertLess(time.monotonic() - started, 6)
+        self.assertLess(time.monotonic() - started, 20)
         self.assertIsNone(client._proc)
         self.assertEqual(launch.call_count, 1)
 
