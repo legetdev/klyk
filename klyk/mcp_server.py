@@ -162,6 +162,35 @@ _HYPHEN_VARIANTS = str.maketrans({
 })
 
 
+def _save_png(save_path: str, image_b64: str, meta: dict) -> bool:
+    """Write a capture to a new .png file the agent named; never overwrite anything.
+
+    Observation tools stay usable without control and during an emergency stop,
+    but writing a file is an action: it is refused then, as it is for an
+    existing file or a non-.png path. Records saved_path or save_error in meta.
+    """
+    resolved = os.path.abspath(os.path.expanduser(save_path))
+    if not resolved.lower().endswith(".png"):
+        meta["save_error"] = "save_path must end in .png; nothing was written."
+    elif computer.emergency_stop_active():
+        meta["save_error"] = "The emergency stop is active; nothing was written."
+    elif not ownership.is_owner():
+        meta["save_error"] = "This session does not hold control; nothing was written."
+    else:
+        try:
+            with open_private(resolved, "xb") as handle:
+                handle.write(base64.b64decode(image_b64))
+        except FileExistsError:
+            meta["save_error"] = "A file already exists there; Klyk never overwrites files. Choose a new name."
+        except Exception as error:
+            log.warning("capture save failed (%s)", type(error).__name__)
+            meta["save_error"] = f"{error}"
+        else:
+            meta["saved_path"] = resolved
+            return True
+    return False
+
+
 def _normalize_label(s: str) -> str:
     # NFC-normalize so canonically-equivalent forms match: macOS filesystem
     # labels (Finder rows, save/open dialogs) come back as NFD ("e" + combining
@@ -499,7 +528,7 @@ _INTERNAL_TOOLS = [
                 "save_path": {
                     "type": "string",
                     "description": (
-                        "Absolute path (or ~-relative) to write the PNG to. When set, the inline "
+                        "Absolute path (or ~-relative) of a new .png file to write; an existing file is never overwritten. When set, the inline "
                         "image is omitted from the response and the path is returned as saved_path. "
                         "Parent directory must already exist — write failure falls back to inline "
                         "image and reports save_error. Owner-only file; links and special files are refused. Ignored when detail='slim'."
@@ -533,7 +562,7 @@ _INTERNAL_TOOLS = [
                 "save_path": {
                     "type": "string",
                     "description": (
-                        "Absolute path (or ~-relative) to write the PNG to. When set, the inline "
+                        "Absolute path (or ~-relative) of a new .png file to write; an existing file is never overwritten. When set, the inline "
                         "image is omitted from the response and the path is returned as saved_path. "
                         "Owner-only file; links and special files are refused with save_error and inline image fallback."
                     ),
@@ -2041,7 +2070,7 @@ TOOLS = [
                     "oneOf": [{"type": "integer", "minimum": 0}, {"type": "string", "enum": ["main"]}],
                     "description": "Capture a whole display: a screen_info index or 'main'.",
                 },
-                "save_path": {"type": "string", "description": "Write the PNG to this absolute or ~ path."},
+                "save_path": {"type": "string", "description": "Write the PNG to a new .png file at this absolute or ~ path; an existing file is never overwritten."},
             },
             "anyOf": [{"required": ["app"]}, {"required": ["display"]}],
         },
@@ -4486,15 +4515,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                 save_path = args.get("save_path")
                 include_image = True
                 if save_path:
-                    resolved = os.path.abspath(os.path.expanduser(save_path))
-                    try:
-                        with open_private(resolved, "wb") as f:
-                            f.write(base64.b64decode(img_b64))
-                        meta["saved_path"] = resolved
-                        include_image = False
-                    except Exception as e:
-                        log.warning("display screenshot save failed (%s)", type(e).__name__)
-                        meta["save_error"] = f"{e}"
+                    include_image = not _save_png(save_path, img_b64, meta)
                 payload: list = []
                 if include_image:
                     payload.append(types.ImageContent(type="image", data=img_b64, mimeType="image/png"))
@@ -4682,15 +4703,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             include_image = not slim
             save_path = args.get("save_path")
             if save_path and not slim:
-                resolved = os.path.abspath(os.path.expanduser(save_path))
-                try:
-                    with open_private(resolved, "wb") as f:
-                        f.write(base64.b64decode(img_b64))
-                    meta["saved_path"] = resolved
-                    include_image = False
-                except Exception as e:
-                    log.warning("screenshot save failed (%s)", type(e).__name__)
-                    meta["save_error"] = f"{e}"
+                include_image = not _save_png(save_path, img_b64, meta)
 
             payload: list = []
             if include_image:
@@ -6813,15 +6826,7 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             }
             include_image = True
             if args.get("save_path"):
-                resolved = os.path.abspath(os.path.expanduser(args["save_path"]))
-                try:
-                    with open_private(resolved, "wb") as handle:
-                        handle.write(base64.b64decode(image))
-                    meta["saved_path"] = resolved
-                    include_image = False
-                except Exception as error:
-                    log.warning("zoom save failed (%s)", type(error).__name__)
-                    meta["save_error"] = f"{error}"
+                include_image = not _save_png(args["save_path"], image, meta)
             payload = [types.TextContent(type="text", text=json.dumps(meta))]
             if include_image:
                 payload.insert(0, types.ImageContent(type="image", data=image, mimeType="image/png"))

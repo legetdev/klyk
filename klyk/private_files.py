@@ -18,13 +18,20 @@ def private_directory(path: Path) -> None:
 
 
 def open_private(path, mode="a", *, encoding="utf-8"):
-    """Open a regular, single-link owned file; restrict access before writing."""
-    if mode not in ("a", "a+", "wb"):
+    """Open a regular, single-link owned file; restrict access before writing.
+
+    "wb" truncates and is only for Klyk's own files (reports, caches). "xb"
+    creates a new file only and is what agent-chosen paths use: an existing
+    file is never truncated, rewritten or re-permissioned (FileExistsError).
+    """
+    if mode not in ("a", "a+", "wb", "xb"):
         raise ValueError("Unsupported private file mode")
     flags = os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK
     flags |= os.O_RDWR if mode == "a+" else os.O_WRONLY
     if mode.startswith("a"):
         flags |= os.O_APPEND
+    if mode == "xb":
+        flags |= os.O_EXCL
     fd = os.open(path, flags, 0o600)
     try:
         info = os.fstat(fd)
@@ -33,7 +40,7 @@ def open_private(path, mode="a", *, encoding="utf-8"):
         os.fchmod(fd, 0o600)
         if mode == "wb":
             os.ftruncate(fd, 0)
-        stream = os.fdopen(fd, mode, encoding=None if "b" in mode else encoding)
+        stream = os.fdopen(fd, "wb" if mode == "xb" else mode, encoding=None if "b" in mode else encoding)
     except BaseException:
         os.close(fd)
         raise

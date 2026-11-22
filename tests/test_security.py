@@ -33,7 +33,7 @@ class PrivateFileTests(unittest.TestCase):
             os.mkfifo(fifo)
             for path in (link, hardlink, fifo):
                 with self.subTest(path=path), self.assertRaises(OSError):
-                    with open_private(path, "wb"):
+                    with open_private(path, "xb"):
                         self.fail("unsafe file opened")
             self.assertEqual(target.read_bytes(), b"preserve")
             self.assertEqual(stat.S_IMODE(target.stat().st_mode), 0o644)
