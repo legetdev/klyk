@@ -237,6 +237,38 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(timeouts[-1], 0.05, "the walk cap is restored after the patient read")
         self.assertLessEqual(max(timeouts), 1.0)
 
+    def test_busy_app_focused_summary_still_reports_the_focused_field(self):
+        """A verify readback on a busy editor must not come back empty after 50 ms."""
+        api = MagicMock()
+        api.AXUIElementCreateApplication.return_value = 111
+        timeouts = []
+        api.AXUIElementSetMessagingTimeout.side_effect = lambda element, seconds: timeouts.append(seconds)
+
+        def busy_read(element, attr):
+            """The app answers its root questions only to a patient caller."""
+            if element == 111:
+                patient = bool(timeouts) and timeouts[-1] >= 0.5
+                return {b"AXFocusedUIElement": 200, b"AXFocusedWindow": 300}.get(attr, 0) if patient else 0
+            return 0
+
+        attrs = {(200, b"AXRole"): "AXTextArea", (200, b"AXValue"): "Electron verified",
+                 (300, b"AXTitle"): "electron-fixture.txt"}
+        ns = {
+            "ctypes": ctypes,
+            "_appserv": api,
+            "_cf": MagicMock(),
+            "_AX_MESSAGING_TIMEOUT_SECONDS": 0.05,
+            "_AX_PATIENT_TIMEOUT_SECONDS": 1.0,
+            "_ax_read_attr_ptr": busy_read,
+            "_ax_str_attr": lambda element, attr: attrs.get((element, attr), ""),
+        }
+        load_functions("computer.py", {"ax_focused_summary"}, ns)
+        summary = ns["ax_focused_summary"](42)
+        self.assertEqual(summary["focused"]["role"], "AXTextArea")
+        self.assertEqual(summary["focused"]["value"], "Electron verified")
+        self.assertEqual(summary["window_title"], "electron-fixture.txt")
+        self.assertEqual(timeouts[-1], 0.05)
+
     def test_focused_window_requires_exact_identity_when_window_is_selected(self):
         """Equal geometry is insufficient when the requested AX window differs."""
         api = MagicMock()
