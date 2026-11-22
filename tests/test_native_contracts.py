@@ -190,6 +190,53 @@ class NativeContractTests(unittest.IsolatedAsyncioTestCase):
         ns["_ax_cgpoint"].assert_not_called()
         ns["_ax_cgsize"].assert_not_called()
 
+    def test_busy_app_window_lookup_waits_once_then_keeps_walks_fast(self):
+        """A browser that misses the 50 ms walk cap still resolves its exact window."""
+        api = MagicMock()
+        api.AXUIElementCreateApplication.return_value = 111
+        timeouts = []
+        api.AXUIElementSetMessagingTimeout.side_effect = lambda element, seconds: timeouts.append(seconds)
+
+        def identity(window, output):
+            output._obj.value = 77
+            return 0
+
+        api._AXUIElementGetWindow.side_effect = identity
+        cf = MagicMock()
+        cf.CFArrayGetCount.return_value = 1
+        cf.CFArrayGetValueAtIndex.return_value = 500
+        cf.CFRetain.return_value = 500
+
+        def busy_read(element, attr):
+            """Answer the window list only when the caller waits longer than the walk cap."""
+            return 300 if attr == b"AXWindows" and timeouts and timeouts[-1] >= 0.5 else 0
+
+        ns = {
+            "ctypes": ctypes,
+            "_appserv": api,
+            "_cf": cf,
+            "_AX_MESSAGING_TIMEOUT_SECONDS": 0.05,
+            "_AX_PATIENT_TIMEOUT_SECONDS": 1.0,
+            "_ax_read_attr_ptr": busy_read,
+            "time": time,
+            "_ax_cgpoint": MagicMock(return_value=(10.0, 20.0)),
+            "_ax_cgsize": MagicMock(return_value=(100.0, 200.0)),
+        }
+        native_builtins = dict(vars(builtins))
+        real_import = builtins.__import__
+        def fake_import(name, globals=None, locals=None, fromlist=(), level=0):
+            """Satisfy the unused relative capture import without loading native code."""
+            if level == 1:
+                return SimpleNamespace(capture=SimpleNamespace())
+            return real_import(name, globals, locals, fromlist, level)
+        native_builtins["__import__"] = fake_import
+        ns["__builtins__"] = native_builtins
+        load_functions("computer.py", {"_ax_window_for_cg_id"}, ns)
+        self.assertEqual(ns["_ax_window_for_cg_id"](42, 77, 10, 20, 100, 200), 500)
+        self.assertEqual(timeouts[0], 0.05)
+        self.assertEqual(timeouts[-1], 0.05, "the walk cap is restored after the patient read")
+        self.assertLessEqual(max(timeouts), 1.0)
+
     def test_focused_window_requires_exact_identity_when_window_is_selected(self):
         """Equal geometry is insufficient when the requested AX window differs."""
         api = MagicMock()
