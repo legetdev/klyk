@@ -97,7 +97,27 @@ class OpenDialogTests(unittest.IsolatedAsyncioTestCase):
         self.assertFalse(result["ok"])
         self.server.computer.press_key.assert_not_awaited()
         self.server.computer.ax_navigate_open_panel.assert_not_called()
-        self.server.computer.ax_press_panel_button.assert_called_once_with(42, ("Open", "Choose"), press=False)
+        calls = self.server.computer.ax_press_panel_button.call_args_list
+        self.assertTrue(calls)
+        self.assertTrue(all(call.args == (42, ("Open", "Choose")) and call.kwargs == {"press": False} for call in calls))
+
+    async def test_panel_still_appearing_is_awaited_without_input(self):
+        """An agent may ask right after the menu click; the sheet appears a moment later."""
+        sheet = [{"role": "AXSheet", "label": "Open"}, {"role": "AXButton", "label": "Open"}]
+        self.server.computer.ax_snapshot.side_effect = [[], [], sheet, sheet]
+        result = await self.open()
+        self.assertTrue(result["ok"], result)
+        self.server.computer.press_key.assert_awaited_once_with("Cmd+Shift+G", expected_frontmost_pid=42)
+
+    async def test_sheet_whose_buttons_are_still_building_is_awaited_without_input(self):
+        """A sheet can exist before its Open button does (the recorded hosted-VM refusal)."""
+        self.server.computer.ax_snapshot.return_value = [{"role": "AXSheet", "label": "open"}]
+        answers = iter([None, None, "Open", "Open"])
+        self.server.computer.ax_press_panel_button.side_effect = lambda *args, **kwargs: next(answers)
+        result = await self.open()
+        self.assertTrue(result["ok"], result)
+        calls = self.server.computer.ax_press_panel_button.call_args_list
+        self.assertEqual([call.kwargs for call in calls], [{"press": False}] * 3 + [{}])
 
     async def test_button_beyond_the_bounded_overview_is_confirmed_without_pressing(self):
         """A large file panel can hide its buttons from the overview; the targeted search finds them."""

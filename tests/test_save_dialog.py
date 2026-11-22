@@ -1,5 +1,7 @@
 """Verify save results distinguish existing files from observed updates."""
 
+import asyncio
+import itertools
 import tempfile
 from pathlib import Path
 from types import SimpleNamespace
@@ -88,7 +90,13 @@ class SaveDialogTests(unittest.IsolatedAsyncioTestCase):
     async def test_multiple_panels_refuse_before_filename_or_button_actions(self):
         """Two simultaneous documents must not make the save target an implicit first match."""
         self.server.computer.ax_snapshot.return_value = [{"role": "AXSheet"}, {"role": "AXDialog"}]
+        # The passive wait for a settling dialog runs on this module's clock only.
+        ticks = itertools.count()
+        self.server.time = SimpleNamespace(monotonic=lambda: next(ticks) * 0.05)
+        self.server.asyncio = SimpleNamespace(
+            current_task=asyncio.current_task, get_event_loop=asyncio.get_event_loop, sleep=AsyncMock())
         result = await self.save("/tmp/fixture-output.txt")
+        self.assertGreater(self.server.computer.ax_snapshot.call_count, 1)
         self.assertFalse(result["ok"])
         self.server.computer.ax_focus_save_field.assert_not_called()
         self.server.computer.ax_set_save_filename.assert_not_called()
