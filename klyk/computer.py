@@ -4023,7 +4023,81 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
             _clipboard_snapshot = _clipboard_change_count = _clipboard_scope = None
 
 
-async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None) -> None:
+# Browser and Electron renderers apply keys asynchronously. When keys arrive
+# faster than a busy renderer handles them, editors that sync a hidden text area
+# after each change (VS Code, many rich editors) reorder or lose characters
+# (observed: "Electron vfied 🧭eri" for "Electron verified 🧭"). Typing into
+# a readable field therefore waits until each character shows up before the
+# next one is sent, which also means typing returns only once the text landed.
+_FIELD_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"})
+_kAXValueCFRangeType = 4
+_TYPING_FIRST_CONFIRM_SECONDS = 0.4  # A field that never reflects typing stops being watched quickly.
+_TYPING_CONFIRM_SECONDS = 1.5  # Once it has shown one, a busy renderer gets this long per character.
+
+
+def _focused_field_state(pid: int) -> str | None:
+    """The focused text field's value and caret, or None when no readable field has focus.
+
+    The caret counts too: typing into an inline autocompletion (a browser's
+    address bar) moves the caret while the shown value stays the same.
+    """
+    app_ptr = _appserv.AXUIElementCreateApplication(int(pid))
+    if not app_ptr:
+        return None
+    try:
+        try:
+            _appserv.AXUIElementSetMessagingTimeout(ctypes.c_void_p(app_ptr), 0.5)
+        except Exception:
+            pass
+        focused = _ax_read_attr_ptr(app_ptr, b"AXFocusedUIElement")
+        if not focused:
+            return None
+        try:
+            if _ax_str_attr(focused, b"AXRole") not in _FIELD_TEXT_ROLES:
+                return None
+            if _ax_str_attr(focused, b"AXSubrole") == "AXSecureTextField":
+                return None
+            value = _ax_str_attr(focused, b"AXValue")
+            caret = ""
+            span_ptr = _ax_read_attr_ptr(focused, b"AXSelectedTextRange")
+            if span_ptr:
+                try:
+                    span = CFRange(0, 0)
+                    if _appserv.AXValueGetValue(ctypes.c_void_p(span_ptr), _kAXValueCFRangeType, ctypes.byref(span)):
+                        caret = f"{span.location},{span.length}"
+                finally:
+                    _cf.CFRelease(ctypes.c_void_p(span_ptr))
+            return f"{value}\0{caret}"
+        except ValueError:
+            return None
+        finally:
+            _cf.CFRelease(ctypes.c_void_p(focused))
+    finally:
+        _cf.CFRelease(ctypes.c_void_p(app_ptr))
+
+
+async def _read_field_state(pid: int) -> str | None:
+    """Read the focused field off the event loop; unknown is None."""
+    try:
+        return await asyncio.get_running_loop().run_in_executor(None, lambda: _focused_field_state(pid))
+    except Exception:
+        return None
+
+
+async def _await_field_change(pid: int, before: str, timeout: float) -> str | None:
+    """Wait until the focused field's value or caret differs from before; None if it never did. Sends nothing."""
+    deadline = time.monotonic() + timeout
+    while True:
+        now = await _read_field_state(pid)
+        if now is not None and now != before:
+            return now
+        if time.monotonic() >= deadline:
+            return None
+        await asyncio.sleep(0.01)
+
+
+async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_frontmost_pid: int | None = None,
+                                 confirm_pid: int | None = None) -> bool:
     """
     Per-character keydown/keyup sequence. Used by type_text(mode='keys')
     for keypress-driven contexts (web games, canvas editors).
@@ -4037,13 +4111,22 @@ async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_
     of "HÜGEL" both vanished. The 60 ms pre-settle absorbs that window
     so the first char lands reliably. Subsequent chars use the existing
     15 ms inter-char delay.
+
+    With confirm_pid, a readable focused text field in that process is
+    watched: each character is sent only after the previous one changed the
+    field, so a busy renderer can never fall behind. A field that does not
+    change within the bound stops being watched and typing continues at the
+    plain pace; no character is ever sent twice. Returns True only when every
+    character was seen landing.
     """
     _check_stop()
     async with _input_lock:
-        post = (lambda ev: _post_to_pid(pid, ev)) if pid else _post
         # Pre-settle so the first key doesn't fall into a post-activation
         # renderer dead-zone. Cost: 60 ms once per call, regardless of length.
         await asyncio.sleep(0.060)
+        watched = await _read_field_state(confirm_pid) if confirm_pid is not None else None
+        confirmed = watched is not None and bool(text)
+        first = True
         for char in text:
             _check_frontmost(expected_frontmost_pid)
             keycode, flags = char_to_keycode(char)
@@ -4060,7 +4143,13 @@ async def type_text_char_by_char(text: str, pid: int | None = None, *, expected_
                     time.sleep(0.005)
                 finally:
                     _finish_input(token)
+            if watched is not None:
+                watched = await _await_field_change(
+                    confirm_pid, watched, _TYPING_FIRST_CONFIRM_SECONDS if first else _TYPING_CONFIRM_SECONDS)
+                confirmed = confirmed and watched is not None
+            first = False
             await asyncio.sleep(0.015)
+        return confirmed
 
 
 # ---------------------------------------------------------------------------

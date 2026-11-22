@@ -5327,9 +5327,12 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
             if gate is not None:
                 return [types.TextContent(type="text", text=json.dumps(gate))]
             if mode == "keys":
-                frontmost_pid = session.pid if _is_chromium_based(session) or session.mode == "humanoid" else None
+                chromium = _is_chromium_based(session)
+                frontmost_pid = session.pid if chromium or session.mode == "humanoid" else None
+                # Renderers apply keys asynchronously; pace each key to the field so none reorder or drop.
                 await computer.type_text_char_by_char(args["text"], session.pid,
-                                                     expected_frontmost_pid=frontmost_pid)
+                                                     expected_frontmost_pid=frontmost_pid,
+                                                     confirm_pid=session.pid if chromium else None)
             else:
                 await computer.type_text(args["text"], session.pid, expected_frontmost_pid=session.pid)
             return [types.TextContent(
