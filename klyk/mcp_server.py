@@ -6248,30 +6248,39 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
                     ),
                 }))]
 
-            observed = await asyncio.get_event_loop().run_in_executor(
-                None, lambda: computer.ax_snapshot(session.pid, max_results=400),
-            )
-            panels = [e for e in observed if e.get("role") in ("AXSheet", "AXDialog")]
-            if len(panels) != 1:
-                return [types.TextContent(type="text", text=json.dumps({
-                    "ok": False, "action": action, "saved": False,
-                    "error": "Expected one accessible dialog; nothing was typed. Inspect and resolve missing or multiple dialogs first.",
-                }))]
-            if action in ("open", "cancel"):
-                if action == "open" and not any(
+            # A dialog requested a moment ago may still be appearing, and a sheet can
+            # exist before its buttons do. Observe passively for up to 1.5 s,
+            # sending nothing, before refusing.
+            appear_deadline = time.monotonic() + 1.5
+            while True:
+                observed = await asyncio.get_event_loop().run_in_executor(
+                    None, lambda: computer.ax_snapshot(session.pid, max_results=400),
+                )
+                panels = [e for e in observed if e.get("role") in ("AXSheet", "AXDialog")]
+                button_found = True
+                if len(panels) == 1 and action == "open" and not any(
                     e.get("role") == "AXButton" and _normalize_label(e.get("label", "")) in ("open", "choose")
                     for e in observed
                 ):
                     # A file panel's tree is large; the bounded overview above can stop
                     # before its bottom buttons. Use the panel's own targeted button
                     # search (the one that will press it), sending nothing yet.
-                    found = await asyncio.get_event_loop().run_in_executor(
-                        None, lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose"), press=False))
-                    if not found:
-                        return [types.TextContent(type="text", text=json.dumps({
-                            "ok": False, "action": action,
-                            "error": "An Open or Choose button was not found; no input was sent.",
-                        }))]
+                    button_found = bool(await asyncio.get_event_loop().run_in_executor(
+                        None, lambda: computer.ax_press_panel_button(session.pid, ("Open", "Choose"), press=False)))
+                if (len(panels) == 1 and button_found) or time.monotonic() >= appear_deadline:
+                    break
+                await asyncio.sleep(0.1)
+            if len(panels) != 1:
+                return [types.TextContent(type="text", text=json.dumps({
+                    "ok": False, "action": action, "saved": False,
+                    "error": "Expected one accessible dialog; nothing was typed. Inspect and resolve missing or multiple dialogs first.",
+                }))]
+            if action in ("open", "cancel"):
+                if not button_found:
+                    return [types.TextContent(type="text", text=json.dumps({
+                        "ok": False, "action": action,
+                        "error": "An Open or Choose button was not found; no input was sent.",
+                    }))]
             if action == "cancel":
                 pressed = await computer.run_input(lambda: computer.ax_press_panel_button(session.pid, ("Cancel",)))
                 return [types.TextContent(type="text", text=json.dumps({
