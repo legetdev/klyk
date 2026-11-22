@@ -172,6 +172,7 @@ class FieldStateTests(unittest.IsolatedAsyncioTestCase):
             "_ax_str_attr": lambda element, attr: attributes.get(attr, ""),
             "_FIELD_TEXT_ROLES": frozenset({"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"}),
             "_kAXValueCFRangeType": 4,
+            "_FIELD_VALUE_READ_LIMIT": 2000,
             "CFRange": CFRange,
         }
         load_functions("computer.py", {"_focused_field_state"}, ns)
@@ -179,8 +180,24 @@ class FieldStateTests(unittest.IsolatedAsyncioTestCase):
 
     def test_field_state_includes_value_and_caret(self):
         ns = self._state_namespace({b"AXFocusedUIElement": 1, b"AXSelectedTextRange": 1,
-                                    b"AXRole": "AXTextField", b"AXValue": "abc"})
-        self.assertEqual(ns["_focused_field_state"](42), "abc\x003,0")
+                                    b"AXRole": "AXTextField", b"AXValue": "abc", b"AXNumberOfCharacters": "3"})
+        self.assertEqual(ns["_focused_field_state"](42), "3\x003,0\x00abc")
+
+    def test_long_field_is_paced_without_copying_its_value_on_every_key(self):
+        """A 50,000-character editor is tracked by length and caret, never by copying its text."""
+        attributes = {b"AXFocusedUIElement": 1, b"AXSelectedTextRange": 1, b"AXRole": "AXTextArea",
+                      b"AXValue": "x" * 50_000, b"AXNumberOfCharacters": "50000"}
+        ns = self._state_namespace(attributes)
+        requested = []
+        reader = ns["_ax_str_attr"]
+        ns["_ax_str_attr"] = lambda element, attr: requested.append(attr) or reader(element, attr)
+        self.assertEqual(ns["_focused_field_state"](42), "50000\x003,0\x00")
+        self.assertNotIn(b"AXValue", requested)
+
+    def test_field_without_a_readable_length_falls_back_to_its_value(self):
+        ns = self._state_namespace({b"AXFocusedUIElement": 1, b"AXSelectedTextRange": 1,
+                                    b"AXRole": "AXTextArea", b"AXValue": "abc"})
+        self.assertEqual(ns["_focused_field_state"](42), "\x003,0\x00abc")
 
     def test_secure_and_non_text_focus_is_never_read(self):
         for attributes in ({b"AXFocusedUIElement": 1, b"AXRole": "AXTextField", b"AXSubrole": "AXSecureTextField",

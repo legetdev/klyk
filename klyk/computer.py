@@ -4068,6 +4068,7 @@ async def type_text(text: str, pid: int | None = None, *, expected_frontmost_pid
 # next one is sent, and typing reports whether every character was seen landing.
 _FIELD_TEXT_ROLES = frozenset({"AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"})
 _kAXValueCFRangeType = 4
+_FIELD_VALUE_READ_LIMIT = 2000  # Characters; longer fields are paced by length and caret alone.
 # A busy renderer can take half a second to show the first key; a field that never
 # reflects typing (a terminal's hidden input) costs this wait once per call.
 _TYPING_FIRST_CONFIRM_SECONDS = 1.0
@@ -4075,10 +4076,11 @@ _TYPING_CONFIRM_SECONDS = 1.5  # Once it has shown one, a busy renderer gets thi
 
 
 def _focused_field_state(pid: int) -> str | None:
-    """The focused text field's value and caret, or None when no readable field has focus.
+    """The focused text field's length, caret and (when short) value, or None when no readable field has focus.
 
     The caret counts too: typing into an inline autocompletion (a browser's
-    address bar) moves the caret while the shown value stays the same.
+    address bar) moves the caret while the shown value stays the same. A long
+    field's value is not copied on every key; its length and caret change anyway.
     """
     app_ptr = _appserv.AXUIElementCreateApplication(int(pid))
     if not app_ptr:
@@ -4096,7 +4098,9 @@ def _focused_field_state(pid: int) -> str | None:
                 return None
             if _ax_str_attr(focused, b"AXSubrole") == "AXSecureTextField":
                 return None
-            value = _ax_str_attr(focused, b"AXValue")
+            length = _ax_str_attr(focused, b"AXNumberOfCharacters")
+            short = not length.isdigit() or int(length) <= _FIELD_VALUE_READ_LIMIT
+            value = _ax_str_attr(focused, b"AXValue") if short else ""
             caret = ""
             span_ptr = _ax_read_attr_ptr(focused, b"AXSelectedTextRange")
             if span_ptr:
@@ -4106,7 +4110,7 @@ def _focused_field_state(pid: int) -> str | None:
                         caret = f"{span.location},{span.length}"
                 finally:
                     _cf.CFRelease(ctypes.c_void_p(span_ptr))
-            return f"{value}\0{caret}"
+            return f"{length}\0{caret}\0{value}"
         except ValueError:
             return None
         finally:
