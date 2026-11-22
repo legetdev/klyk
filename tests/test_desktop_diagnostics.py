@@ -8,11 +8,40 @@ import tempfile
 import unittest
 from unittest.mock import Mock, patch
 
-from desktop_smoke import electron_editor_ready, electron_fixture_diagnostic
+import json
+
+from desktop_smoke import (MOCK_KEYCHAIN, electron_editor_ready, electron_fixture_diagnostic,
+                           frontmost_label, write_electron_fixture_settings)
 
 
 class DesktopDiagnosticTests(unittest.TestCase):
     """Prevent cold editor focus, unbounded reads, or diagnostic errors from concealing failure."""
+
+    def test_disposable_profile_suppresses_first_launch_prompts(self):
+        """Only the temporary profile is configured, before the editor's first start."""
+        with tempfile.TemporaryDirectory() as directory:
+            path=write_electron_fixture_settings(Path(directory)/'vscode-profile')
+            self.assertEqual(path,Path(directory)/'vscode-profile'/'User'/'settings.json')
+            settings=json.loads(path.read_text())
+        self.assertEqual(settings['editor.accessibilitySupport'],'on')
+        self.assertIs(settings['git.enabled'],False)
+        self.assertEqual(settings['workbench.startupEditor'],'none')
+        self.assertEqual(settings['telemetry.telemetryLevel'],'off')
+        self.assertEqual(settings['update.mode'],'none')
+
+    def test_both_browser_hosts_launch_without_keychain_prompts(self):
+        """Chrome and VS Code fixture launches both carry the mock keychain switch."""
+        source=Path(__file__).with_name('desktop_smoke.py').read_text()
+        self.assertEqual(MOCK_KEYCHAIN,'--use-mock-keychain')
+        self.assertIn("'--no-default-browser-check',MOCK_KEYCHAIN",source)
+        self.assertIn("str(work/'vscode-profile'),MOCK_KEYCHAIN",source)
+        self.assertLess(source.index("write_electron_fixture_settings(work/'vscode-profile')"),
+                        source.index("editor=subprocess.Popen("))
+
+    def test_failure_evidence_names_the_frontmost_app_without_raising(self):
+        self.assertEqual(frontmost_label(SimpleNamespace(_frontmost_app_label=lambda:'Code (com.microsoft.VSCode)')),
+                         'Code (com.microsoft.VSCode)')
+        self.assertEqual(frontmost_label(object()),'unreadable (AttributeError)')
 
     def test_only_owned_focused_text_with_exact_baseline_is_ready(self):
         """A filename or chat field cannot qualify the disposable document for replacement."""

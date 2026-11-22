@@ -26,9 +26,51 @@ def electron_editor_ready(computer, pid, expected):
     return focus.get('role') in ('AXTextArea','AXTextField') and focus.get('value')==expected
 
 
+# Settings for the disposable VS Code profile only. A first launch otherwise
+# shows welcome, telemetry, tips, recommendation, update and screen-reader prompts,
+# and the built-in Git support runs git; any of them can take focus while keys
+# are typed. Screen-reader mode is set explicitly because the checks read the
+# editor's text through accessibility.
+ELECTRON_FIXTURE_SETTINGS={
+    'editor.accessibilitySupport':'on',
+    'workbench.startupEditor':'none',
+    'workbench.tips.enabled':False,
+    'workbench.welcomePage.walkthroughs.openOnInstall':False,
+    'telemetry.telemetryLevel':'off',
+    'update.mode':'none',
+    'update.showReleaseNotes':False,
+    'extensions.autoCheckUpdates':False,
+    'extensions.ignoreRecommendations':True,
+    'git.enabled':False,
+    'security.workspace.trust.enabled':False,
+    'chat.disableAIFeatures':True,
+    'window.restoreWindows':'none',
+}
+# Chromium's test switch keeps Chrome and VS Code from asking for keychain access
+# to their safe-storage key on a fresh profile (a system prompt that takes focus).
+MOCK_KEYCHAIN='--use-mock-keychain'
+
+
+def write_electron_fixture_settings(profile):
+    """Write the disposable profile's settings before the editor first starts."""
+    settings=Path(profile)/'User'/'settings.json'
+    settings.parent.mkdir(parents=True,exist_ok=True)
+    settings.write_text(json.dumps(ELECTRON_FIXTURE_SETTINGS,indent=2))
+    return settings
+
+
+def frontmost_label(computer):
+    """Name the app in front for failure evidence; never raises."""
+    try:
+        return computer._frontmost_app_label()
+    except Exception as error:
+        return f'unreadable ({type(error).__name__})'
+
+
 def electron_fixture_diagnostic(computer, pid, document):
     """Keep bounded read-only focus and file evidence from this disposable editor only."""
-    result={'scope':'owned disposable Electron fixture and generated document only'}
+    result={'scope':'owned disposable Electron fixture and generated document only',
+            'frontmost_app':frontmost_label(computer)}
     try:
         with document.open('rb') as stream:
             data=stream.read(8193)
@@ -127,7 +169,7 @@ def main():
             if existing.returncode not in (0,1):raise RuntimeError('Chrome process isolation could not be checked')
             if existing.stdout.strip():raise RuntimeError('An existing Chrome process prevents isolated app-name targeting')
             chrome=subprocess.Popen([str(chrome_executable),'--user-data-dir='+chrome_profile.name,
-                                     '--no-first-run','--no-default-browser-check','--force-renderer-accessibility','--new-window',
+                                     '--no-first-run','--no-default-browser-check',MOCK_KEYCHAIN,'--force-renderer-accessibility','--new-window',
                                      '--window-position=50,50','--window-size=900,650',url],
                                     stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['browser_pid']=chrome.pid
@@ -163,7 +205,8 @@ def main():
             existing=subprocess.run(['pgrep','-f','^'+re.escape(str(executable))+'( |$)'],capture_output=True,text=True)
             if existing.returncode not in (0,1):raise RuntimeError('VS Code process isolation could not be checked')
             if existing.stdout.strip():raise RuntimeError('An existing VS Code process prevents isolated app-name targeting')
-            editor=subprocess.Popen([str(executable),'--user-data-dir',str(work/'vscode-profile'),'--extensions-dir',str(work/'vscode-extensions'),'--disable-extensions','--disable-workspace-trust','--force-renderer-accessibility','--skip-welcome','--skip-release-notes','--new-window',str(document)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
+            write_electron_fixture_settings(work/'vscode-profile')
+            editor=subprocess.Popen([str(executable),'--user-data-dir',str(work/'vscode-profile'),MOCK_KEYCHAIN,'--extensions-dir',str(work/'vscode-extensions'),'--disable-extensions','--disable-workspace-trust','--force-renderer-accessibility','--skip-welcome','--skip-release-notes','--new-window',str(document)],stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL)
             report['editor_pid']=editor.pid
             ready=capture.wait_for_window(editor.pid,timeout=20)
             check('isolated Electron window exists',lambda:ready is not None)
@@ -186,6 +229,7 @@ def main():
             report['completed']=True
     except BaseException as exc:
         report['error']=f'{type(exc).__name__}: {exc}'
+        report['frontmost_app_at_failure']=frontmost_label(computer)
         if editor is not None and editor.poll() is None and document is not None:
             report['electron_failure_diagnostic']=electron_fixture_diagnostic(computer,editor.pid,document)
         raise
