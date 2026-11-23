@@ -3773,21 +3773,8 @@ _OWNERSHIP_EXEMPT = frozenset({
 })
 
 
-def _refresh_menubar() -> None:
-    """Nudge the menu-bar header to re-read ownership after it changed for
-    this session (blocked → inactive, or take_control → active). No-op if the
-    menu isn't installed (non-macOS / not yet built). Never raises — display
-    must not break tool dispatch."""
-    try:
-        from .menubar import menubar as _menubar
-        _menubar.request_refresh()
-    except Exception:
-        pass
-
-
 def _control_blocked_response() -> list:
     """Retain the public ownership-refusal marker without attempting any input."""
-    _refresh_menubar()
     return [types.TextContent(type="text", text=json.dumps({
         "ok": False,
         "blocked": "not_active_session",
@@ -4370,7 +4357,7 @@ def _note_activity(name, arguments) -> None:
     try:
         app = arguments.get("app") if isinstance(arguments, dict) else None
         presence.record(connection_gate.policy.current_client(), app if isinstance(app, str) else None,
-                        name if isinstance(name, str) else None)
+                        name if isinstance(name, str) else None, activity.recorder.latest(8))
     except Exception:
         pass
 
@@ -4388,7 +4375,9 @@ async def call_tool(
             # handler makes internally are handler-to-handler and skip it.
             step_token = _run_step_context.set(False)
             try:
-                return await _execute_public(name, arguments)
+                result = await _execute_public(name, arguments)
+                _note_activity(name, arguments)  # A long run stays visible step by step.
+                return result
             finally:
                 _run_step_context.reset(step_token)
         return await _execute_tool(name, arguments)
@@ -4454,7 +4443,6 @@ async def _execute_tool(name: str, arguments: dict | None) -> list:
         # --- take_control ---
         if name == "take_control":
             prev = ownership.claim_ownership()
-            _refresh_menubar()  # this session is now the active driver
             msg = "This session now controls klyk."
             if prev:
                 msg += (
@@ -7568,7 +7556,7 @@ def _install_parent_death_watch() -> None:
     as EOF and shuts down cleanly. This is the backstop for a client that's
     hard-killed (crash, Force Quit) where the EOF never arrives or the
     stdin reader is wedged. klyk would otherwise linger as an orphan — a
-    stray process still showing a menu-bar item and a stale ownership
+    stray process still shown as connected and a stale ownership
     record. (It can't block a new session: control is latest-wins, so the
     next session just claims it.) We poll the parent pid; when it changes
     (on orphaning, the OS reparents us to launchd), the client is gone, so
@@ -7628,12 +7616,27 @@ def _finish_native_initialization() -> None:
     connection_gate.checkpoint()
     _native_initialized = True
     try:
-        from .menubar import menubar
-        menubar.install_if_needed()
+        _watch_emergency_stop()
         from . import updates
-        updates.start_background_check(on_checked=_refresh_menubar)
+        updates.start_background_check()
     except Exception as error:
         log.warning("optional status setup failed (%s)", type(error).__name__)
+
+
+def _watch_emergency_stop() -> None:
+    """Publish the emergency stop for the controls without work in the event-tap callback."""
+    import threading
+
+    def watch():
+        """Write only when the state flips; the read itself is one in-memory check."""
+        while True:
+            try:
+                presence.stopped(computer.emergency_stop_active())
+            except Exception:
+                pass
+            time.sleep(0.25)
+
+    threading.Thread(target=watch, name="klyk-stop-status", daemon=True).start()
 
 
 async def _ensure_native_runtime() -> None:
@@ -7686,7 +7689,6 @@ def _on_access_revoked() -> bool:
         except Exception as error:
             log.warning("session logs not suspended (%s)", type(error).__name__)
             session.log_buffer.clear()
-    _refresh_menubar()
     return released
 
 
@@ -7757,7 +7759,7 @@ def _run_on_macos() -> None:
     #     that restores the clipboard and leaves no zombie behind.
     _install_signal_handlers()
     # 1b. Parent-death watch — if the client is hard-killed, exit so we
-    #     don't linger as a stray process / stale menu-bar item.
+    #     don't linger as a stray process / stale connection.
     _install_parent_death_watch()
     # 3. asyncio worker thread runs the MCP stdio server.
     def _worker() -> None:
@@ -7787,7 +7789,7 @@ def _run_on_macos() -> None:
     # teardown hung, or we unblocked NSApp via a signal while the worker
     # still blocked on stdin). A non-daemon thread would keep the
     # interpreter alive indefinitely, leaving a zombie process (and its
-    # menu-bar item) lingering. So guarantee exit: run the one
+    # connection status) lingering. So guarantee exit: run the one
     # exit-critical input and clipboard cleanup explicitly, then
     # hard-exit. The common path never reaches this — the worker has
     # already finished by the time NSApp.run returns.
@@ -7806,8 +7808,8 @@ def _start_access_controls() -> None:
     def launch():
         """Launch only the user controls; this path never requests computer access."""
         try:
-            from .controls import start_background
-            if not start_background():
+            from .controls import start_for_connection
+            if not start_for_connection():
                 log.warning("Klyk controls could not start; run klyk controls to try again.")
         except Exception as error:
             log.warning("Klyk controls startup failed (%s)", type(error).__name__)
@@ -7823,11 +7825,12 @@ def _main_entry() -> None:
     Shared controls revoke work without reconnecting this stdio process.
     """
     if sys.platform == "darwin":
-        _start_access_controls()
+        # Announce first, so a controller leaving an idle menu bar cannot miss this server.
         try:
             presence.connected(connection_gate.policy.current_client())
         except Exception:
             pass  # Live status is display-only; it never gates the protocol.
+        _start_access_controls()
         _run_on_macos()
     else:
         # Non-darwin builds are not officially supported (klyk is macOS

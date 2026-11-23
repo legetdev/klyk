@@ -3,10 +3,11 @@
 Each server process owns one tiny owner-only file, ``~/.klyk/presence/<pid>.json``::
 
     {"pid": 4242, "client": "claude", "version": "0.7.0", "started_at": 1767225600.0,
-     "last_action_at": 1767225612.5, "last_app": "Safari", "last_tool": "click"}
+     "last_action_at": 1767225612.5, "last_app": "Safari", "last_tool": "click",
+     "recent": [[1767225612.5, "Safari", "click", "autonomous"]], "stopped": false}
 
 It holds no screen content, no arguments and no results: only which environment is
-connected and which app it last worked in. Readers drop files of dead processes.
+connected, the app, tool and mode of its last few actions, and the emergency-stop state. Readers drop files of dead processes.
 
 How the MCP server calls it (klyk/mcp_server.py); every function is cheap and never raises:
 
@@ -15,6 +16,7 @@ How the MCP server calls it (klyk/mcp_server.py); every function is cheap and ne
 * ``presence.record(client, app, tool)`` after each tool request this environment was
   allowed to run, with the target app's display name (or ``None``) and the tool name.
   Identical calls rewrite the file at most every 0.5 s; a new app or tool writes at once.
+* ``presence.stopped(value)`` when the emergency stop turns on or off.
 * ``presence.clear()`` on every exit path that skips ``atexit``: put it first in
   ``_cleanup_input_on_exit()``, before its early return, which covers the SIGTERM/SIGINT
   handler, the parent-death watch and the forced shutdown (all end in ``os._exit``).
@@ -29,6 +31,7 @@ from __future__ import annotations
 
 import atexit
 import json
+import math
 import os
 import re
 import secrets
@@ -40,7 +43,8 @@ from pathlib import Path
 from . import __version__, connection_policy as policy
 from .private_files import private_directory
 
-_MAX_BYTES = 2048
+_MAX_BYTES = 8192
+_MAX_RECENT = 8
 _MAX_FILES = 64
 _MAX_ENTRIES = 256
 _MIN_INTERVAL = 0.5
@@ -79,7 +83,8 @@ def connected(client: str | None) -> None:
         private_directory(directory().parent)
         with _lock:
             _state = {"pid": os.getpid(), "client": _client(client), "version": __version__,
-                      "started_at": time.time(), "last_action_at": None, "last_app": None, "last_tool": None}
+                      "started_at": time.time(), "last_action_at": None, "last_app": None, "last_tool": None,
+                      "recent": [], "stopped": False}
             _written = (None, None, float("-inf"))
             if not _registered:
                 atexit.register(clear)
@@ -89,7 +94,33 @@ def connected(client: str | None) -> None:
         pass  # Presence is a display aid; it can never affect a request.
 
 
-def record(client: str | None, app: str | None, tool: str | None) -> None:
+def stopped(value: bool) -> None:
+    """Publish an emergency-stop change at once; never raises."""
+    try:
+        with _lock:
+            state = _state
+            if state is None or state["pid"] != os.getpid() or state["stopped"] == value:
+                return
+            state["stopped"] = bool(value)
+            try:
+                _write_locked(state, time.monotonic())
+            except Exception:
+                state["stopped"] = not value  # The watcher retries an unpublished change.
+    except Exception:
+        pass
+
+
+def _recent(actions) -> list[list]:
+    """Keep only display names and times of the newest actions."""
+    result = []
+    for action in list(actions)[-_MAX_RECENT:]:
+        app, tool = _text(action["app"], 80), _text(action["tool"], 64)
+        if app and tool:
+            result.append([action["ts"], app, tool, _text(action.get("mode"), 16)])
+    return result
+
+
+def record(client: str | None, app: str | None, tool: str | None, recent=None) -> None:
     """Note one allowed request, rewriting at most every 0.5 s unless the app or tool changed."""
     try:
         now = time.monotonic()
@@ -100,6 +131,8 @@ def record(client: str | None, app: str | None, tool: str | None) -> None:
                 return  # Not announced, cleared at exit, or a forked child.
             state.update(client=_client(client) or state["client"], last_action_at=time.time(),
                          last_app=app, last_tool=tool)
+            if recent is not None:
+                state["recent"] = _recent(recent)
             last_app, last_tool, last_time = _written
             if (app, tool) == (last_app, last_tool) and now - last_time < _MIN_INTERVAL:
                 return
@@ -126,7 +159,7 @@ def _write_locked(state: dict, now: float) -> None:
         _ensure_directory(folder)
     except FileNotFoundError:
         return  # Uninstall removed Klyk's state; never recreate it from a lingering server.
-    data = json.dumps(state, separators=(",", ":")).encode("utf-8")
+    data = json.dumps(state, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     temporary = folder / f".{state['pid']}.{secrets.token_hex(4)}.tmp"
     target = folder / f"{state['pid']}.json"
     fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600)
@@ -208,7 +241,7 @@ def _load(path: Path, pid: int) -> dict | None:
         return None
     finally:
         os.close(fd)
-    if (not isinstance(data, dict) or set(data) != _KEYS or data["pid"] != pid
+    if (not isinstance(data, dict) or not _KEYS <= set(data) or data["pid"] != pid
             or type(data["pid"]) is not int
             or not (data["client"] is None or _client(data["client"]))
             or not isinstance(data["started_at"], (int, float))
@@ -216,6 +249,14 @@ def _load(path: Path, pid: int) -> dict | None:
             or not all(data[key] is None or isinstance(data[key], str)
                        for key in ("version", "last_app", "last_tool"))):
         return None
+    # Optional fields come and go between versions; a bad one is dropped, not the connection.
+    data["stopped"] = data.get("stopped") is True
+    recent = data.get("recent")
+    data["recent"] = [action for action in (recent if isinstance(recent, list) else [])[:_MAX_RECENT]
+                      if isinstance(action, list) and len(action) == 4
+                      and type(action[0]) in (int, float) and math.isfinite(action[0])
+                      and all(isinstance(value, str) for value in action[1:3])
+                      and (action[3] is None or isinstance(action[3], str))]
     return data
 
 
@@ -249,13 +290,14 @@ def entries() -> list[dict]:
     return found
 
 
-def summary(now: float | None = None, active_window: float = 5.0) -> dict[str, dict]:
+def summary(now: float | None = None, active_window: float = 5.0,
+            found: list[dict] | None = None) -> dict[str, dict]:
     """Per environment: connected, active within the window, and the app it is working in."""
     now = time.time() if now is None else now
     result = {key: {"connected": False, "active": False, "app": None} for key in policy.CLIENT_KEYS}
     latest: dict[str, float] = {}
     try:
-        for data in entries():
+        for data in entries() if found is None else found:
             key = data["client"]
             if key not in result:
                 continue

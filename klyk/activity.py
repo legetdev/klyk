@@ -2,18 +2,17 @@
 Activity recorder — single source of truth for what klyk is doing right now.
 
 MCP tool dispatchers call record() before each user-visible action; the
-menu-bar status item reads this state to display activity to the user.
+the menu-bar controls receive a summary of it to display activity to the user.
 Decoupled from the UI surfaces: when nobody is watching, record() is a
-sub-microsecond append into a bounded deque; when the menubar dropdown
-is open, it reads from this state via get_summary() / get_recent()
-without coupling to any call site.
+sub-microsecond append into a bounded deque; presence.py publishes its
+latest() actions without coupling to any call site.
 
 Design considerations:
 - 4. Token / payload bloat: this module returns nothing to the agent —
   it feeds local UI surfaces only. No risk of bloating tool responses.
 - 9. Hidden state across calls: the recorder IS hidden state. Capped
   bounded (200 entries/app, 64 apps), evicted FIFO, and surfaced through
-  the menu-bar dropdown so the user sees what's accumulating.
+  the menu-bar panel so the user sees what's accumulating.
 - 5. Failure coupling: record() catches every exception internally.
   UI surfaces are observers; an observer that raises does not affect
   other observers or the calling tool.
@@ -174,6 +173,16 @@ class ActivityRecorder:
                 return []
             return list(dq)[-n:]
 
+    def latest(self, n: int) -> list[dict]:
+        """Newest actions across all apps, oldest first; a run is shown by its steps."""
+        with self._lock:
+            found = [{"ts": entry["ts"], "app": app, "tool": entry["tool"],
+                      "mode": self._session_state.get(app, {}).get("mode")}
+                     for app, entries in self._per_app.items()
+                     for entry in list(entries)[-(n + 1):] if entry["tool"] != "run"]
+        found.sort(key=lambda entry: entry["ts"])
+        return found[-n:]
+
     def get_last(self, app: str) -> dict | None:
         with self._lock:
             return self._last.get(app)
@@ -206,7 +215,7 @@ recorder = ActivityRecorder()
 
 # Tools whose dispatch represents a user-visible "action" the UI should
 # surface. Read-only / introspection tools (list_sessions, screen_info,
-# get_pixel, etc.) are excluded so the menubar shows actual activity
+# get_pixel, etc.) are excluded so the menu-bar panel shows actual activity
 # rather than just call counts.
 ACTION_TOOLS = frozenset({
     "click", "double_click", "long_press", "drag", "scroll", "ax_action",
@@ -228,7 +237,7 @@ def record_from_args(session, tool_name: str, args: dict, via: str | None = None
     try:
         # Pull common coordinate pairs. Drag uses x1/y1 → x2/y2; everything
         # else uses x/y. Tools without coords (type_text, press_key) record
-        # without spatial info — the menubar log just omits the coord column.
+        # without spatial info — the log just omits the coord column.
         x = args.get("x")
         y = args.get("y")
         x2 = args.get("x2")
@@ -237,7 +246,7 @@ def record_from_args(session, tool_name: str, args: dict, via: str | None = None
             x = args["x1"]
         if "y1" in args and y is None:
             y = args["y1"]
-        # Detail is a short human-readable hint shown in the menubar log.
+        # Detail is a short human-readable hint kept in the local log.
         detail = None
         if tool_name == "type_text":
             txt = args.get("text", "") or ""
@@ -275,7 +284,7 @@ def record_from_args(session, tool_name: str, args: dict, via: str | None = None
 def record_via(app: str, tool: str, via: str) -> None:
     """Update the last entry's via field once a seamless dispatch resolves.
     Records-and-forgets — used by the seamless paths to stamp 'skylight',
-    'cursor_warp', etc. onto the most recent entry so the menubar's
+    'cursor_warp', etc. onto the most recent entry so the
     last-action row shows the actual delivery mode."""
     try:
         last = recorder.get_last(app)

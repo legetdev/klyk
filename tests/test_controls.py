@@ -402,6 +402,161 @@ class ControlsTests(unittest.TestCase):
         self.assertNotIn("opencode", checked)
 
 
+    def found(self, **extra):
+        """Show one connected server to the panel."""
+        data = {"pid": 4242, "client": "claude", "last_action_at": None, "last_app": None,
+                "recent": [], "stopped": False, **extra}
+        return patch.object(presence, "entries", return_value=[data])
+
+    def idle(self, seconds):
+        """Report whether the controller has left the menu bar by this moment."""
+        with patch.object(ui, "shutdown"):
+            self.panel._check_idle(seconds)
+        return self.panel.idle_exit
+
+    def test_leaves_thirty_seconds_after_the_last_connection(self):
+        """A connected server keeps the icon; a brief reconnect restarts the full grace."""
+        self.panel._found = [{"pid": 1}]
+        self.assertFalse(self.idle(0))
+        self.assertFalse(self.idle(500))
+        self.panel._found = []
+        self.assertFalse(self.idle(501))
+        self.assertFalse(self.idle(530))
+        self.panel._found = [{"pid": 1}]
+        self.assertFalse(self.idle(530.5))
+        self.panel._found = []
+        self.assertFalse(self.idle(532))
+        self.assertFalse(self.idle(561))
+        self.assertTrue(self.idle(562))
+
+    def test_open_panel_pending_save_and_keep_all_prevent_leaving(self):
+        """Nothing disappears under the user's pointer, mid-save, or against their choice."""
+        for block in ("open", "busy", "keep"):
+            with self.subTest(block=block):
+                with patch.object(self.panel, "_panel_open", return_value=block == "open"):
+                    self.panel.busy = {"codex"} if block == "busy" else set()
+                    controls.choose("keep", block == "keep")
+                    self.assertFalse(self.idle(0))
+                    self.assertFalse(self.idle(5000))
+                controls.choose("keep", False)
+                self.panel.busy = set()
+
+    def test_time_after_install_lasts_only_until_the_first_connection(self):
+        """Someone who just installed gets minutes; afterwards the normal grace applies."""
+        self.panel._grace = controls._LINGER_GRACE
+        self.assertFalse(self.idle(0))
+        self.assertFalse(self.idle(599))
+        self.panel._found = [{"pid": 1}]
+        self.assertFalse(self.idle(600))
+        self.panel._found = []
+        self.assertFalse(self.idle(601))
+        self.assertTrue(self.idle(631))
+
+    def test_hide_is_remembered_and_ignores_connections(self):
+        """A mere connection leaves a hidden icon alone."""
+        with patch.object(ui, "shutdown") as stop:
+            self.panel.busy = {"codex"}
+            self.panel.hide()
+            stop.assert_not_called()
+            self.panel.busy = set()
+            self.panel.hide()
+            stop.assert_called_once()
+        with patch.object(controls, "start_background", return_value=True) as start:
+            self.assertTrue(controls.start_for_connection())
+            start.assert_not_called()
+            controls.choose("hidden", False)
+            self.assertTrue(controls.start_for_connection())
+            start.assert_called_once_with()
+
+    def test_choices_never_recreate_state_or_follow_links(self):
+        """Uninstalled state stays gone, and a planted link is not written through."""
+        with patch.object(policy, "policy_path", return_value=self.path.parent / "gone" / "connections.json"):
+            with self.assertRaises(OSError):
+                controls.choose("keep", True)
+            controls.choose("keep", False)
+        target = self.path.parent / "target"
+        (self.path.parent / "controls.keep").symlink_to(target)
+        controls.choose("keep", True)
+        self.assertFalse(target.exists())
+
+    def run_controller(self, *, idle_exit, connected, hidden=False, **arguments):
+        """Run the real lease lifecycle with an inert interface."""
+        class Inert:
+            def __init__(self, keys):
+                self.idle_exit = idle_exit
+                self._grace = controls._IDLE_GRACE
+                Inert.made = self
+
+            def build(self):
+                Inert.hidden_at_build = controls.chosen("hidden")
+
+        controls.choose("hidden", hidden)
+        with patch.object(controls, "Controls", Inert), patch.object(controls.sys, "platform", "darwin"), \
+                patch.object(ui, "install_on_main_thread", return_value=True), patch.object(ui, "run_blocking"), \
+                patch.object(presence, "entries", return_value=[{"pid": 1}] if connected else []), \
+                patch.object(controls, "start_background",
+                             side_effect=lambda: self.assertFalse(controls.running()) or True) as start:
+            controls.run(**arguments)
+        return Inert, start
+
+    def test_connection_during_an_idle_exit_is_picked_up(self):
+        """A server that saw the lease held while the controller left still gets its icon."""
+        _, start = self.run_controller(idle_exit=True, connected=True)
+        start.assert_called_once()
+        for idle_exit, connected in ((True, False), (False, True)):
+            _, start = self.run_controller(idle_exit=idle_exit, connected=connected)
+            start.assert_not_called()
+
+    def test_every_start_ends_hiding_and_only_user_starts_linger(self):
+        """A tool request or explicit open clears the choice; grace depends on who asked."""
+        inert, _ = self.run_controller(idle_exit=False, connected=False, hidden=True)
+        self.assertFalse(inert.hidden_at_build)
+        self.assertEqual(inert.made._grace, controls._IDLE_GRACE)
+        inert, _ = self.run_controller(idle_exit=False, connected=False, linger=True)
+        self.assertEqual(inert.made._grace, controls._LINGER_GRACE)
+
+    def test_emergency_stop_is_unmistakable(self):
+        """The stop outranks every other state in the menu bar."""
+        policy.set_enabled("claude", True)
+        with self.found(stopped=True):
+            self.panel.refresh()
+        self.assertEqual(self.panel._item.view.image, "symbol-stopped")
+        self.assertIn("emergency stop", self.panel._item.view.text)
+        self.panel._live_at = None
+        with self.found():
+            self.panel.refresh()
+        self.assertEqual(self.panel._item.view.image, "symbol-on")
+
+    def test_row_names_who_is_in_control(self):
+        """Only the environment whose server holds the control token says so."""
+        policy.set_enabled("claude", True)
+        policy.set_enabled("codex", True)
+        with self.found(), patch.object(controls.ownership, "OWNER_PATH", self.path), \
+                patch.object(controls.ownership, "current_owner", return_value=4242):
+            self.panel.refresh()
+        self.assertEqual(self.panel.rows["claude"][1].text, "On · in control")
+        self.assertEqual(self.panel.rows["codex"][1].text, "On · not connected")
+
+    def test_activity_merges_servers_newest_first(self):
+        """Activity is bounded, readable and names a mode only when it is not the default."""
+        found = [{"recent": [[100.0, "Safari", "click", "autonomous"], [40.0, "Notes", "type_text", "background"]]},
+                 {"recent": [[95.0, "Mail", "inspect", None]] * 5}]
+        lines = controls.activity_lines(found, 101.0)
+        self.assertEqual(lines[:2], ["Click in Safari · just now", "Inspect in Mail · 6s ago"])
+        self.assertEqual(len(lines), controls._ACTIVITY_LINES)
+        self.assertEqual(controls.activity_lines(found[:1], 101.0)[1], "Type text in Notes (background) · 1m ago")
+
+    def test_update_notice_yields_to_errors(self):
+        """An available release replaces the hint, but never hides a problem."""
+        with patch.object(controls.updates, "status", return_value={"update_available": True, "latest": "9.0"}):
+            self.panel._update = controls.update_line()
+        self.panel.refresh()
+        self.assertIn("9.0", self.panel._footer.text)
+        self.panel.error = "Could not save."
+        self.panel.refresh()
+        self.assertEqual(self.panel._footer.text, "Could not save.")
+
+
 class ControllerLifecycleTests(unittest.TestCase):
     """Uninstall must be able to stop the controller without guessing process names."""
 

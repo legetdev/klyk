@@ -199,7 +199,6 @@ class ConnectionRuntimeTests(IsolatedPolicy, unittest.IsolatedAsyncioTestCase):
         self.server.ownership.release_ownership_if_owned.return_value = True
         self.assertTrue(self.server._on_access_revoked())
         self.assertEqual(self.server.ownership.release_ownership_if_owned.call_count, 2)
-        self.server._refresh_menubar.assert_called()
 
     async def test_old_generation_cleanup_preserves_reenabled_ownership(self):
         """Selective cleanup may release old held inputs without clearing fresh control."""
@@ -259,7 +258,7 @@ class ConnectionRuntimeTests(IsolatedPolicy, unittest.IsolatedAsyncioTestCase):
         self.server.sys = SimpleNamespace(platform='darwin')
         self.server.__package__ = 'klyk'
         self.server._run_on_macos = MagicMock()
-        with patch.dict(sys.modules, {'klyk.controls': SimpleNamespace(start_background=start_background)}):
+        with patch.dict(sys.modules, {'klyk.controls': SimpleNamespace(start_for_connection=start_background)}):
             try:
                 self.server._main_entry()
                 self.server._run_on_macos.assert_called_once()

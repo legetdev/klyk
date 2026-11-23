@@ -119,7 +119,7 @@ class UIThread:
                 0.020, True, _drain,
             )
             # Also tick during menu tracking — without this, queued UI
-            # work pauses while the menubar dropdown is open.
+            # work pauses while a menu is open.
             NSRunLoop.currentRunLoop().addTimer_forMode_(
                 self._drain_timer, "NSEventTrackingRunLoopMode",
             )

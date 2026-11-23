@@ -140,6 +140,9 @@ class ActivityRecorderTests(unittest.TestCase):
         """Closing an app removes history, summary state, and last action."""
         recorder = activity.ActivityRecorder()
         recorder.record("TextEdit", "click", session_mode="humanoid")
+        recorder.record("TextEdit", "run")
+        self.assertEqual([(e["app"], e["tool"], e["mode"]) for e in recorder.latest(8)],
+                         [("TextEdit", "click", "humanoid")])
         recorder.remove_app("TextEdit")
 
         self.assertEqual(recorder.get_recent("TextEdit"), [])

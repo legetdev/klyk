@@ -37,11 +37,6 @@ class _SessionLifecycle:
             activity.recorder.remove_app(app)
         except Exception:
             pass
-        try:
-            from .menubar import menubar
-            menubar.request_refresh()
-        except Exception:
-            pass
 
 
 # Module-level singleton — name kept for compatibility with session.py.
