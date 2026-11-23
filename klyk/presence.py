@@ -102,7 +102,10 @@ def stopped(value: bool) -> None:
             if state is None or state["pid"] != os.getpid() or state["stopped"] == value:
                 return
             state["stopped"] = bool(value)
-            _write_locked(state, time.monotonic())
+            try:
+                _write_locked(state, time.monotonic())
+            except Exception:
+                state["stopped"] = not value  # The watcher retries an unpublished change.
     except Exception:
         pass
 

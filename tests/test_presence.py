@@ -94,6 +94,9 @@ class PresenceTests(unittest.TestCase):
         with patch.object(presence, "_write_locked") as write:
             presence.stopped(True)
             write.assert_not_called()
+        with patch.object(presence, "_write_locked", side_effect=OSError("fixture")):
+            presence.stopped(False)
+        self.assertTrue(presence.entries()[0]["stopped"])
         presence.stopped(False)
         self.assertFalse(presence.entries()[0]["stopped"])
 
