@@ -406,6 +406,18 @@ _TAP_CB_TYPE = ctypes.CFUNCTYPE(
 )
 
 
+_kCGEventSourceUnixProcessID = 41
+_kCGEventSourceStateID = 45
+_kCGEventSourceStateHIDSystemState = 1
+
+
+def _is_hardware_key_event(event) -> bool:
+    """True only for a key event from the keyboard itself: HID system state and no posting process."""
+    return (_cg.CGEventGetIntegerValueField(ctypes.c_void_p(event), _kCGEventSourceStateID)
+            == _kCGEventSourceStateHIDSystemState
+            and _cg.CGEventGetIntegerValueField(ctypes.c_void_p(event), _kCGEventSourceUnixProcessID) == 0)
+
+
 def _make_stop_callback():
     """Ignore key repeats and recover a disabled listener without changing the stop latch."""
     def _cb(proxy, etype, event, refcon):
@@ -425,6 +437,11 @@ def _make_stop_callback():
                 )
                 fl = _cg.CGEventGetFlags(ctypes.c_void_p(event))
                 if kc == _EMERGENCY_STOP_KEYCODE and (fl & _EMERGENCY_STOP_FLAGS) == _EMERGENCY_STOP_FLAGS:
+                    if _stop_engaged[0] and not _is_hardware_key_event(event):
+                        # Any program may engage the stop, but only the physical keyboard
+                        # clears it: a synthetic chord (osascript, another tool) is ignored.
+                        log.warning("Ignored a software Cmd+Shift+Escape while the emergency stop is engaged")
+                        return event
                     engaged = _toggle_stop_from_chord()
                     if engaged is True:
                         log.warning("Emergency stop ENGAGED (Cmd+Shift+Escape) — all input blocked until you press the chord again")
