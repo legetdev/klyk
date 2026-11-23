@@ -59,13 +59,54 @@ class PresenceTests(unittest.TestCase):
         """The announcement is private, atomic and holds no screen content."""
         presence.connected("claude")
         data = json.loads(self.own.read_text())
-        self.assertEqual(set(data), {"pid", "client", "version", "started_at", "last_action_at", "last_app", "last_tool"})
+        self.assertEqual(set(data), {"pid", "client", "version", "started_at", "last_action_at", "last_app", "last_tool",
+                                     "recent", "stopped"})
         self.assertEqual((data["pid"], data["client"], data["version"]), (os.getpid(), "claude", presence.__version__))
         self.assertIsNone(data["last_action_at"])
         self.assertEqual(stat.S_IMODE(self.own.stat().st_mode), 0o600)
         self.assertEqual(stat.S_IMODE(self.folder.stat().st_mode), 0o700)
         self.assertEqual([path.name for path in self.folder.iterdir()], [self.own.name])  # No temporary left.
         self.register.assert_called_once_with(presence.clear)
+
+    def test_recent_actions_hold_only_names_and_times(self):
+        """Labels, text and coordinates of an action never reach the file; the list stays bounded."""
+        presence.connected("claude")
+        actions = [{"ts": float(i), "app": "Ma\nil", "tool": "click", "mode": "background",
+                    "detail": "secret", "x": 5} for i in range(30)]
+        presence.record("claude", "Mail", "click", actions)
+        self.assertNotIn("secret", self.own.read_text())
+        recent = presence.entries()[0]["recent"]
+        self.assertEqual(len(recent), presence._MAX_RECENT)
+        self.assertEqual(recent[-1], [29.0, "Mail", "click", "background"])
+
+    def test_largest_possible_record_stays_readable(self):
+        """Long names in any script must not push a live server over the reader's limit."""
+        presence.connected("claude")
+        actions = [{"ts": 1767225612.123456, "app": "😀" * 200, "tool": "😀" * 200, "mode": "😀" * 50}] * 30
+        presence.record("claude", "😀" * 200, "😀" * 200, actions)
+        self.assertEqual(len(presence.entries()), 1)
+
+    def test_emergency_stop_is_published_on_change_only(self):
+        """A flip is written at once and an unchanged state costs no write."""
+        presence.connected("claude")
+        presence.stopped(True)
+        self.assertTrue(presence.entries()[0]["stopped"])
+        with patch.object(presence, "_write_locked") as write:
+            presence.stopped(True)
+            write.assert_not_called()
+        presence.stopped(False)
+        self.assertFalse(presence.entries()[0]["stopped"])
+
+    def test_other_versions_and_bad_optional_fields_keep_the_connection(self):
+        """Missing, unknown or malformed optional fields never hide a live server."""
+        presence.connected("claude")
+        data = json.loads(self.own.read_text())
+        del data["recent"], data["stopped"]
+        self.own.write_text(json.dumps(data))
+        self.assertEqual((presence.entries()[0]["recent"], presence.entries()[0]["stopped"]), ([], False))
+        for bad in (3, [1], [["x", "a", "b", None]], [[float("nan"), "a", "b", None]], [[1, 2, "b", None]]):
+            self.own.write_text(json.dumps({**data, "recent": bad, "future": 1}))
+            self.assertEqual(presence.entries()[0]["recent"], [])
 
     def test_unknown_client_is_unattributed(self):
         """An invalid identity never appears as a real environment."""

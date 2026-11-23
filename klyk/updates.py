@@ -230,12 +230,10 @@ def status() -> dict:
     }
 
 
-def start_background_check(on_checked=None) -> None:
+def start_background_check() -> None:
     """Daemon thread for the long-lived server: run check() now, then every
-    6 h (the TTL still limits real fetches to one/day). Calls on_checked()
-    after EVERY pass — not just when an update appears — so the menu-bar
-    line also clears promptly after an update lands (going stale in either
-    direction is the failure mode)."""
+    6 h (the TTL still limits real fetches to one/day). The menu-bar controls
+    read the cache whenever their panel is open."""
     if not enabled():
         log.info("update check disabled (KLYK_UPDATE_CHECK=0)")
         return
@@ -245,8 +243,6 @@ def start_background_check(on_checked=None) -> None:
         while True:
             try:
                 check()
-                if on_checked is not None:
-                    on_checked()
             except Exception as e:
                 log.warning("background update check failed: %s: %s", type(e).__name__, e)
             time.sleep(6 * 3600)

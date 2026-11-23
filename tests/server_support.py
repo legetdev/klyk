@@ -73,7 +73,6 @@ def load_server():
     module._TOOL_VALIDATORS = {n: jsonschema.validators.validator_for(s)(s) for n,s in module._TOOL_SCHEMAS.items()}
     module._PUBLIC_SCHEMAS = {t.name: module._tool_input_schema(t) for t in module.TOOLS}
     module._PUBLIC_VALIDATORS = {n: jsonschema.validators.validator_for(s)(s) for n,s in module._PUBLIC_SCHEMAS.items()}
-    module._refresh_menubar = MagicMock()
     # Legacy dispatcher suites already provide native adapters; do not initialize the desktop.
     module._ensure_native_runtime = AsyncMock(return_value=None)
     return module

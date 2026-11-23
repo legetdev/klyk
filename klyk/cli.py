@@ -495,7 +495,7 @@ def _install(rest: list[str]) -> None:
     from .controls import start_background
     try:
         connection_policy.initialize()
-        start_background()
+        start_background(linger=True)
     except (OSError, ValueError, RuntimeError):
         print("Klyk access stays off. Run `klyk controls` to open the controls after fixing the local settings.")
         sys.exit(1)
@@ -773,7 +773,7 @@ def _uninstall(rest: list[str]) -> None:
         if controls_were_running:
             print("  ✓ stopped the menu-bar controls")
     else:
-        print("  ✗ could not stop the menu-bar controls; quit them from the menu bar, then re-run")
+        print("  ✗ could not stop the menu-bar controls; close them from the menu bar, then re-run")
         print("\nNo state was removed.")
         sys.exit(1)
     for b in ("klyk", "klyk-call"):
